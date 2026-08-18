@@ -1,0 +1,143 @@
+# ============================================================
+# Private local project materials
+# Never publish these files to the repository
+# ============================================================
+/AGENTS.md
+/.project/
+/docs/
+/notes/
+/reviews/
+/eval/
+
+# ============================================================
+# Secrets and local environment
+# ============================================================
+.env
+.env.*
+!.env.example
+
+/config.local.*
+*.local.yaml
+*.local.yml
+*.local.json
+/secrets/
+
+# ============================================================
+# Python virtual environments
+# ============================================================
+/.venv/
+/venv/
+/env/
+
+# ============================================================
+# Python caches and build outputs
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.hypothesis/
+
+*.egg-info/
+/build/
+/dist/
+/wheelhouse/
+
+.coverage
+.coverage.*
+/htmlcov/
+coverage.xml
+
+# Tests are source code and are intentionally tracked.
+# Do not ignore tests/, fixtures/, testdata/, or frontend tests.
+
+# ============================================================
+# Runtime data and local databases
+# ============================================================
+/data/
+/runtime/
+/storage/
+/uploads/
+/artifacts/
+/checkpoints/
+
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# ============================================================
+# Models and vector database local data
+# ============================================================
+/models/
+/weights/
+/embeddings/
+
+/qdrant_storage/
+/qdrant-data/
+/snapshots/
+
+# ============================================================
+# Logs and observability outputs
+# ============================================================
+/logs/
+*.log
+*.trace
+*.pid
+
+# ============================================================
+# Frontend dependencies and generated outputs
+# ============================================================
+/node_modules/
+/frontend/node_modules/
+
+/frontend/dist/
+/frontend/.vite/
+/frontend/.cache/
+/frontend/coverage/
+
+*.tsbuildinfo
+
+# ============================================================
+# Temporary files
+# ============================================================
+/tmp/
+/temp/
+/.cache/
+
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# ============================================================
+# IDE and personal workspace
+# ============================================================
+.vscode/
+.idea/
+*.code-workspace
+
+# ============================================================
+# Operating system files
+# ============================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# AI coding tool local state
+# ============================================================
+.codex/
+.claude/
+.cursor/
+.aider*
+
+# Local code review artifacts
+.review/

@@ -1,0 +1,45 @@
+[project]
+name = "langley"
+version = "0.1.0"
+description = "Langley backend"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "asyncmy>=0.2",
+    "cryptography>=44.0",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "langgraph>=0.2",
+    "langsmith>=0.3",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "sqlalchemy>=2.0",
+    "structlog>=25.0",
+    "tzdata>=2025.2",
+    "uvicorn[standard]>=0.30",
+]
+
+[dependency-groups]
+dev = [
+    "alembic>=1.14",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/fast"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+
+[build-system]
+requires = ["uv_build>=0.11.31,<0.12.0"]
+build-backend = "uv_build"

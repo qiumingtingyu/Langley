@@ -1,0 +1,20 @@
+services:
+  mysql:
+    image: mysql:8.4.10
+    environment:
+      MYSQL_DATABASE: langley
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_ROOT_PASSWORD: langley-local-root-password
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - langley_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+volumes:
+  langley_mysql_data:

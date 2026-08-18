@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          enable-cache: false
+      - name: Install Python from .python-version
+        run: uv python install "$(cat .python-version)"
+      - name: Sync locked dependencies
+        run: uv sync --locked
+      - name: Check formatting
+        run: uv run ruff format --check .
+      - name: Lint backend
+        run: uv run ruff check .
+      - name: Type check backend
+        run: uv run mypy src/langley
+      - name: Run fast tests
+        run: uv run pytest
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Lint frontend
+        run: npm run lint
+      - name: Run frontend tests
+        run: npm run test
+      - name: Build frontend
+        run: npm run build
+
+  database:
+    runs-on: ubuntu-latest
+    env:
+      LANGLEY_DATABASE_URL: mysql+asyncmy://root:langley-ci-root-password@127.0.0.1:3306/langley
+      LANGLEY_TEST_DATABASE_URL: mysql+asyncmy://root:langley-ci-root-password@127.0.0.1:3306/langley_test
+    services:
+      mysql:
+        image: mysql:8.4.10
+        env:
+          MYSQL_DATABASE: langley
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_ROOT_PASSWORD: langley-ci-root-password
+        ports:
+          - "3306:3306"
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -plangley-ci-root-password"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=20s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Confirm MySQL health
+        run: >-
+          test "$(docker inspect --format='{{.State.Health.Status}}'
+          '${{ job.services.mysql.id }}')" = healthy
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          enable-cache: false
+      - name: Install Python from .python-version
+        run: uv python install "$(cat .python-version)"
+      - name: Sync locked dependencies
+        run: uv sync --locked
+      - name: Run MySQL integration tests
+        run: uv run pytest tests/integration
