@@ -23,7 +23,7 @@ from langley.infrastructure.database import (
     create_session_factory,
     dispose_database_engine,
 )
-from langley.infrastructure.models import Conversation, User
+from langley.infrastructure.models import Conversation, Run, User
 
 
 @pytest.fixture
@@ -101,6 +101,28 @@ def _scalar(database_url: str, statement: str) -> object:
     return asyncio.run(execute())
 
 
+def _fail_pending_run(database_url: str, run_id: int) -> None:
+    async def fail() -> None:
+        engine = create_database_engine(database_url)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session:
+                async with session.begin():
+                    run = await session.get(Run, run_id)
+                    if run is None:
+                        raise AssertionError("expected pending run")
+                    now = utc_now()
+                    run.status = "FAILED"
+                    run.started_at = now
+                    run.finished_at = now
+                    run.error_code = "ANSWER_EXECUTION_FAILED"
+                    run.updated_at = now
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(fail())
+
+
 def test_new_question_atomically_creates_user_and_pending_run(
     migrated_database: str,
 ) -> None:
@@ -115,6 +137,7 @@ def test_new_question_atomically_creates_user_and_pending_run(
     assert result.run.input_message_id == result.user_message.id
     assert result.run.attempt_no == 1
     assert result.run.status == "PENDING"
+    assert result.memory_catchup_through_message_id is None
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM messages") == 1
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM runs") == 1
 
@@ -133,8 +156,24 @@ def test_same_key_pending_replay_returns_facts_without_new_admission(
     assert replay.user_message.id == initiating.user_message.id
     assert replay.run.id == initiating.run.id
     assert replay.run.status == "PENDING"
+    assert replay.memory_catchup_through_message_id is None
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM messages") == 1
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM runs") == 1
+
+
+def test_new_question_captures_the_prior_canonical_user_high_water(
+    migrated_database: str,
+) -> None:
+    """A later admission excludes itself and catches up through prior USER evidence."""
+
+    conversation_id = _create_conversation(migrated_database)
+    first = _admit(migrated_database, conversation_id, "first-key", "first")
+    _fail_pending_run(migrated_database, first.run.id)
+
+    second = _admit(migrated_database, conversation_id, "second-key", "second")
+
+    assert second.memory_catchup_through_message_id == first.user_message.id
+    assert second.user_message.id > first.user_message.id
 
 
 def test_same_key_with_different_content_is_rejected_before_active_run_check(

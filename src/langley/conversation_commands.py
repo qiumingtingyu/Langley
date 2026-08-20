@@ -3,11 +3,11 @@
 from dataclasses import dataclass
 from enum import StrEnum
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.business_time import utc_now
-from langley.infrastructure.models import Conversation, Message, Run
+from langley.infrastructure.models import Conversation, Message, Run, User
 
 
 class AdmissionDisposition(StrEnum):
@@ -24,6 +24,7 @@ class AnswerCommandResult:
     user_message: Message
     run: Run
     is_replay: bool
+    memory_catchup_through_message_id: int | None
 
     @property
     def disposition(self) -> AdmissionDisposition:
@@ -70,6 +71,7 @@ async def admit_new_question(
     """Atomically persist a new USER and PENDING Run or return a same-key replay."""
 
     async with session.begin():
+        await _lock_user(session, user_id)
         conversation = await session.scalar(
             select(Conversation)
             .where(
@@ -100,6 +102,7 @@ async def admit_new_question(
                 user_message=existing_message,
                 run=existing_run,
                 is_replay=True,
+                memory_catchup_through_message_id=None,
             )
 
         active_run_id = await session.scalar(
@@ -116,6 +119,10 @@ async def admit_new_question(
 
         if not content.strip():
             raise ValueError("content must not be blank")
+
+        memory_catchup_through_message_id = await _canonical_user_high_water(
+            session, user_id
+        )
 
         last_sequence_no = await session.scalar(
             select(Message.sequence_no)
@@ -158,6 +165,7 @@ async def admit_new_question(
         user_message=user_message,
         run=run,
         is_replay=False,
+        memory_catchup_through_message_id=memory_catchup_through_message_id,
     )
 
 
@@ -182,6 +190,7 @@ async def admit_retry(
     """Create a Retry attempt for the latest failed or cancelled USER Message."""
 
     async with session.begin():
+        await _lock_user(session, user_id)
         conversation = await session.scalar(
             select(Conversation)
             .where(
@@ -212,6 +221,7 @@ async def admit_retry(
                 user_message=existing_message,
                 run=existing_run,
                 is_replay=True,
+                memory_catchup_through_message_id=None,
             )
 
         active_run_id = await session.scalar(
@@ -270,6 +280,9 @@ async def admit_retry(
         if last_attempt_no is None:
             raise RuntimeError("latest user has no persisted attempts")
 
+        memory_catchup_through_message_id = await _canonical_user_high_water(
+            session, user_id
+        )
         now = utc_now()
         run = Run(
             conversation_id=conversation_id,
@@ -290,6 +303,7 @@ async def admit_retry(
         user_message=latest_user,
         run=run,
         is_replay=False,
+        memory_catchup_through_message_id=memory_catchup_through_message_id,
     )
 
 
@@ -303,6 +317,7 @@ async def admit_regenerate(
     """Append a copied latest successful USER and a new PENDING Run atomically."""
 
     async with session.begin():
+        await _lock_user(session, user_id)
         conversation = await session.scalar(
             select(Conversation)
             .where(
@@ -336,6 +351,7 @@ async def admit_regenerate(
                 user_message=existing_message,
                 run=existing_run,
                 is_replay=True,
+                memory_catchup_through_message_id=None,
             )
 
         active_run_id = await session.scalar(
@@ -380,6 +396,9 @@ async def admit_regenerate(
             if latest_user.regenerated_from_message_id is not None
             else latest_user.id
         )
+        memory_catchup_through_message_id = await _canonical_user_high_water(
+            session, user_id
+        )
         last_sequence_no = await session.scalar(
             select(Message.sequence_no)
             .where(Message.conversation_id == conversation_id)
@@ -421,4 +440,30 @@ async def admit_regenerate(
         user_message=copied_user,
         run=run,
         is_replay=False,
+        memory_catchup_through_message_id=memory_catchup_through_message_id,
+    )
+
+
+async def _lock_user(session: AsyncSession, user_id: int) -> User:
+    """Establish the per-user ordering point before locking a Conversation."""
+
+    user = await session.scalar(
+        select(User).where(User.id == user_id).with_for_update()
+    )
+    if user is None:
+        raise ConversationNotFoundError
+    return user
+
+
+async def _canonical_user_high_water(session: AsyncSession, user_id: int) -> int | None:
+    """Return the current user's highest canonical USER evidence id."""
+
+    return await session.scalar(
+        select(func.max(Message.id))
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.user_id == user_id,
+            Message.role == "USER",
+            Message.regenerated_from_message_id.is_(None),
+        )
     )

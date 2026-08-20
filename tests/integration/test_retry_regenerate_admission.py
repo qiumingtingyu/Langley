@@ -249,6 +249,7 @@ def test_retry_reuses_failed_latest_user_and_does_not_update_conversation_time(
     assert result.run.input_message_id == user_message_id
     assert result.run.attempt_no == 2
     assert result.run.status == "PENDING"
+    assert result.memory_catchup_through_message_id == user_message_id
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM messages") == 1
     assert (
         _scalar(
@@ -272,6 +273,7 @@ def test_retry_same_key_replays_existing_pending_attempt(
     assert replay.disposition is AdmissionDisposition.REPLAY
     assert replay.user_message.id == user_message_id
     assert replay.run.id == initiating.run.id
+    assert replay.memory_catchup_through_message_id is None
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM runs") == 2
 
 
@@ -386,6 +388,7 @@ def test_regenerate_appends_a_copied_user_and_pending_attempt(
     assert result.run.input_message_id == result.user_message.id
     assert result.run.attempt_no == 1
     assert result.run.status == "PENDING"
+    assert result.memory_catchup_through_message_id == original_user_id
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM messages") == 3
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM runs") == 2
 
@@ -403,6 +406,7 @@ def test_regenerate_same_key_replays_existing_pending_copy(
     assert replay.disposition is AdmissionDisposition.REPLAY
     assert replay.user_message.id == initiating.user_message.id
     assert replay.run.id == initiating.run.id
+    assert replay.memory_catchup_through_message_id is None
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM messages") == 3
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM runs") == 2
 
