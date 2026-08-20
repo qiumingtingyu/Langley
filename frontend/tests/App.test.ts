@@ -262,7 +262,7 @@ describe("App user behavior", () => {
     enqueue(response({ auto_memory_enabled: true })); enqueue(response([]));
     await button(wrapper, "记忆").trigger("click"); await settle();
     enqueue(response({ auto_memory_enabled: true })); enqueue(response([]));
-    memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: JSON.stringify({ user_requested_memory_action: true }) })); await settle();
+    memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: JSON.stringify({ user_requested_memory_action: true, changed_count: 1 }) })); await settle();
     expect(wrapper.text()).toContain("长期记忆已更新");
     for (const [event, message] of [["memory.no_change", "本次未对长期记忆做出修改"], ["memory.retry_pending", "长期记忆同步暂时未完成"], ["memory.not_saved", "本次内容未保存为长期记忆"]] as const) {
       memorySource.emit(event); await settle(); expect(wrapper.text()).toContain(message);
@@ -270,6 +270,23 @@ describe("App user behavior", () => {
     await button(wrapper, "聊天").trigger("click"); await button(wrapper, "记忆").trigger("click");
     expect(FakeEventSource.instances.filter((item) => item.url === "/api/memory-events")).toHaveLength(1);
     wrapper.unmount(); expect(memorySource.closed).toBe(true);
+  });
+
+  it("shows an implicit Memory indicator in Chat and durable explicit mutation notices", async () => {
+    const wrapper = await mountInitial();
+    const memorySource = FakeEventSource.instances.find((item) => item.url === "/api/memory-events")!;
+    memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: JSON.stringify({ user_requested_memory_action: false }) })); await settle();
+    expect(wrapper.get('[aria-label="记忆有更新"]').exists()).toBe(true);
+    expect(wrapper.find('[role="status"]').exists()).toBe(false);
+    enqueue(response({ auto_memory_enabled: true })); enqueue(response([]));
+    await button(wrapper, "记忆").trigger("click"); await settle();
+    expect(wrapper.find('[aria-label="记忆有更新"]').exists()).toBe(false);
+    await button(wrapper, "聊天").trigger("click");
+    for (const [payload, message] of [[{ created_count: 1 }, "长期记忆已保存"], [{ changed_count: 1 }, "长期记忆已更新"], [{ forgotten_count: 1 }, "长期记忆已移除"], [{ created_count: 1, changed_count: 1 }, "长期记忆已更新"]] as const) {
+      memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: JSON.stringify({ user_requested_memory_action: true, ...payload }) })); await settle();
+      expect(wrapper.get('[role="status"]').text()).toContain(message);
+    }
+    wrapper.unmount();
   });
 
   it("corrects without changing an absolute expiry, handles toggle rollback, and renders conversational source", async () => {

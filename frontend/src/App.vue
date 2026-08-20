@@ -84,6 +84,7 @@ const streamState = ref<StreamState | null>(null);
 const activeView = ref<"chat" | "memory">("chat");
 const memoryNotice = ref<string | null>(null);
 const memoryPage = ref<{ load(): Promise<void> } | null>(null);
+const memoryUpdated = ref(false);
 
 let viewRevision = 0;
 let readController: AbortController | null = null;
@@ -139,13 +140,38 @@ function showMemoryNotice(message: string): void {
   memoryNoticeTimer = setTimeout(() => { memoryNotice.value = null; }, 4000);
 }
 
+function openMemoryView(): void {
+  activeView.value = "memory";
+  memoryUpdated.value = false;
+}
+
+function updatedNotice(payload: {
+  created_count?: number;
+  changed_count?: number;
+  forgotten_count?: number;
+}): string {
+  const created = payload.created_count ?? 0;
+  const changed = payload.changed_count ?? 0;
+  const forgotten = payload.forgotten_count ?? 0;
+  if (created > 0 && changed === 0 && forgotten === 0) return "长期记忆已保存。";
+  if (changed > 0 && created === 0 && forgotten === 0) return "长期记忆已更新。";
+  if (forgotten > 0 && created === 0 && changed === 0) return "长期记忆已移除。";
+  return "长期记忆已更新。";
+}
+
 function observeMemoryEvents(): void {
   memoryEventSource?.close();
   const source = new EventSource("/api/memory-events");
   memoryEventSource = source;
   source.addEventListener("memory.updated", (event) => {
-    const payload = JSON.parse((event as MessageEvent<string>).data) as { user_requested_memory_action?: boolean };
-    showMemoryNotice(payload.user_requested_memory_action ? "长期记忆已更新。" : "长期记忆已更新。");
+    const payload = JSON.parse((event as MessageEvent<string>).data) as {
+      user_requested_memory_action?: boolean;
+      created_count?: number;
+      changed_count?: number;
+      forgotten_count?: number;
+    };
+    if (payload.user_requested_memory_action) showMemoryNotice(updatedNotice(payload));
+    else memoryUpdated.value = true;
     if (activeView.value === "memory") void memoryPage.value?.load();
   });
   source.addEventListener("memory.no_change", () => showMemoryNotice("本次未对长期记忆做出修改。"));
@@ -488,7 +514,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="flex min-h-screen bg-stone-50 text-slate-800">
+  <main class="relative flex min-h-screen bg-stone-50 text-slate-800">
     <aside class="flex w-72 shrink-0 flex-col border-r border-stone-200 bg-stone-100/70 p-4">
       <div class="mb-7 flex items-center gap-2 px-1 text-sm font-semibold tracking-tight text-slate-900">
         <span class="flex size-7 items-center justify-center rounded-md bg-slate-900 text-white">
@@ -523,9 +549,14 @@ onBeforeUnmount(() => {
         <button
           class="flex-1 rounded px-2 py-1.5"
           :class="activeView === 'memory' ? 'bg-white shadow-sm' : ''"
-          @click="activeView = 'memory'"
+          @click="openMemoryView"
         >
           记忆
+          <span
+            v-if="memoryUpdated"
+            aria-label="记忆有更新"
+            class="ml-1 inline-block size-1.5 rounded-full bg-sky-600"
+          />
         </button>
       </div>
 
@@ -566,6 +597,13 @@ onBeforeUnmount(() => {
       </nav>
     </aside>
 
+    <p
+      v-if="memoryNotice"
+      role="status"
+      class="absolute right-5 top-5 z-10 max-w-sm rounded border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-900 shadow-sm"
+    >
+      {{ memoryNotice }}
+    </p>
     <section
       v-if="activeView === 'chat'"
       class="flex min-w-0 flex-1 flex-col"
@@ -845,13 +883,6 @@ onBeforeUnmount(() => {
       v-else
       class="min-w-0 flex-1 overflow-y-auto"
     >
-      <p
-        v-if="memoryNotice"
-        role="status"
-        class="mx-auto mt-5 w-full max-w-3xl rounded border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-900"
-      >
-        {{ memoryNotice }}
-      </p>
       <MemoryPage
         ref="memoryPage"
         @notice="showMemoryNotice"
