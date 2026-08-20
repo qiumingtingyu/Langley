@@ -143,7 +143,7 @@ async def post_cancel_run(
     except Exception as error:
         _raise_run_http_error(error)
     try:
-        await execution_manager.stop_cancelled_run(run.id)
+        await execution_manager.stop_cancelled_run(run.id, user_id=current_user_id)
     except Exception:
         structlog.get_logger(__name__).exception(
             "answer.run.cancel_cleanup_failed",

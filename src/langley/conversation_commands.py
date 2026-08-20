@@ -21,6 +21,7 @@ class AdmissionDisposition(StrEnum):
 class AnswerCommandResult:
     """The persisted USER message and Run for one answer command."""
 
+    user_id: int
     user_message: Message
     run: Run
     is_replay: bool
@@ -99,6 +100,7 @@ async def admit_new_question(
             if not _is_new_question_replay(existing_run, existing_message, content):
                 raise ClientRequestIdReusedError
             return AnswerCommandResult(
+                user_id=user_id,
                 user_message=existing_message,
                 run=existing_run,
                 is_replay=True,
@@ -162,6 +164,7 @@ async def admit_new_question(
         await session.flush()
 
     return AnswerCommandResult(
+        user_id=user_id,
         user_message=user_message,
         run=run,
         is_replay=False,
@@ -218,6 +221,7 @@ async def admit_retry(
             if existing_run.attempt_no <= 1:
                 raise ClientRequestIdReusedError
             return AnswerCommandResult(
+                user_id=user_id,
                 user_message=existing_message,
                 run=existing_run,
                 is_replay=True,
@@ -300,6 +304,7 @@ async def admit_retry(
         await session.flush()
 
     return AnswerCommandResult(
+        user_id=user_id,
         user_message=latest_user,
         run=run,
         is_replay=False,
@@ -348,6 +353,7 @@ async def admit_regenerate(
             ):
                 raise ClientRequestIdReusedError
             return AnswerCommandResult(
+                user_id=user_id,
                 user_message=existing_message,
                 run=existing_run,
                 is_replay=True,
@@ -437,6 +443,7 @@ async def admit_regenerate(
         await session.flush()
 
     return AnswerCommandResult(
+        user_id=user_id,
         user_message=copied_user,
         run=run,
         is_replay=False,

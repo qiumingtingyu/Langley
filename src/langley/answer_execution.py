@@ -1,7 +1,7 @@
 """Short-transaction execution of an already-admitted answer Run."""
 
 import asyncio
-from typing import Any, Callable, Coroutine
+from typing import Any, Awaitable, Callable, Coroutine
 
 import structlog
 from sqlalchemy import select, update
@@ -21,6 +21,9 @@ class RunExecutionStateError(RuntimeError):
 
 
 TaskScheduler = Callable[[Coroutine[Any, Any, None]], asyncio.Task[None]]
+MemoryCatchUp = Callable[[AnswerCommandResult], Awaitable[None]]
+MemoryBoundaryCapture = Callable[[int], Awaitable[int | None]]
+MemoryBackgroundDrain = Callable[[int, int], Coroutine[Any, Any, None]]
 
 
 class AnswerExecutionManager:
@@ -31,11 +34,18 @@ class AnswerExecutionManager:
         session_factory: async_sessionmaker[AsyncSession],
         workflow_factory: Callable[[], LearningAssistantWorkflow],
         task_scheduler: TaskScheduler = asyncio.create_task,
+        memory_catch_up: MemoryCatchUp | None = None,
+        memory_boundary_capture: MemoryBoundaryCapture | None = None,
+        memory_background_drain: MemoryBackgroundDrain | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._workflow_factory = workflow_factory
         self._active_answers: dict[int, ActiveAnswer] = {}
         self._task_scheduler = task_scheduler
+        self._memory_catch_up = memory_catch_up
+        self._memory_boundary_capture = memory_boundary_capture
+        self._memory_background_drain = memory_background_drain
+        self._memory_tasks: set[asyncio.Task[None]] = set()
 
     async def schedule(self, command: AnswerCommandResult) -> None:
         """Schedule exactly one newly accepted Run without making HTTP its owner."""
@@ -64,7 +74,7 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
                 conversation_id=command.run.conversation_id,
             )
-            self._close(
+            self._close_after_terminal(
                 answer,
                 (
                     "run.failed",
@@ -72,22 +82,25 @@ class AnswerExecutionManager:
                 ),
             )
             self._active_answers.pop(command.run.id, None)
-            await _mark_active_execution_failed(
+            changed = await _mark_active_execution_failed(
                 self._session_factory,
                 conversation_id=command.run.conversation_id,
                 run_id=command.run.id,
             )
+            if changed:
+                await self._schedule_memory_wake(command.user_id)
 
-    async def stop_cancelled_run(self, run_id: int) -> None:
+    async def stop_cancelled_run(self, run_id: int, *, user_id: int) -> None:
         """Best-effort local stop only after MySQL has committed CANCELLED."""
 
         answer = self._active_answers.get(run_id)
-        if answer is None:
-            return
-        self._close(answer, ("run.cancelled", {"run_id": run_id}))
-        task = answer.task
-        if task is not None and not task.done():
-            task.cancel()
+        if answer is not None:
+            self._close_after_terminal(answer, ("run.cancelled", {"run_id": run_id}))
+        await self._schedule_memory_wake(user_id)
+        if answer is not None:
+            task = answer.task
+            if task is not None and not task.done():
+                task.cancel()
 
     async def stop_interrupted_runs(self, run_ids: list[int]) -> None:
         """Best-effort local task stop after committed PROCESS_INTERRUPTED facts."""
@@ -139,6 +152,7 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
             )
             self._publish(answer, ("run.started", {"run_id": command.run.id}))
+            await self._run_memory_catch_up(command)
             success = await workflow.execute(
                 self._session_factory,
                 run_id=command.run.id,
@@ -154,7 +168,10 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
                 content=success,
             )
-            self._close(answer, ("run.succeeded", {"run_id": command.run.id}))
+            self._close_after_terminal(
+                answer, ("run.succeeded", {"run_id": command.run.id})
+            )
+            await self._schedule_memory_wake(command.user_id)
         except WorkflowFailure as failure:
             failed = await mark_run_failed_if_running(
                 self._session_factory,
@@ -163,7 +180,7 @@ class AnswerExecutionManager:
                 error_code=failure.error_code.value,
             )
             if failed:
-                self._close(
+                self._close_after_terminal(
                     answer,
                     (
                         "run.failed",
@@ -173,6 +190,7 @@ class AnswerExecutionManager:
                         },
                     ),
                 )
+                await self._schedule_memory_wake(command.user_id)
         except asyncio.CancelledError:
             raise
         except RunExecutionStateError:
@@ -189,7 +207,7 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
             )
             if changed:
-                self._close(
+                self._close_after_terminal(
                     answer,
                     (
                         "run.failed",
@@ -199,6 +217,7 @@ class AnswerExecutionManager:
                         },
                     ),
                 )
+                await self._schedule_memory_wake(command.user_id)
         finally:
             self._close(answer, None)
             if self._active_answers.get(command.run.id) is answer:
@@ -212,11 +231,77 @@ class AnswerExecutionManager:
         answer.partial_text += delta
         self._publish(answer, ("message.delta", {"run_id": run_id, "delta": delta}))
 
+    async def _run_memory_catch_up(self, command: AnswerCommandResult) -> None:
+        """Isolate optional Memory failures from the authoritative Answer outcome."""
+
+        if self._memory_catch_up is None:
+            return
+        try:
+            await self._memory_catch_up(command)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            structlog.get_logger(__name__).exception(
+                "memory.catch_up.unexpected_failure",
+                run_id=command.run.id,
+                conversation_id=command.run.conversation_id,
+            )
+
+    async def _schedule_memory_wake(self, user_id: int) -> None:
+        """Capture a finite boundary then retain one best-effort drain task."""
+
+        if (
+            self._memory_boundary_capture is None
+            or self._memory_background_drain is None
+        ):
+            return
+        drain: Coroutine[Any, Any, None] | None = None
+        try:
+            boundary = await self._memory_boundary_capture(user_id)
+            if boundary is None:
+                return
+            drain = self._memory_background_drain(user_id, boundary)
+            task = self._task_scheduler(drain)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if drain is not None:
+                drain.close()
+            structlog.get_logger(__name__).exception(
+                "memory.background.scheduling_failed", user_id=user_id
+            )
+            return
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._consume_memory_task)
+
+    def _consume_memory_task(self, task: asyncio.Task[None]) -> None:
+        """Release the strong reference and observe a detached task failure."""
+
+        self._memory_tasks.discard(task)
+        if task.cancelled():
+            structlog.get_logger(__name__).info("memory.background.cancelled")
+            return
+        try:
+            task.result()
+        except Exception:
+            structlog.get_logger(__name__).exception("memory.background.failed")
+
     @staticmethod
     def _publish(answer: ActiveAnswer, item: StreamItem) -> None:
         if not answer.closed:
             for queue in tuple(answer.streams):
                 queue.put_nowait(item)
+
+    @staticmethod
+    def _close_after_terminal(answer: ActiveAnswer, item: StreamItem) -> None:
+        """Keep a stream-publication bug downstream of durable terminal state."""
+
+        try:
+            AnswerExecutionManager._close(answer, item)
+        except Exception:
+            structlog.get_logger(__name__).exception(
+                "answer.run.terminal_publish_failed"
+            )
 
     @staticmethod
     def _close(answer: ActiveAnswer, item: StreamItem | None) -> None:

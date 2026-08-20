@@ -101,7 +101,8 @@ class CancelStopSpy:
     def __init__(self) -> None:
         self.cancelled_run_ids: list[int] = []
 
-    async def stop_cancelled_run(self, run_id: int) -> None:
+    async def stop_cancelled_run(self, run_id: int, *, user_id: int) -> None:
+        del user_id
         self.cancelled_run_ids.append(run_id)
 
     async def stop_interrupted_runs(self, run_ids: list[int]) -> None:
@@ -111,7 +112,8 @@ class CancelStopSpy:
 class CancelStopFailureSpy(CancelStopSpy):
     """Simulate local cleanup failure after the authoritative Cancel commit."""
 
-    async def stop_cancelled_run(self, run_id: int) -> None:
+    async def stop_cancelled_run(self, run_id: int, *, user_id: int) -> None:
+        del user_id
         self.cancelled_run_ids.append(run_id)
         raise RuntimeError("injected local stop failure")
 

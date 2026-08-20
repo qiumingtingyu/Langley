@@ -1,6 +1,7 @@
 """Real MySQL integration tests for the production execution shell."""
 
 import asyncio
+import json
 from argparse import Namespace
 
 import pytest
@@ -41,6 +42,9 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.models import Message, Run
+from langley.main import _memory_lifecycle_callbacks, _memory_provider_for
+from langley.memory_policy import MemoryPolicy
+from langley.runs import cancel_owned_run
 from langley.settings import Settings
 
 Admission = NewQuestionAdmission | RetryAdmission | RegenerateAdmission
@@ -469,3 +473,274 @@ def test_success_transaction_rolls_back_run_transition_when_assistant_insert_fai
         == "RUNNING"
     )
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM messages") == 1
+
+
+def _memory_no_change() -> LLMResponseCompleted:
+    return _completion(
+        json.dumps({"mutations": [], "user_requested_memory_action": False})
+    )
+
+
+def test_memory_catch_up_precedes_workflow_and_terminal_drain_is_finite(
+    migrated_database: str,
+) -> None:
+    """T5 uses T4 before and after Answer without widening its boundary."""
+
+    _bootstrap(migrated_database)
+    conversation_id = _create_conversation(migrated_database)
+    first = _admit_new(migrated_database, conversation_id, "first", "first fact")
+    _execute(
+        migrated_database,
+        first,
+        FakeProvider([ScriptedProviderRound(events=(_completion("first answer"),))]),
+    )
+    second = _admit_new(migrated_database, conversation_id, "second", "second fact")
+
+    async def exercise() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        policy = MemoryPolicy(
+            provider=FakeProvider(
+                [
+                    ScriptedProviderRound(events=(_memory_no_change(),)),
+                    ScriptedProviderRound(events=(_memory_no_change(),)),
+                ]
+            ),
+            memory_policy_estimated_token_budget=10_000,
+        )
+        settings = Settings(
+            environment="test",
+            database_url=migrated_database,
+            local_user_id=1,
+            memory_policy_model="test-memory-policy",
+            memory_policy_estimated_token_budget=10_000,
+        )
+        catch_up, capture_boundary, background_drain = _memory_lifecycle_callbacks(
+            settings, session_factory, policy
+        )
+        catch_up_completed = asyncio.Event()
+        background_completed = asyncio.Event()
+
+        async def observed_catch_up(command: Admission) -> None:
+            await catch_up(command)
+            catch_up_completed.set()
+
+        async def observed_background(user_id: int, boundary: int) -> None:
+            assert boundary == second.user_message.id
+            await background_drain(user_id, boundary)
+            background_completed.set()
+
+        class CheckingWorkflow:
+            async def execute(self, *args, **kwargs) -> str:
+                del args, kwargs
+                assert catch_up_completed.is_set()
+                return "second answer"
+
+        manager = AnswerExecutionManager(
+            session_factory,
+            lambda: CheckingWorkflow(),
+            memory_catch_up=observed_catch_up,
+            memory_boundary_capture=capture_boundary,
+            memory_background_drain=observed_background,
+        )
+        try:
+            await manager.schedule(second)
+            answer = manager._active_answers.get(second.run.id)
+            assert answer is not None and answer.task is not None
+            await answer.task
+            await asyncio.wait_for(background_completed.wait(), timeout=2)
+            async with session_factory() as session:
+                first_message = await session.get(Message, first.user_message.id)
+                second_message = await session.get(Message, second.user_message.id)
+                assert first_message is not None
+                assert second_message is not None
+                assert first_message.memory_processed_at is not None
+                assert second_message.memory_processed_at is not None
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(exercise())
+
+
+def test_unexpected_memory_catch_up_failure_fails_open_to_answer(
+    migrated_database: str,
+) -> None:
+    """The outer optional-subsystem seam preserves the Answer terminal outcome."""
+
+    _bootstrap(migrated_database)
+    conversation_id = _create_conversation(migrated_database)
+    admission = _admit_new(migrated_database, conversation_id, "new-key", "question")
+
+    async def exercise() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+
+        async def broken_catch_up(command: Admission) -> None:
+            del command
+            raise RuntimeError("programmer failure")
+
+        manager = AnswerExecutionManager(
+            session_factory,
+            lambda: workflow_for(
+                FakeProvider([ScriptedProviderRound(events=(_completion("answer"),))])
+            ),
+            memory_catch_up=broken_catch_up,
+        )
+        try:
+            await manager.schedule(admission)
+            answer = manager._active_answers.get(admission.run.id)
+            assert answer is not None and answer.task is not None
+            await answer.task
+            async with session_factory() as session:
+                run = await session.get(Run, admission.run.id)
+                assert run is not None
+                assert run.status == "SUCCEEDED"
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(exercise())
+
+
+def test_background_memory_failure_cannot_change_a_failed_run(
+    migrated_database: str,
+) -> None:
+    """A detached post-terminal failure never rewrites durable Run state."""
+
+    _bootstrap(migrated_database)
+    conversation_id = _create_conversation(migrated_database)
+    admission = _admit_new(migrated_database, conversation_id, "new-key", "question")
+
+    async def exercise() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        drain_started = asyncio.Event()
+
+        async def capture_boundary(user_id: int) -> int | None:
+            assert user_id == 1
+            return admission.user_message.id
+
+        async def broken_drain(user_id: int, boundary: int) -> None:
+            assert user_id == 1
+            assert boundary == admission.user_message.id
+            drain_started.set()
+            raise RuntimeError("background failure")
+
+        manager = AnswerExecutionManager(
+            session_factory,
+            lambda: workflow_for(
+                FakeProvider(
+                    [
+                        ScriptedProviderRound(
+                            events=(),
+                            failure=WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED),
+                        )
+                    ]
+                )
+            ),
+            memory_boundary_capture=capture_boundary,
+            memory_background_drain=broken_drain,
+        )
+        try:
+            await manager.schedule(admission)
+            answer = manager._active_answers.get(admission.run.id)
+            assert answer is not None and answer.task is not None
+            await answer.task
+            await asyncio.wait_for(drain_started.wait(), timeout=2)
+            await asyncio.sleep(0)
+            async with session_factory() as session:
+                run = await session.get(Run, admission.run.id)
+                assert run is not None
+                assert run.status == "FAILED"
+                assert run.error_code == "LLM_PROVIDER_FAILED"
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_run_schedules_one_post_commit_memory_wake(
+    migrated_database: str,
+) -> None:
+    """Only the durable CANCELLED winner schedules its detached finite drain."""
+
+    _bootstrap(migrated_database)
+    conversation_id = _create_conversation(migrated_database)
+    admission = _admit_new(migrated_database, conversation_id, "new-key", "question")
+
+    async def exercise() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        provider_started = asyncio.Event()
+        release_provider = asyncio.Event()
+        drain_started = asyncio.Event()
+        boundaries: list[int] = []
+
+        async def capture_boundary(user_id: int) -> int | None:
+            assert user_id == 1
+            return admission.user_message.id
+
+        async def drain(user_id: int, boundary: int) -> None:
+            assert user_id == 1
+            boundaries.append(boundary)
+            drain_started.set()
+
+        manager = AnswerExecutionManager(
+            session_factory,
+            lambda: workflow_for(
+                FakeProvider(
+                    [
+                        ScriptedProviderRound(
+                            events=(),
+                            started=provider_started,
+                            blocked_until=release_provider,
+                        )
+                    ]
+                )
+            ),
+            memory_boundary_capture=capture_boundary,
+            memory_background_drain=drain,
+        )
+        try:
+            await manager.schedule(admission)
+            answer = manager._active_answers.get(admission.run.id)
+            assert answer is not None and answer.task is not None
+            await asyncio.wait_for(provider_started.wait(), timeout=2)
+            async with session_factory() as session:
+                cancelled = await cancel_owned_run(
+                    session, user_id=1, run_id=admission.run.id
+                )
+            assert cancelled.status == "CANCELLED"
+            await manager.stop_cancelled_run(admission.run.id, user_id=1)
+            await asyncio.wait_for(drain_started.wait(), timeout=2)
+            with pytest.raises(asyncio.CancelledError):
+                await answer.task
+            assert boundaries == [admission.user_message.id]
+            async with session_factory() as session:
+                run = await session.get(Run, admission.run.id)
+                assert run is not None
+                assert run.status == "CANCELLED"
+        finally:
+            release_provider.set()
+            await dispose_database_engine(engine)
+
+    asyncio.run(exercise())
+
+
+def test_memory_model_none_constructs_no_policy_provider(
+    migrated_database: str,
+) -> None:
+    """An injected Memory fake stays untouched without explicit model configuration."""
+
+    settings = _settings(migrated_database)
+    memory_provider = FakeProvider([])
+
+    assert _memory_provider_for(settings, memory_provider) is None
+    configured_settings = Settings(
+        environment="test",
+        database_url=migrated_database,
+        local_user_id=1,
+        memory_policy_model="explicit-memory-model",
+        memory_policy_estimated_token_budget=10_000,
+    )
+
+    assert _memory_provider_for(configured_settings, memory_provider) is memory_provider

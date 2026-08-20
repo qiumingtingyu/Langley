@@ -81,6 +81,14 @@ async def process_memory_through(
         )
 
 
+async def capture_memory_high_water(
+    session_factory: SessionFactory, *, user_id: int
+) -> int | None:
+    """Capture one User-serialized finite canonical USER boundary."""
+
+    return await _capture_canonical_boundary(session_factory, user_id)
+
+
 async def add_memory_direct(
     session_factory: SessionFactory,
     *,

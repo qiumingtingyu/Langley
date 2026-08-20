@@ -1,5 +1,6 @@
 """FastAPI application factory."""
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from time import perf_counter
@@ -26,6 +27,14 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.qwen_provider import QwenProvider
+from langley.memory_policy import MemoryPolicy
+from langley.memory_processing import (
+    BACKGROUND_BATCH_LIMIT,
+    PRE_ANSWER_CATCHUP_LIMIT,
+    PRE_ANSWER_CATCHUP_TIMEOUT_SECONDS,
+    capture_memory_high_water,
+    process_memory_through,
+)
 from langley.observability import configure_logging
 from langley.settings import Settings
 
@@ -57,6 +66,81 @@ def _provider_for(settings: Settings, override: LLMProvider | None) -> LLMProvid
         base_url=settings.qwen_base_url,
         model=settings.llm_model,
     )
+
+
+def _memory_provider_for(
+    settings: Settings, override: LLMProvider | None
+) -> LLMProvider | None:
+    """Construct only the explicitly configured Memory Policy provider."""
+
+    if settings.memory_policy_model is None:
+        return None
+    if override is not None:
+        return override
+    if settings.qwen_api_key is None or settings.qwen_base_url is None:
+        return _UnavailableProvider()
+    return QwenProvider(
+        api_key=settings.qwen_api_key,
+        base_url=settings.qwen_base_url,
+        model=settings.memory_policy_model,
+    )
+
+
+def _memory_lifecycle_callbacks(
+    settings: Settings,
+    session_factory,
+    memory_policy: MemoryPolicy,
+):
+    """Build concrete optional-Memory callbacks around T4's one processor."""
+
+    lane = asyncio.Lock()
+
+    async def catch_up(command) -> None:
+        boundary = command.memory_catchup_through_message_id
+        if boundary is None:
+            return
+        try:
+            async with asyncio.timeout(PRE_ANSWER_CATCHUP_TIMEOUT_SECONDS):
+                result = await process_memory_through(
+                    session_factory,
+                    user_id=command.user_id,
+                    through_message_id=boundary,
+                    policy=memory_policy,
+                    local_timezone=settings.local_timezone,
+                    lane=lane,
+                    limit=PRE_ANSWER_CATCHUP_LIMIT,
+                )
+        except TimeoutError:
+            logger.warning(
+                "memory.catch_up.timed_out",
+                run_id=command.run.id,
+                conversation_id=command.run.conversation_id,
+            )
+            return
+        if not result.complete:
+            logger.info(
+                "memory.catch_up.incomplete",
+                run_id=command.run.id,
+                conversation_id=command.run.conversation_id,
+            )
+
+    async def capture_boundary(user_id: int) -> int | None:
+        return await capture_memory_high_water(session_factory, user_id=user_id)
+
+    async def background_drain(user_id: int, boundary: int) -> None:
+        result = await process_memory_through(
+            session_factory,
+            user_id=user_id,
+            through_message_id=boundary,
+            policy=memory_policy,
+            local_timezone=settings.local_timezone,
+            lane=lane,
+            limit=BACKGROUND_BATCH_LIMIT,
+        )
+        if not result.complete:
+            logger.info("memory.background.incomplete", user_id=user_id)
+
+    return catch_up, capture_boundary, background_drain
 
 
 def _workflow_factory_for(
@@ -118,6 +202,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     provider: LLMProvider | None = None,
+    memory_provider: LLMProvider | None = None,
     tracer: Tracer | None = None,
 ) -> FastAPI:
     """Create the Langley FastAPI application."""
@@ -131,9 +216,32 @@ def create_app(
         app.state.database_engine = database_engine
         app.state.session_factory = create_session_factory(database_engine)
         configured_provider = _provider_for(resolved_settings, provider)
+        configured_memory_provider = _memory_provider_for(
+            resolved_settings, memory_provider
+        )
+        memory_callbacks = None
+        if configured_memory_provider is not None:
+            memory_policy = MemoryPolicy(
+                provider=configured_memory_provider,
+                memory_policy_estimated_token_budget=(
+                    resolved_settings.memory_policy_estimated_token_budget
+                ),
+            )
+            memory_callbacks = _memory_lifecycle_callbacks(
+                resolved_settings, app.state.session_factory, memory_policy
+            )
         app.state.execution_manager = AnswerExecutionManager(
             app.state.session_factory,
             _workflow_factory_for(resolved_settings, configured_provider, tracer),
+            memory_catch_up=memory_callbacks[0]
+            if memory_callbacks is not None
+            else None,
+            memory_boundary_capture=(
+                memory_callbacks[1] if memory_callbacks is not None else None
+            ),
+            memory_background_drain=(
+                memory_callbacks[2] if memory_callbacks is not None else None
+            ),
         )
 
     @app.middleware("http")
