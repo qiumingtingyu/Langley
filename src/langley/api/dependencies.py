@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answer_execution import AnswerExecutionManager
 from langley.infrastructure.models import User
+from langley.memory_events import MemoryEventSubscribers
+from langley.memory_policy import MemoryPolicy
 
 
 def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
@@ -37,6 +39,28 @@ def get_execution_manager(request: Request) -> AnswerExecutionManager:
             detail={"code": "DATABASE_NOT_CONFIGURED"},
         )
     return execution_manager
+
+
+def get_settings(request: Request):
+    return request.app.state.settings
+
+
+def get_memory_policy(request: Request) -> MemoryPolicy | None:
+    return getattr(request.app.state, "memory_policy", None)
+
+
+def get_memory_lane(request: Request):
+    lane = getattr(request.app.state, "memory_lane", None)
+    if lane is None:
+        raise HTTPException(status_code=500, detail={"code": "DATABASE_NOT_CONFIGURED"})
+    return lane
+
+
+def get_memory_subscribers(request: Request) -> MemoryEventSubscribers:
+    subscribers = getattr(request.app.state, "memory_subscribers", None)
+    if subscribers is None:
+        raise HTTPException(status_code=500, detail={"code": "DATABASE_NOT_CONFIGURED"})
+    return subscribers
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:

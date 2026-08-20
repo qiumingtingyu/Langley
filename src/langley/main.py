@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from langley.answer_execution import AnswerExecutionManager
@@ -20,6 +21,7 @@ from langley.answering.tracing import LangSmithTracer, Tracer
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.api.conversations import router as conversations_router
 from langley.api.health import router as health_router
+from langley.api.memories import router as memories_router
 from langley.api.runs import router as runs_router
 from langley.infrastructure.database import (
     create_database_engine,
@@ -27,6 +29,7 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.qwen_provider import QwenProvider
+from langley.memory_events import MemoryEventSubscribers
 from langley.memory_policy import MemoryPolicy
 from langley.memory_processing import (
     BACKGROUND_BATCH_LIMIT,
@@ -90,10 +93,12 @@ def _memory_lifecycle_callbacks(
     settings: Settings,
     session_factory,
     memory_policy: MemoryPolicy,
+    lane: asyncio.Lock | None = None,
+    outcome_callback=None,
 ):
     """Build concrete optional-Memory callbacks around T4's one processor."""
 
-    lane = asyncio.Lock()
+    resolved_lane = lane or asyncio.Lock()
 
     async def catch_up(command) -> None:
         boundary = command.memory_catchup_through_message_id
@@ -107,8 +112,9 @@ def _memory_lifecycle_callbacks(
                     through_message_id=boundary,
                     policy=memory_policy,
                     local_timezone=settings.local_timezone,
-                    lane=lane,
+                    lane=resolved_lane,
                     limit=PRE_ANSWER_CATCHUP_LIMIT,
+                    outcome_callback=outcome_callback,
                 )
         except TimeoutError:
             logger.warning(
@@ -134,8 +140,9 @@ def _memory_lifecycle_callbacks(
             through_message_id=boundary,
             policy=memory_policy,
             local_timezone=settings.local_timezone,
-            lane=lane,
+            lane=resolved_lane,
             limit=BACKGROUND_BATCH_LIMIT,
+            outcome_callback=outcome_callback,
         )
         if not result.complete:
             logger.info("memory.background.incomplete", user_id=user_id)
@@ -211,11 +218,23 @@ def create_app(
     resolved_settings = settings if settings is not None else Settings()
     configure_logging(resolved_settings)
     app = FastAPI(lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        del request, error
+        return JSONResponse(
+            status_code=422, content={"detail": {"code": "VALIDATION_ERROR"}}
+        )
+
     app.state.settings = resolved_settings
     if resolved_settings.database_url is not None:
         database_engine = create_database_engine(resolved_settings.database_url)
         app.state.database_engine = database_engine
         app.state.session_factory = create_session_factory(database_engine)
+        app.state.memory_lane = asyncio.Lock()
+        app.state.memory_subscribers = MemoryEventSubscribers()
         configured_provider = _provider_for(resolved_settings, provider)
         configured_memory_provider = _memory_provider_for(
             resolved_settings, memory_provider
@@ -228,8 +247,13 @@ def create_app(
                     resolved_settings.memory_policy_estimated_token_budget
                 ),
             )
+            app.state.memory_policy = memory_policy
             memory_callbacks = _memory_lifecycle_callbacks(
-                resolved_settings, app.state.session_factory, memory_policy
+                resolved_settings,
+                app.state.session_factory,
+                memory_policy,
+                app.state.memory_lane,
+                app.state.memory_subscribers.publish,
             )
         app.state.execution_manager = AnswerExecutionManager(
             app.state.session_factory,
@@ -290,4 +314,5 @@ def create_app(
     app.include_router(health_router)
     app.include_router(conversations_router)
     app.include_router(runs_router)
+    app.include_router(memories_router)
     return app

@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
 
+import structlog
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.answering.errors import WorkflowFailure
 from langley.business_time import utc_naive_to_local_reference, utc_now
 from langley.infrastructure.models import Conversation, Memory, Message, User
+from langley.memory_events import MemoryOutcome
 from langley.memory_policy import (
     MemoryMutationDecision,
     MemoryPolicy,
@@ -30,6 +32,8 @@ PRE_ANSWER_CATCHUP_TIMEOUT_SECONDS = 5
 MANUAL_SYNC_LIMIT = 4
 MANUAL_SYNC_TIMEOUT_SECONDS = 20
 
+logger = structlog.get_logger(__name__)
+
 
 class MemorySynchronizationUnavailableError(RuntimeError):
     """The mandatory ordered Memory barrier could not complete safely."""
@@ -41,6 +45,7 @@ class MemoryProcessingResult:
 
     processed_count: int
     complete: bool
+    outcomes: tuple[MemoryOutcome, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,7 @@ class _DetachedEvidence:
 
     policy_input: MemoryPolicyInput
     auto_memory_enabled: bool
+    conversation_id: int
 
 
 SessionFactory = Callable[[], AsyncSession]
@@ -63,6 +69,7 @@ async def process_memory_through(
     local_timezone: str,
     lane: asyncio.Lock,
     limit: int = BACKGROUND_BATCH_LIMIT,
+    outcome_callback: Callable[[MemoryOutcome], None] | None = None,
 ) -> MemoryProcessingResult:
     """Process the oldest-first finite canonical USER prefix under one local lane."""
 
@@ -71,7 +78,7 @@ async def process_memory_through(
     if limit < 1:
         raise ValueError("limit must be positive")
     async with lane:
-        return await _process_memory_through_locked(
+        result = await _process_memory_through_locked(
             session_factory,
             user_id=user_id,
             through_message_id=through_message_id,
@@ -79,6 +86,21 @@ async def process_memory_through(
             local_timezone=local_timezone,
             limit=limit,
         )
+    if outcome_callback is None:
+        return MemoryProcessingResult(
+            processed_count=result.processed_count, complete=result.complete
+        )
+    for outcome in result.outcomes:
+        try:
+            outcome_callback(outcome)
+        except Exception:
+            logger.exception(
+                "memory.outcome_publish_failed",
+                outcome_kind=outcome.kind,
+                conversation_id=outcome.conversation_id,
+                source_message_id=outcome.source_message_id,
+            )
+    return result
 
 
 async def capture_memory_high_water(
@@ -266,6 +288,7 @@ async def _process_memory_through_locked(
     if through_message_id is None:
         return MemoryProcessingResult(processed_count=0, complete=True)
     processed_count = 0
+    outcomes: list[MemoryOutcome] = []
     while processed_count < limit:
         evidence = await _load_oldest_evidence(
             session_factory,
@@ -275,7 +298,7 @@ async def _process_memory_through_locked(
         )
         if evidence is None:
             return MemoryProcessingResult(
-                processed_count=processed_count, complete=True
+                processed_count=processed_count, complete=True, outcomes=tuple(outcomes)
             )
         try:
             result = await policy.decide(evidence.policy_input)
@@ -290,14 +313,32 @@ async def _process_memory_through_locked(
                 == "closed"
             ):
                 processed_count += 1
+                outcomes.append(
+                    MemoryOutcome(
+                        user_id=user_id,
+                        conversation_id=evidence.conversation_id,
+                        source_message_id=evidence.policy_input.evidence_message_id,
+                        kind="not_saved",
+                    )
+                )
             continue
         except (
             WorkflowFailure,
             MemoryPolicyUnavailableError,
             MemoryPolicyContextInfeasibleError,
         ):
+            outcomes.append(
+                MemoryOutcome(
+                    user_id=user_id,
+                    conversation_id=evidence.conversation_id,
+                    source_message_id=evidence.policy_input.evidence_message_id,
+                    kind="retry_pending",
+                )
+            )
             return MemoryProcessingResult(
-                processed_count=processed_count, complete=False
+                processed_count=processed_count,
+                complete=False,
+                outcomes=tuple(outcomes),
             )
 
         outcome = await _apply_policy_result(
@@ -308,6 +349,31 @@ async def _process_memory_through_locked(
         )
         if outcome == "applied":
             processed_count += 1
+            mutation_counts = _mutation_counts(result)
+            if mutation_counts == (0, 0, 0):
+                if result.user_requested_memory_action:
+                    outcomes.append(
+                        MemoryOutcome(
+                            user_id=user_id,
+                            conversation_id=evidence.conversation_id,
+                            source_message_id=evidence.policy_input.evidence_message_id,
+                            kind="no_change",
+                            user_requested_memory_action=True,
+                        )
+                    )
+            else:
+                outcomes.append(
+                    MemoryOutcome(
+                        user_id=user_id,
+                        conversation_id=evidence.conversation_id,
+                        source_message_id=evidence.policy_input.evidence_message_id,
+                        kind="updated",
+                        user_requested_memory_action=result.user_requested_memory_action,
+                        created_count=mutation_counts[0],
+                        changed_count=mutation_counts[1],
+                        forgotten_count=mutation_counts[2],
+                    )
+                )
         # A concurrent apply/marker/toggle made the detached snapshot stale.
         # Reload the same oldest evidence under current facts rather than closing it.
 
@@ -315,7 +381,9 @@ async def _process_memory_through_locked(
         session_factory, user_id=user_id, through_message_id=through_message_id
     )
     return MemoryProcessingResult(
-        processed_count=processed_count, complete=not remaining
+        processed_count=processed_count,
+        complete=not remaining,
+        outcomes=tuple(outcomes),
     )
 
 
@@ -399,6 +467,7 @@ async def _load_oldest_evidence(
                 ),
             ),
             auto_memory_enabled=user.auto_memory_enabled,
+            conversation_id=source.conversation_id,
         )
 
 
@@ -599,6 +668,14 @@ def _policy_role(role: str) -> Literal["USER", "ASSISTANT"]:
     if role not in {"USER", "ASSISTANT"}:
         raise RuntimeError("persisted message role is invalid")
     return cast(Literal["USER", "ASSISTANT"], role)
+
+
+def _mutation_counts(result: MemoryPolicyResult) -> tuple[int, int, int]:
+    return (
+        sum(mutation.operation == "NEW" for mutation in result.mutations),
+        sum(mutation.operation == "CHANGE" for mutation in result.mutations),
+        sum(mutation.operation == "FORGET" for mutation in result.mutations),
+    )
 
 
 def _validate_direct_valid_until(valid_until: datetime | None, now: datetime) -> None:
