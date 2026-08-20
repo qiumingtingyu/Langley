@@ -1,10 +1,10 @@
 # Langley
 
-Langley Slice 4 provides a bounded Learning Assistant Agent over the durable,
-process-local streaming execution shell. MySQL remains authoritative for
-Conversation, Message, and Run facts; LangGraph state, Tool calls/results, and
-streamed partial text remain transient. Only the canonical completed ASSISTANT
-message is persisted.
+Langley provides a bounded Learning Assistant Agent and Personal Context
+Memory over a durable, process-local streaming execution shell. MySQL remains
+authoritative for Conversation, Message, Run, and Memory facts; LangGraph
+state, Tool calls/results, and streamed partial text remain transient. Only the
+canonical completed ASSISTANT message is persisted.
 
 ## Prerequisites
 
@@ -33,6 +33,9 @@ The current settings are:
 - `LANGLEY_QWEN_BASE_URL` (provider-issued OpenAI-compatible API base URL)
 - `LANGLEY_LLM_MODEL` (defaults to `qwen3.7-plus-2026-05-26`)
 - `LANGLEY_HISTORY_ESTIMATED_TOKEN_BUDGET` (defaults to `16000`)
+- `LANGLEY_MEMORY_ESTIMATED_TOKEN_BUDGET` (defaults to `8192`)
+- `LANGLEY_MEMORY_POLICY_MODEL` (enables the Memory Policy when configured)
+- `LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET` (required with the policy model)
 - `LANGLEY_MAX_LLM_ROUNDS` (defaults to `4`)
 - `LANGLEY_MAX_TOOL_CALLS` (defaults to `3`)
 - `LANGLEY_OVERALL_WORKFLOW_DEADLINE_SECONDS` (defaults to `180`)
@@ -125,12 +128,12 @@ $env:LANGLEY_LANGSMITH_PROJECT = 'langley-slice4-acceptance'
 $env:LANGLEY_TRACE_CONTENT_ENABLED = 'false'
 ```
 
-Real Qwen and LangSmith smoke/eval are manual T8 acceptance activities: they
+Real Qwen and LangSmith smoke/eval are manual acceptance activities: they
 are never default CI commands and should run only against synthetic,
 non-sensitive prompts.
 
-Slice 4 supports exactly one active FastAPI application worker because its
-execution and observation runtime is process-local. Do not use
+The current application supports exactly one active FastAPI application worker
+because execution and observation runtime remains process-local. Do not use
 `uvicorn --workers > 1`. A reload supervisor is acceptable only when it leaves
 one serving/executing application worker active at a time.
 
@@ -196,7 +199,9 @@ uv run pytest tests/integration
 The integration suite uses `asyncmy`, resets the dedicated `langley_test`
 database, runs migrations from empty, and covers command admission, independent
 execution, terminal races, Run query/cancel, SSE observation, lifecycle repair,
-transactions, locks, concurrency, Retry, and Regenerate behavior.
+transactions, locks, concurrency, Retry, Regenerate, and deterministic Personal
+Context persistence, ordered / NO-HOLE processing, barriers, Memory API, and
+outcome semantics.
 
 Before frontend checks on Windows, stop any Langley Vite server started above;
 otherwise its native binding can be locked.
@@ -217,12 +222,20 @@ A-to-B-to-A stale callbacks, Rename, logical Delete, and terminal replay before
 declaring browser acceptance complete. The Tool protocol must never appear in
 the UI or MySQL Message facts.
 
-## Slice 4 boundaries
+Also smoke the Personal Context UI: load current Memory items and settings,
+toggle auto-memory, directly add/edit/forget an item, inspect a source, and
+observe Memory outcome feedback. This UI smoke does not replace the deferred
+T10 real-model semantic evaluation.
+
+## Current boundaries
 
 - one active FastAPI application worker only; no multi-worker execution
 - no Redis, durable queue, worker service, lease, heartbeat, or execution owner
 - no durable SSE event log or `Last-Event-ID` replay
 - no persisted streaming partials
 - no persistent LangGraph checkpointer, RunStep, ToolInvocation, or ToolMessage
-- no memory, RAG/Knowledge, web search, model router, reflection, or multi-agent
+- no RAG/Knowledge, web search, model router, reflection, or multi-agent
+- Personal Context Memory is current-state MySQL data with detached Policy
+  execution; it has no vector index, semantic retrieval, revision/tombstone
+  history, durable worker, queue, or multi-worker coordination
 - Qwen and LangSmith network access are explicit manual opt-ins, never CI defaults
