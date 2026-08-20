@@ -10,6 +10,7 @@ from langley.infrastructure.database import (
     dispose_database_engine,
     require_test_database_url,
 )
+from langley.infrastructure.models import Memory, Message, User
 from langley.main import create_app
 from langley.settings import Settings
 
@@ -63,3 +64,18 @@ def test_create_app_does_not_connect_to_configured_database() -> None:
     )
 
     assert app.state.settings.database_url is not None
+
+
+def test_memory_orm_metadata_matches_the_persistence_contract() -> None:
+    assert set(Memory.__table__.columns.keys()) == {
+        "content",
+        "created_at",
+        "id",
+        "source_message_id",
+        "updated_at",
+        "user_id",
+        "valid_until",
+    }
+    assert {index.name for index in Memory.__table__.indexes} == {"ix_memories_user"}
+    assert User.__table__.c.auto_memory_enabled.nullable is False
+    assert Message.__table__.c.memory_processed_at.nullable is True

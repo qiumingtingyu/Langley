@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -23,6 +24,12 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    auto_memory_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="1",
+        nullable=False,
+    )
 
 
 class Conversation(Base):
@@ -66,6 +73,11 @@ class Message(Base):
             "regenerated_from_message_id IS NULL OR role = 'USER'",
             name="ck_messages_regenerated_from_role",
         ),
+        CheckConstraint(
+            "memory_processed_at IS NULL OR "
+            "(role = 'USER' AND regenerated_from_message_id IS NULL)",
+            name="ck_messages_memory_processed_canonical",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -90,6 +102,32 @@ class Message(Base):
         nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    memory_processed_at: Mapped[datetime | None] = mapped_column(
+        DATETIME(fsp=6), nullable=True
+    )
+
+
+class Memory(Base):
+    """A current, user-owned Personal Context Memory item."""
+
+    __tablename__ = "memories"
+    __table_args__ = (Index("ix_memories_user", "user_id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", name="fk_memories_user"),
+        nullable=False,
+    )
+    content: Mapped[str] = mapped_column(LONGTEXT, nullable=False)
+    source_message_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("messages.id", name="fk_memories_source_message"),
+        nullable=True,
+    )
+    valid_until: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
 class Run(Base):

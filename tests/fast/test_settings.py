@@ -3,6 +3,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from langley.settings import Settings
 
 
@@ -19,6 +21,10 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
         "LANGLEY_QWEN_BASE_URL",
         "LANGLEY_LLM_MODEL",
         "LANGLEY_HISTORY_ESTIMATED_TOKEN_BUDGET",
+        "LANGLEY_MEMORY_ESTIMATED_TOKEN_BUDGET",
+        "LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET",
+        "LANGLEY_MEMORY_POLICY_MODEL",
+        "LANGLEY_LOCAL_TIMEZONE",
         "LANGLEY_MAX_LLM_ROUNDS",
         "LANGLEY_MAX_TOOL_CALLS",
         "LANGLEY_OVERALL_WORKFLOW_DEADLINE_SECONDS",
@@ -49,6 +55,10 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
     assert settings.qwen_base_url is None
     assert settings.llm_model == "qwen3.7-plus-2026-05-26"
     assert settings.history_estimated_token_budget == 16_000
+    assert settings.memory_estimated_token_budget == 8_192
+    assert settings.memory_policy_estimated_token_budget is None
+    assert settings.memory_policy_model is None
+    assert settings.local_timezone == "UTC"
     assert settings.max_llm_rounds == 4
     assert settings.max_tool_calls == 3
     assert settings.overall_workflow_deadline_seconds == 180.0
@@ -69,6 +79,10 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     monkeypatch.setenv("LANGLEY_QWEN_BASE_URL", "https://qwen.example.test/v1")
     monkeypatch.setenv("LANGLEY_LLM_MODEL", "qwen-test-model")
     monkeypatch.setenv("LANGLEY_HISTORY_ESTIMATED_TOKEN_BUDGET", "20000")
+    monkeypatch.setenv("LANGLEY_MEMORY_ESTIMATED_TOKEN_BUDGET", "8192")
+    monkeypatch.setenv("LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET", "12000")
+    monkeypatch.setenv("LANGLEY_MEMORY_POLICY_MODEL", "memory-policy-test-model")
+    monkeypatch.setenv("LANGLEY_LOCAL_TIMEZONE", "Asia/Shanghai")
     monkeypatch.setenv("LANGLEY_MAX_LLM_ROUNDS", "5")
     monkeypatch.setenv("LANGLEY_MAX_TOOL_CALLS", "4")
     monkeypatch.setenv("LANGLEY_OVERALL_WORKFLOW_DEADLINE_SECONDS", "12.5")
@@ -90,6 +104,10 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.qwen_base_url == "https://qwen.example.test/v1"
     assert settings.llm_model == "qwen-test-model"
     assert settings.history_estimated_token_budget == 20_000
+    assert settings.memory_estimated_token_budget == 8_192
+    assert settings.memory_policy_estimated_token_budget == 12_000
+    assert settings.memory_policy_model == "memory-policy-test-model"
+    assert settings.local_timezone == "Asia/Shanghai"
     assert settings.max_llm_rounds == 5
     assert settings.max_tool_calls == 4
     assert settings.overall_workflow_deadline_seconds == 12.5
@@ -98,3 +116,8 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.langsmith_project == "langley-test"
     assert "test-qwen-key" not in repr(settings)
     assert "test-qwen-key" not in str(settings)
+
+
+def test_settings_reject_an_invalid_local_timezone() -> None:
+    with pytest.raises(ValueError, match="IANA timezone"):
+        Settings(local_timezone="not-a-timezone")

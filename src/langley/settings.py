@@ -1,8 +1,9 @@
 """Application configuration."""
 
 from typing import Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogFormat = Literal["console", "json"]
@@ -28,9 +29,23 @@ class Settings(BaseSettings):
     qwen_base_url: str | None = None
     llm_model: str = _DEFAULT_QWEN_MODEL
     history_estimated_token_budget: int = Field(default=16_000, ge=1)
+    memory_estimated_token_budget: int = Field(default=8_192, ge=1)
+    memory_policy_estimated_token_budget: int | None = Field(default=None, ge=1)
+    memory_policy_model: str | None = None
+    local_timezone: str = "UTC"
     max_llm_rounds: int = Field(default=4, ge=1)
     max_tool_calls: int = Field(default=3, ge=1)
     overall_workflow_deadline_seconds: float = Field(default=180.0, gt=0)
     tracing_enabled: bool = False
     trace_content_enabled: bool = False
     langsmith_project: str | None = None
+
+    @field_validator("local_timezone")
+    @classmethod
+    def local_timezone_must_be_an_iana_timezone(cls, value: str) -> str:
+        """Reject invalid timezone names without consulting the host timezone."""
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError("local_timezone must be a valid IANA timezone") from error
+        return value
