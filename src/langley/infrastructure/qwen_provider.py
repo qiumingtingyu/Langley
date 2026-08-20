@@ -158,9 +158,28 @@ class QwenProvider:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": request.system_input}
         ]
-        for item in request.transcript:
+        for index, item in enumerate(request.transcript):
             if isinstance(item, UserRuntimeMessage):
-                messages.append({"role": "user", "content": item.content})
+                content: object = item.content
+                if index == request.current_user_message_index:
+                    content = json.dumps(
+                        {
+                            "personal_context_status": (
+                                "unavailable"
+                                if request.personal_context is None
+                                else "available"
+                            ),
+                            "personal_context": (
+                                None
+                                if request.personal_context is None
+                                else list(request.personal_context)
+                            ),
+                            "current_user_request": item.content,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                messages.append({"role": "user", "content": content})
             elif isinstance(item, AssistantRuntimeMessage):
                 message: dict[str, Any] = {"role": "assistant", "content": item.content}
                 if item.tool_calls:

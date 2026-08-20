@@ -8,7 +8,11 @@ from typing import cast
 import pytest
 from langsmith import get_tracing_context
 
-from langley.answering.context_builder import AnswerContext, AnswerContextBuilder
+from langley.answering.context_builder import (
+    AnswerContext,
+    AnswerContextBuilder,
+    PersonalContextItem,
+)
 from langley.answering.contracts import (
     AssistantContentDelta,
     LLMFinishReason,
@@ -167,6 +171,57 @@ async def test_tool_loop_round_trips_tool_observation() -> None:
     tool_result = cast(ToolResult, second_request.transcript[2])
     assert tool_result.call_id == "time-1"
     assert tool_result.kind is ToolResultKind.SUCCESS
+
+
+@pytest.mark.anyio
+async def test_personal_context_is_not_transcript_and_stays_stable_across_rounds() -> (
+    None
+):
+    tool_call = ToolCall(
+        call_id="time-1", name="get_current_time", raw_arguments='{"timezone":"UTC"}'
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(tool_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="done"),)),
+        ]
+    )
+    context = AnswerContext(
+        completed_turns=(),
+        current_user_content="current request",
+        personal_context=(
+            PersonalContextItem(memory_id=99, content="prefers short examples"),
+        ),
+    )
+
+    await _workflow(
+        provider,
+        context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+    ).execute(
+        cast(object, None),
+        conversation_id=11,
+        input_message_id=22,
+        on_assistant_delta=_discard_delta,
+    )
+
+    assert provider.requests[0].personal_context == ("prefers short examples",)
+    assert provider.requests[1].personal_context == ("prefers short examples",)
+    assert all(
+        "prefers short examples" not in item.content
+        for request in provider.requests
+        for item in request.transcript
+        if isinstance(item, UserRuntimeMessage)
+    )
+    assert provider.requests[0].current_user_message_index == 0
+    assert provider.requests[1].current_user_message_index == 0
 
 
 @pytest.mark.anyio

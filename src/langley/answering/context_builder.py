@@ -2,10 +2,11 @@
 
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from langley.infrastructure.models import Message, Run
+from langley.business_time import utc_now
+from langley.infrastructure.models import Conversation, Memory, Message, Run
 
 
 @dataclass(frozen=True)
@@ -18,20 +19,37 @@ class CompletedTurn:
 
 
 @dataclass(frozen=True)
+class PersonalContextItem:
+    """One detached current Memory fact available to answer generation."""
+
+    memory_id: int
+    content: str
+
+
+@dataclass(frozen=True)
 class AnswerContext:
     """Provider- and framework-neutral context for a current USER input."""
 
     completed_turns: tuple[CompletedTurn, ...]
     current_user_content: str
+    personal_context: tuple[PersonalContextItem, ...] | None = ()
 
 
 class AnswerContextBuilder:
     """Read authoritative facts briefly, then return only detached runtime data."""
 
-    def __init__(self, *, history_estimated_token_budget: int) -> None:
+    def __init__(
+        self,
+        *,
+        history_estimated_token_budget: int,
+        memory_estimated_token_budget: int = 8_192,
+    ) -> None:
         if history_estimated_token_budget < 1:
             raise ValueError("history_estimated_token_budget must be positive")
+        if memory_estimated_token_budget < 1:
+            raise ValueError("memory_estimated_token_budget must be positive")
         self._history_estimated_token_budget = history_estimated_token_budget
+        self._memory_estimated_token_budget = memory_estimated_token_budget
 
     async def build(
         self,
@@ -60,9 +78,29 @@ class AnswerContextBuilder:
                         )
                     ).all()
                 )
+                memories = tuple(
+                    (
+                        await session.scalars(
+                            select(Memory)
+                            .join(
+                                Conversation,
+                                Memory.user_id == Conversation.user_id,
+                            )
+                            .where(
+                                Conversation.id == conversation_id,
+                                or_(
+                                    Memory.valid_until.is_(None),
+                                    Memory.valid_until > utc_now(),
+                                ),
+                            )
+                            .order_by(Memory.updated_at.desc(), Memory.id.desc())
+                        )
+                    ).all()
+                )
                 return self._assemble(
                     messages=messages,
                     runs=runs,
+                    memories=memories,
                     conversation_id=conversation_id,
                     current_user_message_id=current_user_message_id,
                 )
@@ -72,6 +110,7 @@ class AnswerContextBuilder:
         *,
         messages: tuple[Message, ...],
         runs: tuple[Run, ...],
+        memories: tuple[Memory, ...] = (),
         conversation_id: int,
         current_user_message_id: int,
     ) -> AnswerContext:
@@ -95,7 +134,7 @@ class AnswerContextBuilder:
             if message.run_id is not None:
                 assistants_by_run[message.run_id] = message
 
-        complete_turns: list[tuple[int, CompletedTurn]] = []
+        complete_turns: list[tuple[int, int, CompletedTurn]] = []
         for input_message_id, run in successful_runs_by_input.items():
             user_message = messages_by_id.get(input_message_id)
             assistant_message = assistants_by_run.get(run.id)
@@ -107,6 +146,7 @@ class AnswerContextBuilder:
                 complete_turns.append(
                     (
                         user_message.sequence_no,
+                        input_message_id,
                         CompletedTurn(
                             user_content=user_message.content,
                             assistant_content=assistant_message.content,
@@ -117,17 +157,44 @@ class AnswerContextBuilder:
                     )
                 )
 
-        selected_newest_first: list[CompletedTurn] = []
+        selected_newest_first: list[tuple[int, CompletedTurn]] = []
         remaining = self._history_estimated_token_budget
-        for _, turn in sorted(complete_turns, key=lambda item: item[0], reverse=True):
+        for _, input_message_id, turn in sorted(
+            complete_turns, key=lambda item: item[0], reverse=True
+        ):
             if turn.estimated_tokens > remaining:
                 break
-            selected_newest_first.append(turn)
+            selected_newest_first.append(
+                (
+                    input_message_id,
+                    turn,
+                )
+            )
             remaining -= turn.estimated_tokens
 
+        exposed_canonical_user_ids = {
+            self._canonical_user_message_id(current_user),
+            *(
+                self._canonical_user_message_id(messages_by_id[input_message_id])
+                for input_message_id, _ in selected_newest_first
+            ),
+        }
+        personal_context_items = tuple(
+            PersonalContextItem(memory_id=memory.id, content=memory.content)
+            for memory in memories
+            if memory.source_message_id not in exposed_canonical_user_ids
+        )
+        personal_context: tuple[PersonalContextItem, ...] | None = (
+            personal_context_items
+            if self._estimate_personal_context(personal_context_items)
+            <= self._memory_estimated_token_budget
+            else None
+        )
+
         return AnswerContext(
-            completed_turns=tuple(reversed(selected_newest_first)),
+            completed_turns=tuple(turn for _, turn in reversed(selected_newest_first)),
             current_user_content=current_user.content,
+            personal_context=personal_context,
         )
 
     @staticmethod
@@ -135,3 +202,15 @@ class AnswerContextBuilder:
         """Use a deterministic character estimate until tokenization exists."""
 
         return len(user_content) + len(assistant_content)
+
+    @staticmethod
+    def _canonical_user_message_id(message: Message) -> int:
+        """Map regenerated evidence to its original canonical USER identity."""
+
+        return message.regenerated_from_message_id or message.id
+
+    @staticmethod
+    def _estimate_personal_context(
+        personal_context: tuple[PersonalContextItem, ...],
+    ) -> int:
+        return sum(len(item.content) + 32 for item in personal_context)

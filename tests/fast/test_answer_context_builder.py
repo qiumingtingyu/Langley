@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from langley.answering.context_builder import AnswerContextBuilder
-from langley.infrastructure.models import Message, Run
+from langley.infrastructure.models import Memory, Message, Run
 
 NOW = datetime(2026, 8, 14, tzinfo=UTC)
 
@@ -60,15 +60,38 @@ def _run(run_id: int, input_message_id: int, status: str) -> Run:
     )
 
 
+def _memory(
+    memory_id: int,
+    content: str,
+    *,
+    source_message_id: int | None = None,
+) -> Memory:
+    return Memory(
+        id=memory_id,
+        user_id=1,
+        content=content,
+        source_message_id=source_message_id,
+        valid_until=None,
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
 def _build(
     messages: tuple[Message, ...],
     runs: tuple[Run, ...],
     current_user_message_id: int,
     budget: int = 100,
+    memory_budget: int = 8_192,
+    memories: tuple[Memory, ...] = (),
 ):
-    return AnswerContextBuilder(history_estimated_token_budget=budget)._assemble(
+    return AnswerContextBuilder(
+        history_estimated_token_budget=budget,
+        memory_estimated_token_budget=memory_budget,
+    )._assemble(
         messages=messages,
         runs=runs,
+        memories=memories,
         conversation_id=1,
         current_user_message_id=current_user_message_id,
     )
@@ -180,6 +203,67 @@ def test_builder_does_not_skip_an_oversized_turn_for_an_older_one() -> None:
     ]
 
 
+def test_builder_loads_all_personal_context_or_marks_it_unavailable() -> None:
+    messages = (_user(1, 1, "current"),)
+    memory = _memory(10, "preference")
+
+    exact_fit = _build(
+        messages,
+        (_run(1, 1, "PENDING"),),
+        1,
+        memory_budget=len(memory.content) + 32,
+        memories=(memory,),
+    )
+    over_budget = _build(
+        messages,
+        (_run(1, 1, "PENDING"),),
+        1,
+        memory_budget=len(memory.content) + 31,
+        memories=(memory,),
+    )
+
+    assert [
+        (item.memory_id, item.content) for item in exact_fit.personal_context or ()
+    ] == [(10, "preference")]
+    assert over_budget.personal_context is None
+
+
+def test_builder_suppresses_only_exposed_canonical_source_identity() -> None:
+    messages = (
+        _user(1, 1, "history user"),
+        _assistant(2, 2, 10, "history answer"),
+        _user(3, 3, "current"),
+    )
+    context = _build(
+        messages,
+        (_run(10, 1, "SUCCEEDED"), _run(11, 3, "PENDING")),
+        3,
+        memories=(
+            _memory(10, "from exposed original", source_message_id=1),
+            _memory(11, "same meaning is not identity", source_message_id=99),
+        ),
+    )
+
+    assert [item.content for item in context.personal_context or ()] == [
+        "same meaning is not identity"
+    ]
+
+
+def test_builder_maps_regenerated_current_user_to_canonical_source_identity() -> None:
+    messages = (
+        _user(1, 1, "original"),
+        _user(2, 2, "original", regenerated_from_message_id=1),
+    )
+    context = _build(
+        messages,
+        (_run(10, 2, "PENDING"),),
+        2,
+        memories=(_memory(10, "from original", source_message_id=1),),
+    )
+
+    assert context.personal_context == ()
+
+
 def test_builder_releases_its_database_scope_before_returning_context() -> None:
     class ScalarResult:
         def __init__(self, values: tuple[object, ...]) -> None:
@@ -211,7 +295,9 @@ def test_builder_releases_its_database_scope_before_returning_context() -> None:
             self._calls += 1
             if self._calls == 1:
                 return ScalarResult((_user(1, 1, "current"),))
-            return ScalarResult((_run(10, 1, "PENDING"),))
+            if self._calls == 2:
+                return ScalarResult((_run(10, 1, "PENDING"),))
+            return ScalarResult(())
 
     factory = RecordingSessionFactory()
 

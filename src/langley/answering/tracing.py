@@ -125,6 +125,11 @@ class _LangSmithTrace:
             inputs = {
                 "system_input": request.system_input,
                 "transcript": [_transcript_item(item) for item in request.transcript],
+                "personal_context": (
+                    None
+                    if request.personal_context is None
+                    else list(request.personal_context)
+                ),
             }
             outputs = {
                 "assistant_content": response.assistant_content,

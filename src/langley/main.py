@@ -151,7 +151,8 @@ def _workflow_factory_for(
     """Assemble one production Workflow factory without giving routes AI authority."""
 
     context_builder = AnswerContextBuilder(
-        history_estimated_token_budget=settings.history_estimated_token_budget
+        history_estimated_token_budget=settings.history_estimated_token_budget,
+        memory_estimated_token_budget=settings.memory_estimated_token_budget,
     )
     tool_executor = ToolExecutor()
     resolved_tracer = tracer or LangSmithTracer(

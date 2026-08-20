@@ -130,6 +130,42 @@ def test_qwen_provider_maps_normalized_request_and_disables_thinking() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("personal_context", "status", "expected_context"),
+    [
+        (("prefers concise answers",), "available", ["prefers concise answers"]),
+        ((), "available", []),
+        (None, "unavailable", None),
+    ],
+)
+def test_qwen_provider_wraps_only_the_current_user_with_personal_context(
+    personal_context: tuple[str, ...] | None,
+    status: str,
+    expected_context: list[str] | None,
+) -> None:
+    request = LLMRequest(
+        system_input="system prompt",
+        transcript=(
+            UserRuntimeMessage(content="historical user"),
+            AssistantRuntimeMessage(content="historical assistant", tool_calls=()),
+            UserRuntimeMessage(content="current user"),
+        ),
+        allowed_tools=(),
+        personal_context=personal_context,
+        current_user_message_index=2,
+    )
+
+    payload = _provider(lambda _: httpx.Response(200))._request_payload(request)
+
+    assert payload["messages"][1] == {"role": "user", "content": "historical user"}
+    envelope = json.loads(payload["messages"][3]["content"])
+    assert envelope == {
+        "personal_context_status": status,
+        "personal_context": expected_context,
+        "current_user_request": "current user",
+    }
+
+
 def test_qwen_provider_losslessly_aggregates_fragmented_malformed_tool_arguments() -> (
     None
 ):
