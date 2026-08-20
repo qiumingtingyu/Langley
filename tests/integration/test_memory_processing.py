@@ -8,7 +8,8 @@ from datetime import timedelta
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
+from sqlalchemy import event, text
+from sqlalchemy.orm import Session
 
 from langley.answering.contracts import LLMFinishReason, LLMResponseCompleted
 from langley.answering.errors import RunErrorCode, WorkflowFailure
@@ -20,6 +21,7 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.models import Conversation, Memory, Message, User
+from langley.memory_events import MemoryOutcome
 from langley.memory_policy import (
     MemoryPolicy,
     MemoryPolicyInput,
@@ -102,7 +104,12 @@ def _seed_evidence(database_url: str, contents: list[str]) -> tuple[int, list[in
 
 
 def _process(
-    database_url: str, *, through_message_id: int, policy: MemoryPolicy, limit: int = 4
+    database_url: str,
+    *,
+    through_message_id: int,
+    policy: MemoryPolicy,
+    limit: int = 4,
+    outcome_callback=None,
 ):
     async def process():
         engine = create_database_engine(database_url)
@@ -116,6 +123,7 @@ def _process(
                 local_timezone="Asia/Shanghai",
                 lane=asyncio.Lock(),
                 limit=limit,
+                outcome_callback=outcome_callback,
             )
         finally:
             await dispose_database_engine(engine)
@@ -164,6 +172,21 @@ class _GatePolicy(MemoryPolicy):
                 raise self._first
             return self._first
         return self._later
+
+
+class _RecordingPolicy(MemoryPolicy):
+    """Immediate deterministic policy used where an interleaving gate is unnecessary."""
+
+    def __init__(self, decisions: list[MemoryPolicyResult | Exception]):
+        self._decisions = decisions
+        self.inputs: list[MemoryPolicyInput] = []
+
+    async def decide(self, policy_input: MemoryPolicyInput) -> MemoryPolicyResult:
+        self.inputs.append(policy_input)
+        decision = self._decisions.pop(0)
+        if isinstance(decision, Exception):
+            raise decision
+        return decision
 
 
 def _insert_memory(database_url: str, *, content: str = "existing") -> int:
@@ -538,6 +561,518 @@ def test_forget_and_marker_close_together(migrated_database: str) -> None:
             f"WHERE id = {message_ids[0]}",
         )
         == 1
+    )
+
+
+def test_forget_does_not_resurrect_from_already_closed_old_evidence(
+    migrated_database: str,
+) -> None:
+    """A physical FORGET cannot be undone by reprocessing its old provenance."""
+
+    _, message_ids = _seed_evidence(migrated_database, ["remember tea", "forget tea"])
+    first = _process(
+        migrated_database,
+        through_message_id=message_ids[0],
+        policy=_policy(
+            [
+                ScriptedProviderRound(
+                    events=(
+                        _completion(
+                            {
+                                "mutations": [
+                                    {"operation": "NEW", "content": "prefers tea"}
+                                ],
+                                "user_requested_memory_action": True,
+                            }
+                        ),
+                    )
+                )
+            ]
+        ),
+    )
+    assert first.complete
+    memory_id = int(_scalar(migrated_database, "SELECT id FROM memories"))
+
+    forgotten = _process(
+        migrated_database,
+        through_message_id=message_ids[1],
+        policy=_policy(
+            [
+                ScriptedProviderRound(
+                    events=(
+                        _completion(
+                            {
+                                "mutations": [
+                                    {
+                                        "operation": "FORGET",
+                                        "target_memory_id": memory_id,
+                                    }
+                                ],
+                                "user_requested_memory_action": True,
+                            }
+                        ),
+                    )
+                )
+            ]
+        ),
+    )
+    assert forgotten.complete
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 0
+
+    replay_old_boundary = _process(
+        migrated_database,
+        through_message_id=message_ids[0],
+        policy=_policy([]),
+    )
+    assert replay_old_boundary == type(replay_old_boundary)(
+        processed_count=0, complete=True
+    )
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 0
+
+
+def test_apply_transaction_rollback_leaves_effect_and_marker_undurable(
+    migrated_database: str,
+) -> None:
+    """An apply-transaction failure rolls back both NEW and its source marker."""
+
+    _, message_ids = _seed_evidence(migrated_database, ["remember durable fact"])
+
+    def fail_dirty_commit(session) -> None:
+        if session.new or session.dirty or session.deleted:
+            raise RuntimeError("forced apply rollback")
+
+    event.listen(
+        Session,
+        "before_commit",
+        fail_dirty_commit,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="forced apply rollback"):
+            _process(
+                migrated_database,
+                through_message_id=message_ids[0],
+                policy=_policy(
+                    [
+                        ScriptedProviderRound(
+                            events=(
+                                _completion(
+                                    {
+                                        "mutations": [
+                                            {
+                                                "operation": "NEW",
+                                                "content": "durable fact",
+                                            }
+                                        ],
+                                        "user_requested_memory_action": True,
+                                    }
+                                ),
+                            )
+                        )
+                    ]
+                ),
+            )
+    finally:
+        event.remove(
+            Session,
+            "before_commit",
+            fail_dirty_commit,
+        )
+
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 0
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT memory_processed_at IS NULL FROM messages "
+            f"WHERE id = {message_ids[0]}",
+        )
+        == 1
+    )
+
+
+def test_processed_retry_evidence_is_not_processed_twice(
+    migrated_database: str,
+) -> None:
+    """Retry's stable canonical Message identity permits exactly one disposition."""
+
+    _, message_ids = _seed_evidence(migrated_database, ["same retried user evidence"])
+    policy = _policy(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {
+                            "mutations": [
+                                {"operation": "NEW", "content": "one durable fact"}
+                            ],
+                            "user_requested_memory_action": False,
+                        }
+                    ),
+                )
+            )
+        ]
+    )
+
+    assert _process(
+        migrated_database, through_message_id=message_ids[0], policy=policy
+    ).complete
+    retry_drain = _process(
+        migrated_database, through_message_id=message_ids[0], policy=policy
+    )
+
+    assert retry_drain == type(retry_drain)(processed_count=0, complete=True)
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 1
+
+
+def test_regenerated_copy_is_never_selected_as_memory_evidence(
+    migrated_database: str,
+) -> None:
+    """A copied USER Message stays excluded even when it falls below the boundary."""
+
+    conversation_id, message_ids = _seed_evidence(migrated_database, ["canonical"])
+
+    async def add_copy() -> int:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session, session.begin():
+                copied = Message(
+                    conversation_id=conversation_id,
+                    sequence_no=2,
+                    role="USER",
+                    content="regenerated copy",
+                    run_id=None,
+                    regenerated_from_message_id=message_ids[0],
+                    created_at=utc_now(),
+                )
+                session.add(copied)
+                await session.flush()
+                return copied.id
+        finally:
+            await dispose_database_engine(engine)
+
+    copied_id = _run(add_copy())
+    policy = _RecordingPolicy(
+        [_result({"mutations": [], "user_requested_memory_action": False})]
+    )
+    assert _process(
+        migrated_database, through_message_id=copied_id, policy=policy
+    ).complete
+    assert [item.evidence_message_id for item in policy.inputs] == [message_ids[0]]
+    assert [item.evidence_content for item in policy.inputs] == ["canonical"]
+    assert (
+        _scalar(
+            migrated_database,
+            f"SELECT memory_processed_at IS NULL FROM messages WHERE id = {copied_id}",
+        )
+        == 1
+    )
+
+
+def test_cross_conversation_transient_failure_blocks_the_user_global_prefix(
+    migrated_database: str,
+) -> None:
+    """An older Conversation A failure prevents semantic processing of later B."""
+
+    _, first_ids = _seed_evidence(migrated_database, ["older A"])
+
+    async def add_later_conversation() -> int:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session, session.begin():
+                now = utc_now()
+                conversation = Conversation(
+                    user_id=1,
+                    title=None,
+                    created_at=now,
+                    updated_at=now,
+                    last_message_at=now,
+                    deleted_at=None,
+                )
+                session.add(conversation)
+                await session.flush()
+                message = Message(
+                    conversation_id=conversation.id,
+                    sequence_no=1,
+                    role="USER",
+                    content="later B",
+                    run_id=None,
+                    regenerated_from_message_id=None,
+                    created_at=now,
+                )
+                session.add(message)
+                await session.flush()
+                return message.id
+        finally:
+            await dispose_database_engine(engine)
+
+    later_id = _run(add_later_conversation())
+    policy = _RecordingPolicy([WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED)])
+    result = _process(migrated_database, through_message_id=later_id, policy=policy)
+
+    assert result == type(result)(processed_count=0, complete=False)
+    assert [item.evidence_message_id for item in policy.inputs] == [first_ids[0]]
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT COUNT(*) FROM messages WHERE id IN "
+            f"({first_ids[0]}, {later_id}) AND memory_processed_at IS NULL",
+        )
+        == 2
+    )
+
+
+def test_manual_barrier_stops_after_its_bounded_prefix_without_mass_closure(
+    migrated_database: str,
+) -> None:
+    """Direct control cannot close an over-limit backlog to proceed."""
+
+    _, message_ids = _seed_evidence(
+        migrated_database, [f"backlog {index}" for index in range(5)]
+    )
+    policy = _policy(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            )
+            for _ in range(4)
+        ]
+    )
+
+    async def add() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            with pytest.raises(MemorySynchronizationUnavailableError):
+                await add_memory_direct(
+                    session_factory,
+                    user_id=1,
+                    content="must not bypass backlog",
+                    valid_until=None,
+                    policy=policy,
+                    local_timezone="Asia/Shanghai",
+                    lane=asyncio.Lock(),
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    _run(add())
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 0
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT COUNT(*) FROM messages WHERE id IN "
+            f"({', '.join(map(str, message_ids))}) AND memory_processed_at IS NULL",
+        )
+        == 1
+    )
+
+
+def test_real_processing_outcomes_match_durable_dispositions_and_publish_fail_open(
+    migrated_database: str,
+) -> None:
+    """Post-commit outcomes retain source correlation and cannot undo durable Memory."""
+
+    conversation_id, message_ids = _seed_evidence(
+        migrated_database,
+        ["remember", "explicit no change", "retry later", "bad output"],
+    )
+    outcomes = []
+
+    def broken_publish(outcome) -> None:
+        outcomes.append(outcome)
+        raise RuntimeError("subscriber gone")
+
+    policy = _policy(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {
+                            "mutations": [
+                                {"operation": "NEW", "content": "saved by outcome"}
+                            ],
+                            "user_requested_memory_action": True,
+                        }
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": True}
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(), failure=WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED)
+            ),
+        ]
+    )
+
+    async def process() -> object:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            return await process_memory_through(
+                session_factory,
+                user_id=1,
+                through_message_id=message_ids[-1],
+                policy=policy,
+                local_timezone="Asia/Shanghai",
+                lane=asyncio.Lock(),
+                limit=4,
+                outcome_callback=broken_publish,
+            )
+        finally:
+            await dispose_database_engine(engine)
+
+    result = _run(process())
+    assert result.complete is False
+    assert [(outcome.kind, outcome.source_message_id) for outcome in outcomes] == [
+        ("updated", message_ids[0]),
+        ("no_change", message_ids[1]),
+        ("retry_pending", message_ids[2]),
+    ]
+    assert all(outcome.conversation_id == conversation_id for outcome in outcomes)
+    assert outcomes[0].created_count == 1
+    assert outcomes[0].user_requested_memory_action is True
+    assert outcomes[1].user_requested_memory_action is True
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 1
+    memory_id = int(_scalar(migrated_database, "SELECT id FROM memories"))
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT COUNT(*) FROM messages "
+            "WHERE memory_processed_at IS NOT NULL "
+            f"AND id IN ({message_ids[0]}, {message_ids[1]})",
+        )
+        == 2
+    )
+
+    invalid_outcomes: list[MemoryOutcome] = []
+    invalid = _process(
+        migrated_database,
+        through_message_id=message_ids[-1],
+        policy=_RecordingPolicy(
+            [MemoryPolicyInvalidOutputError("bounded invalid output")]
+        ),
+        limit=1,
+        outcome_callback=invalid_outcomes.append,
+    )
+    assert invalid.complete is False
+    assert invalid_outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[2],
+            kind="not_saved",
+        )
+    ]
+
+    changed_outcomes: list[MemoryOutcome] = []
+    changed = _process(
+        migrated_database,
+        through_message_id=message_ids[3],
+        policy=_RecordingPolicy(
+            [
+                _result(
+                    {
+                        "mutations": [
+                            {
+                                "operation": "CHANGE",
+                                "target_memory_id": memory_id,
+                                "content": "changed by outcome",
+                            }
+                        ],
+                        "user_requested_memory_action": True,
+                    }
+                )
+            ]
+        ),
+        limit=1,
+        outcome_callback=changed_outcomes.append,
+    )
+    assert changed.complete is True
+    assert changed_outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[3],
+            kind="updated",
+            user_requested_memory_action=True,
+            changed_count=1,
+        )
+    ]
+    assert (
+        _scalar(
+            migrated_database,
+            f"SELECT content FROM memories WHERE id = {memory_id}",
+        )
+        == "changed by outcome"
+    )
+
+    async def add_forget_evidence() -> int:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session, session.begin():
+                source = Message(
+                    conversation_id=conversation_id,
+                    sequence_no=5,
+                    role="USER",
+                    content="forget changed fact",
+                    run_id=None,
+                    regenerated_from_message_id=None,
+                    created_at=utc_now(),
+                )
+                session.add(source)
+                await session.flush()
+                return source.id
+        finally:
+            await dispose_database_engine(engine)
+
+    forget_message_id = _run(add_forget_evidence())
+    forgotten_outcomes: list[MemoryOutcome] = []
+    forgotten = _process(
+        migrated_database,
+        through_message_id=forget_message_id,
+        policy=_RecordingPolicy(
+            [
+                _result(
+                    {
+                        "mutations": [
+                            {"operation": "FORGET", "target_memory_id": memory_id}
+                        ],
+                        "user_requested_memory_action": True,
+                    }
+                )
+            ]
+        ),
+        limit=1,
+        outcome_callback=forgotten_outcomes.append,
+    )
+    assert forgotten.complete is True
+    assert forgotten_outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=forget_message_id,
+            kind="updated",
+            user_requested_memory_action=True,
+            forgotten_count=1,
+        )
+    ]
+    assert (
+        _scalar(
+            migrated_database,
+            f"SELECT COUNT(*) FROM memories WHERE id = {memory_id}",
+        )
+        == 0
     )
 
 

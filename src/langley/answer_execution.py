@@ -74,21 +74,24 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
                 conversation_id=command.run.conversation_id,
             )
-            self._close_after_terminal(
-                answer,
-                (
-                    "run.failed",
-                    {"run_id": command.run.id, "error_code": "ANSWER_EXECUTION_FAILED"},
-                ),
-            )
-            self._active_answers.pop(command.run.id, None)
             changed = await _mark_active_execution_failed(
                 self._session_factory,
                 conversation_id=command.run.conversation_id,
                 run_id=command.run.id,
             )
             if changed:
+                self._close_after_terminal(
+                    answer,
+                    (
+                        "run.failed",
+                        {
+                            "run_id": command.run.id,
+                            "error_code": "ANSWER_EXECUTION_FAILED",
+                        },
+                    ),
+                )
                 await self._schedule_memory_wake(command.user_id)
+            self._active_answers.pop(command.run.id, None)
 
     async def stop_cancelled_run(self, run_id: int, *, user_id: int) -> None:
         """Best-effort local stop only after MySQL has committed CANCELLED."""

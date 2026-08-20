@@ -212,6 +212,124 @@ def _run(database_url: str, statement: str) -> None:
     asyncio.run(execute())
 
 
+def test_scheduler_failure_publishes_only_after_durable_failed_transition(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    conversation_id = _create_conversation(migrated_database)
+    admission = _admit_new(migrated_database, conversation_id, "scheduler-failure", "q")
+
+    async def exercise() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        scheduling_attempts = 0
+        drain_started = asyncio.Event()
+
+        def schedule(coroutine):
+            nonlocal scheduling_attempts
+            scheduling_attempts += 1
+            if scheduling_attempts == 1:
+                raise RuntimeError("no answer task")
+            return asyncio.create_task(coroutine)
+
+        async def capture_boundary(user_id: int) -> int | None:
+            assert user_id == 1
+            return admission.user_message.id
+
+        async def drain(user_id: int, boundary: int) -> None:
+            assert user_id == 1
+            assert boundary == admission.user_message.id
+            drain_started.set()
+
+        manager = AnswerExecutionManager(
+            session_factory,
+            lambda: workflow_for(FakeProvider([])),
+            task_scheduler=schedule,
+            memory_boundary_capture=capture_boundary,
+            memory_background_drain=drain,
+        )
+        observed: list[str] = []
+        original_close = manager._close_after_terminal
+
+        def observe_terminal(answer, terminal):
+            observed.append(terminal[0])
+            original_close(answer, terminal)
+
+        manager._close_after_terminal = observe_terminal
+        try:
+            await manager.schedule(admission)
+            async with session_factory() as session:
+                run = await session.get(Run, admission.run.id)
+                assert run is not None and run.status == "FAILED"
+            assert observed == ["run.failed"]
+            await asyncio.wait_for(drain_started.wait(), timeout=2)
+            assert scheduling_attempts == 2
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(exercise())
+
+
+def test_scheduler_failure_loser_emits_no_terminal_event_or_memory_wake(
+    migrated_database: str,
+) -> None:
+    """A losing scheduler failure has no presentation authority."""
+
+    _bootstrap(migrated_database)
+    conversation_id = _create_conversation(migrated_database)
+    admission = _admit_new(migrated_database, conversation_id, "scheduler-loser", "q")
+    _run(
+        migrated_database,
+        "UPDATE runs SET status = 'CANCELLED', "
+        "finished_at = NOW(6), updated_at = NOW(6) "
+        f"WHERE id = {admission.run.id}",
+    )
+
+    async def exercise() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        wakes: list[int] = []
+        manager = AnswerExecutionManager(
+            session_factory,
+            lambda: workflow_for(FakeProvider([])),
+            task_scheduler=lambda coroutine: (_ for _ in ()).throw(
+                RuntimeError("no task")
+            ),
+            memory_boundary_capture=lambda user_id: _record_wake(wakes, user_id),
+            memory_background_drain=lambda user_id, boundary: _unexpected_drain(
+                user_id, boundary
+            ),
+        )
+        observed: list[str] = []
+        original_close = manager._close_after_terminal
+
+        def observe_terminal(answer, terminal):
+            observed.append(terminal[0])
+            original_close(answer, terminal)
+
+        manager._close_after_terminal = observe_terminal
+        try:
+            await manager.schedule(admission)
+            async with session_factory() as session:
+                run = await session.get(Run, admission.run.id)
+                assert run is not None and run.status == "CANCELLED"
+            assert observed == []
+            assert wakes == []
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(exercise())
+
+
+async def _record_wake(wakes: list[int], user_id: int) -> int | None:
+    wakes.append(user_id)
+    return None
+
+
+async def _unexpected_drain(user_id: int, boundary: int) -> None:
+    raise AssertionError(f"unexpected memory drain for {user_id=} {boundary=}")
+
+
 def test_successful_execution_commits_assistant_and_succeeded_run(
     migrated_database: str,
 ) -> None:
