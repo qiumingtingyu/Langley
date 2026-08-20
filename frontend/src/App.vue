@@ -14,6 +14,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import MessageContent from "@/components/MessageContent.vue";
+import MemoryPage from "@/MemoryPage.vue";
 
 type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 
@@ -80,10 +81,15 @@ const isLoading = ref(true);
 const requestError = ref<string | null>(null);
 const pendingNetworkCommand = ref<PendingCommand | null>(null);
 const streamState = ref<StreamState | null>(null);
+const activeView = ref<"chat" | "memory">("chat");
+const memoryNotice = ref<string | null>(null);
+const memoryPage = ref<{ load(): Promise<void> } | null>(null);
 
 let viewRevision = 0;
 let readController: AbortController | null = null;
 let eventSource: EventSource | null = null;
+let memoryEventSource: EventSource | null = null;
+let memoryNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 const selectedConversation = computed(() =>
   conversations.value.find((conversation) => conversation.id === selectedConversationId.value),
@@ -125,6 +131,26 @@ function closeStream(): void {
   eventSource?.close();
   eventSource = null;
   streamState.value = null;
+}
+
+function showMemoryNotice(message: string): void {
+  memoryNotice.value = message;
+  if (memoryNoticeTimer !== null) clearTimeout(memoryNoticeTimer);
+  memoryNoticeTimer = setTimeout(() => { memoryNotice.value = null; }, 4000);
+}
+
+function observeMemoryEvents(): void {
+  memoryEventSource?.close();
+  const source = new EventSource("/api/memory-events");
+  memoryEventSource = source;
+  source.addEventListener("memory.updated", (event) => {
+    const payload = JSON.parse((event as MessageEvent<string>).data) as { user_requested_memory_action?: boolean };
+    showMemoryNotice(payload.user_requested_memory_action ? "长期记忆已更新。" : "长期记忆已更新。");
+    if (activeView.value === "memory") void memoryPage.value?.load();
+  });
+  source.addEventListener("memory.no_change", () => showMemoryNotice("本次未对长期记忆做出修改。"));
+  source.addEventListener("memory.retry_pending", () => showMemoryNotice("长期记忆同步暂时未完成，后续交互时会再次尝试。"));
+  source.addEventListener("memory.not_saved", () => showMemoryNotice("本次内容未保存为长期记忆。"));
 }
 
 function beginView(conversationId: number | null): number {
@@ -452,10 +478,12 @@ async function deleteSelectedConversation(): Promise<void> {
   }
 }
 
-onMounted(() => void refreshFacts());
+onMounted(() => { void refreshFacts(); observeMemoryEvents(); });
 onBeforeUnmount(() => {
   readController?.abort();
   closeStream();
+  memoryEventSource?.close();
+  if (memoryNoticeTimer !== null) clearTimeout(memoryNoticeTimer);
 });
 </script>
 
@@ -483,6 +511,23 @@ onBeforeUnmount(() => {
         />
         新建会话
       </Button>
+
+      <div class="mb-4 flex gap-1 rounded-md bg-stone-200/60 p-1 text-sm">
+        <button
+          class="flex-1 rounded px-2 py-1.5"
+          :class="activeView === 'chat' ? 'bg-white shadow-sm' : ''"
+          @click="activeView = 'chat'"
+        >
+          聊天
+        </button>
+        <button
+          class="flex-1 rounded px-2 py-1.5"
+          :class="activeView === 'memory' ? 'bg-white shadow-sm' : ''"
+          @click="activeView = 'memory'"
+        >
+          记忆
+        </button>
+      </div>
 
       <div class="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.13em] text-slate-500">
         会话列表
@@ -521,7 +566,10 @@ onBeforeUnmount(() => {
       </nav>
     </aside>
 
-    <section class="flex min-w-0 flex-1 flex-col">
+    <section
+      v-if="activeView === 'chat'"
+      class="flex min-w-0 flex-1 flex-col"
+    >
       <header class="flex h-16 shrink-0 items-center justify-between border-b border-stone-200 bg-stone-50/90 px-8">
         <div>
           <p class="text-sm font-semibold text-slate-900">
@@ -792,6 +840,22 @@ onBeforeUnmount(() => {
           </form>
         </div>
       </div>
+    </section>
+    <section
+      v-else
+      class="min-w-0 flex-1 overflow-y-auto"
+    >
+      <p
+        v-if="memoryNotice"
+        role="status"
+        class="mx-auto mt-5 w-full max-w-3xl rounded border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-900"
+      >
+        {{ memoryNotice }}
+      </p>
+      <MemoryPage
+        ref="memoryPage"
+        @notice="showMemoryNotice"
+      />
     </section>
   </main>
 </template>
