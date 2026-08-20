@@ -43,7 +43,7 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.models import Message, Run
 from langley.main import _memory_lifecycle_callbacks, _memory_provider_for
-from langley.memory_policy import MemoryPolicy
+from langley.memory.policy import MemoryPolicy
 from langley.runs import cancel_owned_run
 from langley.settings import Settings
 

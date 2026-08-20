@@ -15,7 +15,7 @@ from langley.answering.contracts import (
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
-from langley.memory_policy import (
+from langley.memory.policy import (
     MemoryPolicy,
     MemoryPolicyContextInfeasibleError,
     MemoryPolicyConversationMessage,

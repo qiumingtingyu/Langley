@@ -23,19 +23,19 @@ from langley.api.dependencies import (
 from langley.api.responses import as_optional_utc, as_utc, message_response
 from langley.business_time import normalize_aware_datetime_to_utc_naive, utc_now
 from langley.infrastructure.models import Memory, User
-from langley.memories import (
-    get_memory_source_context,
-    get_owned_current_memory,
-    list_current_memories,
-)
-from langley.memory_events import MemoryEventSubscribers, MemoryOutcome
-from langley.memory_policy import MemoryPolicy
-from langley.memory_processing import (
+from langley.memory.events import MemoryEventSubscribers, MemoryOutcome
+from langley.memory.policy import MemoryPolicy
+from langley.memory.processing import (
     MemorySynchronizationUnavailableError,
     add_memory_direct,
     correct_memory_direct,
     forget_memory_direct,
     set_auto_memory_enabled,
+)
+from langley.memory.reads import (
+    get_memory_source_context,
+    get_owned_current_memory,
+    list_current_memories,
 )
 from langley.settings import Settings
 

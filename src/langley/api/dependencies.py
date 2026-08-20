@@ -7,8 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answer_execution import AnswerExecutionManager
 from langley.infrastructure.models import User
-from langley.memory_events import MemoryEventSubscribers
-from langley.memory_policy import MemoryPolicy
+from langley.memory.events import MemoryEventSubscribers
+from langley.memory.policy import MemoryPolicy
 
 
 def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:

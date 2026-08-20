@@ -13,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from langley.answering.errors import WorkflowFailure
 from langley.business_time import utc_naive_to_local_reference, utc_now
 from langley.infrastructure.models import Conversation, Memory, Message, User
-from langley.memory_events import MemoryOutcome
-from langley.memory_policy import (
+from langley.memory.events import MemoryOutcome
+from langley.memory.policy import (
     MemoryMutationDecision,
     MemoryPolicy,
     MemoryPolicyContextInfeasibleError,

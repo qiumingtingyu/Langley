@@ -16,7 +16,7 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.models import Conversation, Memory, Message, Run, User
-from langley.memories import (
+from langley.memory.reads import (
     get_memory_source_context,
     get_owned_current_memory,
     list_current_memories,

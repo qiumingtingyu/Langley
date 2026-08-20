@@ -3,7 +3,7 @@
 import pytest
 
 from langley.api.memories import _encode_outcome
-from langley.memory_events import MemoryEventSubscribers, MemoryOutcome
+from langley.memory.events import MemoryEventSubscribers, MemoryOutcome
 
 
 def test_memory_event_subscribers_are_user_scoped_and_unsubscribable() -> None:

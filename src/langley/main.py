@@ -29,9 +29,9 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.qwen_provider import QwenProvider
-from langley.memory_events import MemoryEventSubscribers
-from langley.memory_policy import MemoryPolicy
-from langley.memory_processing import (
+from langley.memory.events import MemoryEventSubscribers
+from langley.memory.policy import MemoryPolicy
+from langley.memory.processing import (
     BACKGROUND_BATCH_LIMIT,
     PRE_ANSWER_CATCHUP_LIMIT,
     PRE_ANSWER_CATCHUP_TIMEOUT_SECONDS,
