@@ -2,13 +2,29 @@
 
 from hashlib import sha256
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.business_time import utc_now
 from langley.infrastructure.local_file_storage import LocalFileStorage
-from langley.infrastructure.models import Document, DocumentVersion, KnowledgeBase, User
-from langley.knowledge.contracts import DocumentSourceRef, FileStorage
+from langley.infrastructure.models import (
+    Document,
+    DocumentVersion,
+    KnowledgeBase,
+    KnowledgeChunk,
+    User,
+)
+from langley.knowledge.chunking import (
+    CandidateChunk,
+    ChunkingConfig,
+    build_candidate_chunks,
+)
+from langley.knowledge.contracts import (
+    DocumentSourceRef,
+    FileStorage,
+    encode_source_region,
+)
+from langley.knowledge.markdown import parse_markdown
 
 _ASCII_WHITESPACE = " \t\n\r\f\v"
 _SUPPORTED_SOURCE_MEDIA_TYPE = "text/markdown"
@@ -154,6 +170,94 @@ async def read_verified_source(
     if sha256(source_bytes).hexdigest() != source_ref.source_sha256:
         raise SourceIntegrityError("stored source hash does not match persisted facts")
     return source_bytes
+
+
+async def rebuild_document_version_chunks(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    file_storage: FileStorage,
+    user_id: int,
+    document_version_id: int,
+    config: ChunkingConfig,
+) -> None:
+    """Atomically replace current chunks from one verified immutable source."""
+
+    source_ref = await load_document_source_ref(
+        session_factory, user_id=user_id, document_version_id=document_version_id
+    )
+    source_bytes = await read_verified_source(file_storage, source_ref)
+    candidates = build_candidate_chunks(parse_markdown(source_bytes), config)
+    prepared_rows = _materialize_chunk_rows(document_version_id, candidates)
+    await _replace_document_version_chunks(
+        session_factory=session_factory,
+        user_id=user_id,
+        source_ref=source_ref,
+        prepared_rows=prepared_rows,
+    )
+
+
+def _materialize_chunk_rows(
+    document_version_id: int, candidates: tuple[CandidateChunk, ...]
+) -> list[KnowledgeChunk]:
+    now = utc_now()
+    return [
+        KnowledgeChunk(
+            document_version_id=document_version_id,
+            ordinal=candidate.ordinal,
+            content=candidate.content,
+            heading_path=list(candidate.heading_path),
+            source_regions=[
+                encode_source_region(region) for region in candidate.source_regions
+            ],
+            created_at=now,
+        )
+        for candidate in candidates
+    ]
+
+
+async def _replace_document_version_chunks(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    user_id: int,
+    source_ref: DocumentSourceRef,
+    prepared_rows: list[KnowledgeChunk],
+) -> None:
+    owned_document_ids = (
+        select(Document.id).join(KnowledgeBase).where(KnowledgeBase.user_id == user_id)
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            version = await session.scalar(
+                select(DocumentVersion)
+                .where(
+                    DocumentVersion.id == source_ref.document_version_id,
+                    DocumentVersion.document_id.in_(owned_document_ids),
+                )
+                .with_for_update()
+            )
+            if version is None:
+                raise DocumentVersionNotFoundError
+            if not _document_version_matches_source_ref(version, source_ref):
+                raise RuntimeError("document source identity changed during rebuild")
+            await session.execute(
+                delete(KnowledgeChunk).where(
+                    KnowledgeChunk.document_version_id == version.id
+                )
+            )
+            session.add_all(prepared_rows)
+            await session.flush()
+
+
+def _document_version_matches_source_ref(
+    version: DocumentVersion, source_ref: DocumentSourceRef
+) -> bool:
+    """Compare every immutable source fact captured before slow rebuild work."""
+    return (
+        version.storage_key == source_ref.storage_key
+        and version.source_media_type == source_ref.source_media_type
+        and version.source_sha256 == source_ref.source_sha256
+        and version.source_size_bytes == source_ref.source_size_bytes
+    )
 
 
 async def find_unreferenced_local_sources(
