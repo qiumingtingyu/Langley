@@ -227,6 +227,7 @@ def test_memory_cutover_marks_only_pre_slice5_canonical_user_messages(
 
     command.downgrade(config, "0002_conversation_answer_loop")
     command.upgrade(config, "head")
+    expected_revision = ScriptDirectory.from_config(config).get_current_head()
 
     async def current_revision() -> str | None:
         engine = create_database_engine(test_database_url)
@@ -238,4 +239,4 @@ def test_memory_cutover_marks_only_pre_slice5_canonical_user_messages(
         finally:
             await dispose_database_engine(engine)
 
-    assert asyncio.run(current_revision()) == "0004_knowledge_persistence"
+    assert asyncio.run(current_revision()) == expected_revision

@@ -3,6 +3,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -120,6 +121,45 @@ class DocumentVersion(Base):
     storage_key: Mapped[str] = mapped_column(
         String(512, collation="utf8mb4_0900_bin"), nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
+class KnowledgeChunk(Base):
+    """One current authoritative chunk with typed JSON provenance."""
+
+    __tablename__ = "knowledge_chunks"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id", "ordinal", name="uq_knowledge_chunks_version_ordinal"
+        ),
+        CheckConstraint("ordinal > 0", name="ck_knowledge_chunks_ordinal_positive"),
+        CheckConstraint(
+            "CHAR_LENGTH(content) > 0", name="ck_knowledge_chunks_content_nonempty"
+        ),
+        CheckConstraint(
+            "JSON_TYPE(heading_path) = 'ARRAY'",
+            name="ck_knowledge_chunks_heading_path_array",
+        ),
+        CheckConstraint(
+            "JSON_TYPE(source_regions) = 'ARRAY' AND JSON_LENGTH(source_regions) > 0",
+            name="ck_knowledge_chunks_source_regions_nonempty_array",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "document_versions.id",
+            name="fk_knowledge_chunks_document_version",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content: Mapped[str] = mapped_column(LONGTEXT, nullable=False)
+    heading_path: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+    source_regions: Mapped[list[object]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
