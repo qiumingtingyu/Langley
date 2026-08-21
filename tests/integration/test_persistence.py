@@ -238,4 +238,4 @@ def test_memory_cutover_marks_only_pre_slice5_canonical_user_messages(
         finally:
             await dispose_database_engine(engine)
 
-    assert asyncio.run(current_revision()) == "0003_personal_context_memory"
+    assert asyncio.run(current_revision()) == "0004_knowledge_persistence"

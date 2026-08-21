@@ -32,6 +32,97 @@ class User(Base):
     )
 
 
+class KnowledgeBase(Base):
+    """A user-owned grouping of logically related knowledge documents."""
+
+    __tablename__ = "knowledge_bases"
+    __table_args__ = (
+        Index("ix_knowledge_bases_user", "user_id"),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(name)) > 0", name="ck_knowledge_bases_name_nonblank"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", name="fk_knowledge_bases_user"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
+class Document(Base):
+    """A logical user-visible document within one KnowledgeBase."""
+
+    __tablename__ = "documents"
+    __table_args__ = (
+        Index("ix_documents_knowledge_base", "knowledge_base_id"),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(name)) > 0", name="ck_documents_name_nonblank"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    knowledge_base_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("knowledge_bases.id", name="fk_documents_knowledge_base"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
+class DocumentVersion(Base):
+    """One immutable source upload belonging to a logical Document."""
+
+    __tablename__ = "document_versions"
+    __table_args__ = (
+        UniqueConstraint("storage_key", name="uq_document_versions_storage_key"),
+        Index("ix_document_versions_document", "document_id"),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(source_filename)) > 0",
+            name="ck_document_versions_source_filename_nonblank",
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(source_media_type)) > 0",
+            name="ck_document_versions_source_media_type_nonblank",
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(source_sha256) = 64",
+            name="ck_document_versions_source_sha256_length",
+        ),
+        CheckConstraint(
+            "source_size_bytes > 0",
+            name="ck_document_versions_source_size_bytes_positive",
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(storage_key)) > 0",
+            name="ck_document_versions_storage_key_nonblank",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("documents.id", name="fk_document_versions_document"),
+        nullable=False,
+    )
+    source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_media_type: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    source_sha256: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    source_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    storage_key: Mapped[str] = mapped_column(
+        String(512, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
 class Conversation(Base):
     """A user-owned, linearly ordered conversation."""
 

@@ -28,6 +28,7 @@ from langley.infrastructure.database import (
     create_session_factory,
     dispose_database_engine,
 )
+from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.qwen_provider import QwenProvider
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy
@@ -188,8 +189,13 @@ def _workflow_factory_for(
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Record application lifecycle events without external side effects."""
 
+    session_factory = None
+    execution_manager = None
     logger.info("application.started")
     try:
+        local_file_storage = getattr(app.state, "local_file_storage", None)
+        if local_file_storage is not None:
+            await local_file_storage.cleanup_partial_sources()
         session_factory = getattr(app.state, "session_factory", None)
         execution_manager = getattr(app.state, "execution_manager", None)
         if session_factory is not None:
@@ -229,6 +235,9 @@ def create_app(
         )
 
     app.state.settings = resolved_settings
+    app.state.local_file_storage = LocalFileStorage(
+        resolved_settings.knowledge_storage_root
+    )
     if resolved_settings.database_url is not None:
         database_engine = create_database_engine(resolved_settings.database_url)
         app.state.database_engine = database_engine

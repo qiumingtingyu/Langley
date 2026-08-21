@@ -1,5 +1,6 @@
 """Application configuration."""
 
+from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     log_format: LogFormat = "console"
     database_url: str | None = None
     test_database_url: str | None = None
+    knowledge_storage_root: Path = Path("data/knowledge")
     local_user_id: int | None = None
     llm_provider: LLMProviderName = "qwen"
     qwen_api_key: SecretStr | None = None

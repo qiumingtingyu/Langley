@@ -27,6 +27,7 @@ The current settings are:
 - `LANGLEY_LOG_FORMAT` (defaults to `console`)
 - `LANGLEY_DATABASE_URL` (development database)
 - `LANGLEY_TEST_DATABASE_URL` (dedicated integration database only)
+- `LANGLEY_KNOWLEDGE_STORAGE_ROOT` (defaults to `data/knowledge`)
 - `LANGLEY_LOCAL_USER_ID` (explicit local/demo user for conversation APIs)
 - `LANGLEY_LLM_PROVIDER` (currently only `qwen`; defaults to `qwen`)
 - `LANGLEY_QWEN_API_KEY` (real-service opt-in credential; never commit it)
@@ -234,7 +235,9 @@ T10 real-model semantic evaluation.
 - no durable SSE event log or `Last-Event-ID` replay
 - no persisted streaming partials
 - no persistent LangGraph checkpointer, RunStep, ToolInvocation, or ToolMessage
-- no RAG/Knowledge, web search, model router, reflection, or multi-agent
+- Knowledge persistence stores immutable Markdown source bytes locally, but has
+  no Knowledge API, parsing, chunking, retrieval, citations, or Knowledge QA
+- no web search, model router, reflection, or multi-agent
 - Personal Context Memory is current-state MySQL data with detached Policy
   execution; it has no vector index, semantic retrieval, revision/tombstone
   history, durable worker, queue, or multi-worker coordination

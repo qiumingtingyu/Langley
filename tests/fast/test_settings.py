@@ -15,6 +15,7 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
         "LANGLEY_LOG_FORMAT",
         "LANGLEY_DATABASE_URL",
         "LANGLEY_TEST_DATABASE_URL",
+        "LANGLEY_KNOWLEDGE_STORAGE_ROOT",
         "LANGLEY_LOCAL_USER_ID",
         "LANGLEY_LLM_PROVIDER",
         "LANGLEY_QWEN_API_KEY",
@@ -49,6 +50,7 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
     assert settings.log_format == "console"
     assert settings.database_url is None
     assert settings.test_database_url is None
+    assert settings.knowledge_storage_root == Path("data/knowledge")
     assert settings.local_user_id is None
     assert settings.llm_provider == "qwen"
     assert settings.qwen_api_key is None
@@ -73,6 +75,7 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     monkeypatch.setenv("LANGLEY_LOG_FORMAT", "json")
     monkeypatch.setenv("LANGLEY_DATABASE_URL", "mysql://application")
     monkeypatch.setenv("LANGLEY_TEST_DATABASE_URL", "mysql://test")
+    monkeypatch.setenv("LANGLEY_KNOWLEDGE_STORAGE_ROOT", "temporary/knowledge")
     monkeypatch.setenv("LANGLEY_LOCAL_USER_ID", "17")
     monkeypatch.setenv("LANGLEY_LLM_PROVIDER", "qwen")
     monkeypatch.setenv("LANGLEY_QWEN_API_KEY", "test-qwen-key")
@@ -97,6 +100,7 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.log_format == "json"
     assert settings.database_url == "mysql://application"
     assert settings.test_database_url == "mysql://test"
+    assert settings.knowledge_storage_root == Path("temporary/knowledge")
     assert settings.local_user_id == 17
     assert settings.llm_provider == "qwen"
     assert settings.qwen_api_key is not None
