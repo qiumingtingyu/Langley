@@ -21,6 +21,7 @@ from langley.answering.tracing import LangSmithTracer, Tracer
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.api.conversations import router as conversations_router
 from langley.api.health import router as health_router
+from langley.api.knowledge import router as knowledge_router
 from langley.api.memories import router as memories_router
 from langley.api.runs import router as runs_router
 from langley.infrastructure.database import (
@@ -324,4 +325,5 @@ def create_app(
     app.include_router(conversations_router)
     app.include_router(runs_router)
     app.include_router(memories_router)
+    app.include_router(knowledge_router)
     return app

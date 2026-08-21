@@ -14,6 +14,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import MessageContent from "@/components/MessageContent.vue";
+import KnowledgePage from "@/KnowledgePage.vue";
 import MemoryPage from "@/MemoryPage.vue";
 
 type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
@@ -81,7 +82,7 @@ const isLoading = ref(true);
 const requestError = ref<string | null>(null);
 const pendingNetworkCommand = ref<PendingCommand | null>(null);
 const streamState = ref<StreamState | null>(null);
-const activeView = ref<"chat" | "memory">("chat");
+const activeView = ref<"chat" | "memory" | "knowledge">("chat");
 const memoryNotice = ref<string | null>(null);
 const memoryPage = ref<{ load(): Promise<void> } | null>(null);
 const memoryUpdated = ref(false);
@@ -143,6 +144,10 @@ function showMemoryNotice(message: string): void {
 function openMemoryView(): void {
   activeView.value = "memory";
   memoryUpdated.value = false;
+}
+
+function openKnowledgeView(): void {
+  activeView.value = "knowledge";
 }
 
 function updatedNotice(payload: {
@@ -548,6 +553,13 @@ onBeforeUnmount(() => {
         </button>
         <button
           class="flex-1 rounded px-2 py-1.5"
+          :class="activeView === 'knowledge' ? 'bg-white shadow-sm' : ''"
+          @click="openKnowledgeView"
+        >
+          知识库
+        </button>
+        <button
+          class="flex-1 rounded px-2 py-1.5"
           :class="activeView === 'memory' ? 'bg-white shadow-sm' : ''"
           @click="openMemoryView"
         >
@@ -880,13 +892,19 @@ onBeforeUnmount(() => {
       </div>
     </section>
     <section
-      v-else
+      v-else-if="activeView === 'memory'"
       class="min-w-0 flex-1 overflow-y-auto"
     >
       <MemoryPage
         ref="memoryPage"
         @notice="showMemoryNotice"
       />
+    </section>
+    <section
+      v-else
+      class="min-w-0 flex-1 overflow-y-auto"
+    >
+      <KnowledgePage @notice="showMemoryNotice" />
     </section>
   </main>
 </template>

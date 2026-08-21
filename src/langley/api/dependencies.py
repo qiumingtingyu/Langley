@@ -6,6 +6,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answer_execution import AnswerExecutionManager
+from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.models import User
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy
@@ -43,6 +44,18 @@ def get_execution_manager(request: Request) -> AnswerExecutionManager:
 
 def get_settings(request: Request):
     return request.app.state.settings
+
+
+def get_local_file_storage(request: Request) -> LocalFileStorage:
+    """Return the application-scoped local storage used by Knowledge commands."""
+
+    storage = getattr(request.app.state, "local_file_storage", None)
+    if storage is None:
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "DATABASE_NOT_CONFIGURED"},
+        )
+    return storage
 
 
 def get_memory_policy(request: Request) -> MemoryPolicy | None:
