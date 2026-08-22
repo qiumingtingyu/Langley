@@ -17,18 +17,18 @@ ALLOWED_SOURCE_FAMILIES = {
 }
 APPROVED_CASE_IDS = {
     "fastapi-002",
-    "markdown-007",
     "scifact-001",
     "scifact-002",
     "scifact-003",
     "scifact-004",
     "scifact-005",
+    "scifact-006",
     "xiaolin-cn-001",
     "xiaolin-cn-002",
     "xiaolin-cn-003",
     "xiaolin-co-001",
+    "xiaolin-co-002",
     "xiaolin-os-001",
-    "xiaolin-os-002",
 }
 
 
@@ -189,11 +189,11 @@ def validate_dataset(root: Path = DATASET_ROOT) -> None:
             raise AssertionError(
                 f"case {case_id} source family does not match {document_key}"
             )
-        if family == "scifact" and not isinstance(
-            provenance.get("source_query_id"), int
+        if "source_query_id" in provenance and not isinstance(
+            provenance["source_query_id"], int
         ):
             raise AssertionError(
-                f"SciFact case {case_id} requires integer source_query_id"
+                f"case {case_id}.provenance.source_query_id must be an integer"
             )
         evidence = case.get("evidence")
         if not isinstance(evidence, dict):
@@ -236,7 +236,7 @@ def test_retrieval_golden_dataset_has_approved_composition() -> None:
     assert len(payload["documents"]) == 40
     assert len(payload["cases"]) == 13
     families = [case["provenance"]["source_family"] for case in payload["cases"]]
-    assert families.count("scifact") == 5
+    assert families.count("scifact") == 6
     assert families.count("xiaolin_personal_markdown") == 6
     assert families.count("fastapi_docs") == 1
-    assert families.count("langley_project_fixture") == 1
+    assert families.count("langley_project_fixture") == 0

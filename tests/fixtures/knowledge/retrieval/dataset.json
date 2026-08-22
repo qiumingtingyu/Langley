@@ -747,17 +747,17 @@
       }
     },
     {
-      "case_id": "xiaolin-os-002",
-      "query": "快表（TLB）未命中为什么不等于发生缺页？",
-      "document_key": "xiaolin_os_memory_management",
+      "case_id": "xiaolin-co-002",
+      "query": "间接寻址为什么能扩大寻址范围，但执行速度又较慢？",
+      "document_key": "xiaolin_co_instruction_set",
       "evidence": {
-        "start_byte": 28816,
-        "end_byte": 29200,
-        "text": "2. 若快表未命中，则要到页表中查找，若找到，则从相应表项中取出物理块号，并将该页表项写入快表，若快表已满，则需采用某种算法替换\n3. 若在页表中未找到，则需要进行缺页中断处理，请求系统将该页从外存换入内存，页面被调入内存后，由 OS 负责更新页表和快表，并获得物理块号\n"
+        "start_byte": 12415,
+        "end_byte": 12646,
+        "text": "- **优点**：可扩大寻址范围【EA 的位数大于 A 的位数】，便于编制程序【方便完成子程序的返回】\n- **缺点**：指令在执行阶段要多次访存（1 次间址 2 次访存），执行速度较慢"
       },
       "provenance": {
         "source_family": "xiaolin_personal_markdown",
-        "human_review": "Approved personal technical Markdown distinction case."
+        "human_review": "Approved Human-selected replacement mechanism/tradeoff case."
       }
     },
     {
@@ -831,17 +831,17 @@
       }
     },
     {
-      "case_id": "markdown-007",
-      "query": "プロセスは何の単位ですか？",
-      "document_key": "langley_markdown_unicode_ja",
+      "case_id": "scifact-006",
+      "query": "How does blocking glutaminolysis affect RagB and mTORC1 activation?",
+      "document_key": "scifact_1344498",
       "evidence": {
-        "start_byte": 15,
-        "end_byte": 60,
-        "text": "プロセスは資源管理の単位です。"
+        "start_byte": 534,
+        "end_byte": 657,
+        "text": "Inhibition of glutaminolysis prevented GTP loading of RagB and lysosomal translocation and subsequent activation of mTORC1."
       },
       "provenance": {
-        "source_family": "langley_project_fixture",
-        "human_review": "Approved intentionally tiny Japanese-to-Japanese sanity case."
+        "source_family": "scifact",
+        "human_review": "Approved Human-selected replacement mechanism case; query is Langley-authored and not represented as an upstream SciFact claim."
       }
     }
   ]
