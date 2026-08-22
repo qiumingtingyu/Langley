@@ -1,1 +1,2 @@
 tests/fixtures/knowledge/markdown/golden/*.md text eol=lf
+tests/fixtures/knowledge/retrieval/documents/*.md text eol=lf whitespace=-trailing-space,-blank-at-eof

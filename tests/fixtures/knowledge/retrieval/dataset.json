@@ -1,0 +1,848 @@
+{
+  "format_version": 1,
+  "name": "Langley Retrieval Golden Seed",
+  "approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION",
+  "documents": [
+    {
+      "key": "scifact_2177022",
+      "path": "documents/scifact_2177022.md",
+      "sha256": "4f41f002b5b1b3f033be4a374a008c2631fc888604ee8c0eca0efdbb93f9660c",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 2177022,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_1084345",
+      "path": "documents/scifact_1084345.md",
+      "sha256": "f8a57944a3aba3c54fe5f7901eb2896cd6bbfad91d447d4fdcaea195b3b7b835",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 1084345,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_6277638",
+      "path": "documents/scifact_6277638.md",
+      "sha256": "91273a0e234b3a2be16709cc8ff70ea3b845cd700b0889690f9811610fc07293",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 6277638,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_13439128",
+      "path": "documents/scifact_13439128.md",
+      "sha256": "d9ec958cabb0c28e1fe4c1a6347976302cf570ecc8ac36621c2f39a4f41dd33f",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 13439128,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_31272411",
+      "path": "documents/scifact_31272411.md",
+      "sha256": "333a73aabc458ef605560bffea9ba7328159f0751863aafe7dd4f3ec4b768d0b",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 31272411,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_1669173",
+      "path": "documents/scifact_1669173.md",
+      "sha256": "ae60e5a4460d0b8d6013878b916d0b4a3a8a069c6164fe24c415361d5256dc4a",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 1669173,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_1344498",
+      "path": "documents/scifact_1344498.md",
+      "sha256": "843b5c33b605b5b4b6db6b7ea272361a354308d55fb7ece0dc9d5a0b20b6f7ac",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 1344498,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_33370",
+      "path": "documents/scifact_33370.md",
+      "sha256": "e165933f3e3c65f99237dd832e911a92bce55ce72eb0a51482476af4091eb62f",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 33370,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_207972",
+      "path": "documents/scifact_207972.md",
+      "sha256": "021d4c136d008140c12a8afbc76948f624051bc1eddd16dbaa4313fd2708bb06",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 207972,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_4983",
+      "path": "documents/scifact_4983.md",
+      "sha256": "721f5676b5a0e47a4d4d307856db072d7063af3dfb9798c1751f5ad139aa1991",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 4983,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_7912",
+      "path": "documents/scifact_7912.md",
+      "sha256": "9bb8a6bf745606bccdeccc75dd5af8f60984a74bce9d6428a8696882412c93c2",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 7912,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_5836",
+      "path": "documents/scifact_5836.md",
+      "sha256": "ec9162a377b5e1e684dbf5a86208e6db3e40245c095e1c901db0e68be5fbf052",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 5836,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_213017",
+      "path": "documents/scifact_213017.md",
+      "sha256": "4ccd88acdafe5cbb6a92c683319b0f4bb004791a2ae44ab16ad750419a9e7cbc",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 213017,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_97884",
+      "path": "documents/scifact_97884.md",
+      "sha256": "38d008a687c0185a32f4d3a78dc57f2f4b99940d25faf169ea97eb5380e69534",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 97884,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_123859",
+      "path": "documents/scifact_123859.md",
+      "sha256": "0b3b8e6ea66a21e446d06d34c88be4e36c422b8c6047659224dff2749d9a55f2",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 123859,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_19238",
+      "path": "documents/scifact_19238.md",
+      "sha256": "51c68c2f32e3e3dda9048e19e5c42a162d6b2281097e38fd65e88571f59225ed",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 19238,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_72159",
+      "path": "documents/scifact_72159.md",
+      "sha256": "2f31e3e8218fbe6db54fa98700ff9384be8fd3b2d1c363c2f5130a9866a73925",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 72159,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_92308",
+      "path": "documents/scifact_92308.md",
+      "sha256": "bdbd02b1eb22cc11551e173f6ca989c865a478aa10a779893f557cde2c0d1622",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 92308,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_152245",
+      "path": "documents/scifact_152245.md",
+      "sha256": "076d71304f90efcbcbf87bac2ef966fc6354610469224a6bab7ee75d520a4f09",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 152245,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_1605196",
+      "path": "documents/scifact_1605196.md",
+      "sha256": "e7b25e0ecff1aa710108cd2c78414a79e2811193bd4b93bbc9241cbc723276af",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 1605196,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "scifact_238409",
+      "path": "documents/scifact_238409.md",
+      "sha256": "8c24fff332663fe832fe2fe624580ebe3734fe5518df8f7f597c8089897001c9",
+      "language": "en",
+      "provenance": {
+        "source_family": "scifact",
+        "origin": "SciFact corpus abstract, minimally adapted to Markdown distractor",
+        "upstream": {
+          "dataset": "SciFact",
+          "repository": "https://github.com/allenai/scifact",
+          "revision": "68b98a56d93e0f9da0d2aab4e6c3294699a0f72e",
+          "release": "https://scifact.s3-us-west-2.amazonaws.com/release/latest/data.tar.gz",
+          "original_document_id": 238409,
+          "content_license": "ODC-By 1.0",
+          "annotation_license": "CC BY 4.0"
+        }
+      }
+    },
+    {
+      "key": "xiaolin_cn_network_architecture",
+      "path": "documents/xiaolin_cn_network_architecture.md",
+      "sha256": "3eb2a312c5ee54ac6083c365428c0a1fe166bf0c5b2ab272c2b8bf7fd2870fc0",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "cn/第1章 计算机网络体系结构.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_cn_physical_layer",
+      "path": "documents/xiaolin_cn_physical_layer.md",
+      "sha256": "37e237f2b058135bc05361cfa4cd436e2c329ccaffb2afc460c95859e702ab4a",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "cn/第2章 物理层.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_cn_data_link",
+      "path": "documents/xiaolin_cn_data_link.md",
+      "sha256": "a4b682772eb0a4dbbf4f3994da643dfb034d7c061bb9d8776d33d9df461e5218",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "cn/第3章 数据链路层.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_cn_network",
+      "path": "documents/xiaolin_cn_network.md",
+      "sha256": "be4838e969b4f4d9371051dcc844455902ec5203832c6e4640d8759459cd610d",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "cn/第4章 网络层.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_cn_transport",
+      "path": "documents/xiaolin_cn_transport.md",
+      "sha256": "3e40ae95815c1cd5ab18ed6c7416304e6ceb09ebb337ac22001509519cb32767",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "cn/第5章 传输层.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_cn_application",
+      "path": "documents/xiaolin_cn_application.md",
+      "sha256": "9ba35294f9112c6091ed2fe5f477331f6e9021986fe2122f0ba65f3b09fb77d9",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "cn/第6章 应用层.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_co_overview",
+      "path": "documents/xiaolin_co_overview.md",
+      "sha256": "1154f833b312b1b5699ce48ecdb8639fab973932136c7f212ac827ad052e46db",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "co/第1章 计算机系统概述.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_co_storage",
+      "path": "documents/xiaolin_co_storage.md",
+      "sha256": "6cb2bed4b63a5141ec03baaaa3dc606a5169fb87f86e708a5f3ec555eeb06e12",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "co/第3章 存储系统.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_co_instruction_set",
+      "path": "documents/xiaolin_co_instruction_set.md",
+      "sha256": "08855f244912b85a45f147f38b3b386155dd7dbc8daf205a4acd345247d28a65",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "co/第4章 指令系统.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_co_cpu",
+      "path": "documents/xiaolin_co_cpu.md",
+      "sha256": "4f66b7bbfb188e5a21d4f3e886ddef4ff6652353c2f821105dcdb9e43e65d627",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "co/第5章 中央处理器.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_co_bus",
+      "path": "documents/xiaolin_co_bus.md",
+      "sha256": "e4e2802a0584f4d0dc8b6b3c27abcca3ad6675077945c5c240175c0dd7e75229",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "co/第6章 总线.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_co_io",
+      "path": "documents/xiaolin_co_io.md",
+      "sha256": "a02cfa1893a0e6879c5a6df3ff094a80a0261d4c06db1563628068eaa9260f5f",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "co/第7章 输入输出系统.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_os_overview",
+      "path": "documents/xiaolin_os_overview.md",
+      "sha256": "619f277af94489774d40bc3e83813fd85aae72e048aa875396646300c9318bfb",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "os/第1章 计算机系统概述.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_os_processes_threads",
+      "path": "documents/xiaolin_os_processes_threads.md",
+      "sha256": "095449a919a070a4719491855c8e0974b027260f16d2b33cd737df4acf7d0824",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "os/第2章 进程与线程.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_os_memory_management",
+      "path": "documents/xiaolin_os_memory_management.md",
+      "sha256": "9e4064d9d069b1f1b835836979c9ed425b9b9ebfe1bc98c5af6748c92c8fe363",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "os/第3章 内存管理.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_os_file_management",
+      "path": "documents/xiaolin_os_file_management.md",
+      "sha256": "68e6807869d84db8673e1083035504e3dbf97a541baf30534e5627d7f4e52ea7",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "os/第4章 文件管理.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "xiaolin_os_io_management",
+      "path": "documents/xiaolin_os_io_management.md",
+      "sha256": "3cf8ecdef1b8f95d1c16d904f2461d94ec54984458ef02f6f0fc24570a9cdf74",
+      "language": "zh",
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "origin": "Human-provided personal technical Markdown",
+        "original_path": "os/第5章 输入输出管理.md",
+        "owner_approval": "Task 3 HUMAN GOLDEN REVIEW FINAL DECISION"
+      }
+    },
+    {
+      "key": "fastapi_async",
+      "path": "documents/fastapi_async.md",
+      "sha256": "1d4397242a6b63f64dd5106e36999dff6deacdc79bb0bb157aae6cc36f8a2c44",
+      "language": "en",
+      "provenance": {
+        "source_family": "fastapi_docs",
+        "origin": "FastAPI documentation Markdown",
+        "upstream": {
+          "repository": "https://github.com/fastapi/fastapi",
+          "revision": "c3f316b7e814667e8ee81e03a7330d00ee61e45c",
+          "original_path": "docs/en/docs/async.md",
+          "content_license": "MIT"
+        }
+      }
+    },
+    {
+      "key": "langley_markdown_unicode_ja",
+      "path": "documents/langley_markdown_unicode_ja.md",
+      "sha256": "86d0f3dfb228991dec52e336ce8d31870fa6110efd208f6593ea2474c4c2c543",
+      "language": "ja",
+      "provenance": {
+        "source_family": "langley_project_fixture",
+        "origin": "Langley project-owned Markdown fixture",
+        "original_path": "tests/fixtures/knowledge/markdown/golden/unicode_ja.md"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "scifact-001",
+      "query": "CCL19 is a ligand for CCR7.",
+      "document_key": "scifact_2177022",
+      "evidence": {
+        "start_byte": 822,
+        "end_byte": 949,
+        "text": "Soluble CCL21 functionally resembles the second CCR7 ligand, CCL19, which lacks anchoring residues and forms soluble gradients."
+      },
+      "provenance": {
+        "source_family": "scifact",
+        "source_query_id": 197,
+        "official_judgment": "SUPPORT",
+        "official_evidence_document_id": 2177022,
+        "official_evidence_sentence_indices": [
+          4
+        ]
+      }
+    },
+    {
+      "case_id": "scifact-002",
+      "query": "Chaperone-mediated autophagy (CMA) activity declines in aged organisms.",
+      "document_key": "scifact_1084345",
+      "evidence": {
+        "start_byte": 320,
+        "end_byte": 610,
+        "text": "We have previously found that CMA activity declines in aged organisms and have proposed that this failure in cellular clearance could contribute to the accumulation of altered proteins, the abnormal cellular homeostasis and, eventually, the functional loss characteristic of aged organisms."
+      },
+      "provenance": {
+        "source_family": "scifact",
+        "source_query_id": 148,
+        "official_judgment": "SUPPORT",
+        "official_evidence_document_id": 1084345,
+        "official_evidence_sentence_indices": [
+          1
+        ],
+        "langley_adaptation": "Human-narrowed from the broader upstream autophagy claim."
+      }
+    },
+    {
+      "case_id": "scifact-003",
+      "query": "Rapamycin delays aging in fruit flies.",
+      "document_key": "scifact_6277638",
+      "evidence": {
+        "start_byte": 445,
+        "end_byte": 559,
+        "text": "We show here that feeding rapamycin to adult Drosophila produces the life span extension seen in some TOR mutants."
+      },
+      "provenance": {
+        "source_family": "scifact",
+        "source_query_id": 1015,
+        "official_judgment": "SUPPORT",
+        "official_evidence_document_id": 6277638,
+        "official_evidence_sentence_indices": [
+          2
+        ]
+      }
+    },
+    {
+      "case_id": "scifact-004",
+      "query": "BLM gene encodes RecQ-class DNA helicase.",
+      "document_key": "scifact_13439128",
+      "evidence": {
+        "start_byte": 490,
+        "end_byte": 795,
+        "text": "cDNA analysis of the candidate gene identified a 4437 bp cDNA that encodes a 1417 amino acid peptide with homology to the RecQ helicases, a subfamily of DExH box-containing DNA and RNA helicases.\n\nThe presence of chain-terminating mutations in the candidate gene in persons with BS proved that it was BLM."
+      },
+      "provenance": {
+        "source_family": "scifact",
+        "source_query_id": 157,
+        "official_judgment": "SUPPORT",
+        "official_evidence_document_id": 13439128,
+        "official_evidence_sentence_indices": [
+          3
+        ]
+      }
+    },
+    {
+      "case_id": "scifact-005",
+      "query": "The PRR MDA5 is a sensor of RNA virus infection.",
+      "document_key": "scifact_31272411",
+      "evidence": {
+        "start_byte": 45,
+        "end_byte": 204,
+        "text": "The RIG-I-like receptors (RLRs) RIG-I, MDA5, and LGP2 play a major role in pathogen sensing of RNA virus infection to initiate and modulate antiviral immunity."
+      },
+      "provenance": {
+        "source_family": "scifact",
+        "source_query_id": 1180,
+        "official_judgment": "SUPPORT",
+        "official_evidence_document_id": 31272411,
+        "official_evidence_sentence_indices": [
+          0
+        ],
+        "human_adjudication": "Multi-RLR sentence approved as sufficient for the MDA5-specific query."
+      }
+    },
+    {
+      "case_id": "xiaolin-os-001",
+      "query": "为什么缺页中断处理并把缺失页面调入内存后，还要重新执行原来的访存指令？",
+      "document_key": "xiaolin_os_memory_management",
+      "evidence": {
+        "start_byte": 27219,
+        "end_byte": 27395,
+        "text": "\t- 缺页中断是访存指令引起的，说明所要访问的页面不在内存中\n\t- 进行缺页中断处理并调入所要访问的页后，访存指令应该重新执行\n"
+      },
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "human_review": "Approved personal technical Markdown mechanism case."
+      }
+    },
+    {
+      "case_id": "xiaolin-os-002",
+      "query": "快表（TLB）未命中为什么不等于发生缺页？",
+      "document_key": "xiaolin_os_memory_management",
+      "evidence": {
+        "start_byte": 28816,
+        "end_byte": 29200,
+        "text": "2. 若快表未命中，则要到页表中查找，若找到，则从相应表项中取出物理块号，并将该页表项写入快表，若快表已满，则需采用某种算法替换\n3. 若在页表中未找到，则需要进行缺页中断处理，请求系统将该页从外存换入内存，页面被调入内存后，由 OS 负责更新页表和快表，并获得物理块号\n"
+      },
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "human_review": "Approved personal technical Markdown distinction case."
+      }
+    },
+    {
+      "case_id": "xiaolin-cn-001",
+      "query": "TCP 主动关闭方为什么在发送最后一次 ACK 后还要保持 TIME-WAIT 2MSL？",
+      "document_key": "xiaolin_cn_transport",
+      "evidence": {
+        "start_byte": 17855,
+        "end_byte": 18322,
+        "text": "\t- 处于 TIME-WAIT【时间等待】状态后要经过` 2MSL` 时长，可以**确保 TCP 服务器进程能够收到最后一个 TCP 确认报文段而进入 CLOSED【关闭】状态**\n\t- TCP 客户进程在发送完最后一个 TCP 确认报文段后，再经过 `2MSL` 时长，就可以使**本次连接持续时间内所产生的的所有报文段都从网络中消失**，这样就可以使下一个**新的 TCP 连接中不会出现旧连接中的报文段**\n"
+      },
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "human_review": "Approved personal technical Markdown mechanism case."
+      }
+    },
+    {
+      "case_id": "xiaolin-cn-002",
+      "query": "NAT 为什么能够缓解 IPv4 地址空间不足？",
+      "document_key": "xiaolin_cn_network",
+      "evidence": {
+        "start_byte": 18575,
+        "end_byte": 18806,
+        "text": "\t- 能使大量使用**内部专用地址的专用网络用户共享少量外部全球地址**来访问因特网上的主机和资源\n\t- 专用网本地 IP 地址是可重用的，可缓解 `IPv4` 地址空间即将耗尽的问题\n"
+      },
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "human_review": "Approved personal technical Markdown paraphrase case."
+      }
+    },
+    {
+      "case_id": "xiaolin-cn-003",
+      "query": "共享总线以太网为什么要规定最小帧长？",
+      "document_key": "xiaolin_cn_data_link",
+      "evidence": {
+        "start_byte": 28488,
+        "end_byte": 28970,
+        "text": "- **最小帧长**：总线传播时延 * 数据传输速率 * 2\n\t- 争用期内可发送的数据长度\n\t- 确保共享总线以太网上的每一个站点在发送完一个完整的帧之前，能够检测出是否产生了碰撞\n\t- 如果在争用期检测到碰撞就立即中止发送，这时已经发送出去的数据一定小于 64 字节，因此凡长度小于 64 字节的帧都是由于**碰撞检测而异常中止的无效帧**，收到这种无效帧应立即丢弃\n"
+      },
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "human_adjudication": "The later 64B-padding sentence is not independently sufficient alternate evidence for the contention-period/collision-detection query."
+      }
+    },
+    {
+      "case_id": "xiaolin-co-001",
+      "query": "低位交叉编址为什么能够提高存储器带宽？",
+      "document_key": "xiaolin_co_storage",
+      "evidence": {
+        "start_byte": 13567,
+        "end_byte": 13958,
+        "text": "- **特点**：\n\t- 连续地址分布在相邻的不同模块内，同一模块内的地址是**不连续**的\n\t- 地位交叉编制是交叉存放的，满足程序的**局部性原理**\n- **编号**：高位地址表示**体内地址**，低位地址表示**体号【模块号】**\n- **优点**：对连续字的成块传送可实现多模块并行存取，**提高了存储器的带宽**\n"
+      },
+      "provenance": {
+        "source_family": "xiaolin_personal_markdown",
+        "human_review": "Approved body-only structural-context case."
+      }
+    },
+    {
+      "case_id": "fastapi-002",
+      "query": "如果第三方库不支持 await，FastAPI 路径操作应如何声明？",
+      "document_key": "fastapi_async",
+      "evidence": {
+        "start_byte": 727,
+        "end_byte": 1025,
+        "text": "If you are using a third party library that communicates with something (a database, an API, the file system, etc.) and doesn't have support for using `await`, (this is currently the case for most database libraries), then declare your *path operation functions* as normally, with just `def`, like:"
+      },
+      "provenance": {
+        "source_family": "fastapi_docs",
+        "human_review": "Approved FastAPI real-Markdown paraphrase case."
+      }
+    },
+    {
+      "case_id": "markdown-007",
+      "query": "プロセスは何の単位ですか？",
+      "document_key": "langley_markdown_unicode_ja",
+      "evidence": {
+        "start_byte": 15,
+        "end_byte": 60,
+        "text": "プロセスは資源管理の単位です。"
+      },
+      "provenance": {
+        "source_family": "langley_project_fixture",
+        "human_review": "Approved intentionally tiny Japanese-to-Japanese sanity case."
+      }
+    }
+  ]
+}
