@@ -201,6 +201,10 @@ class DocumentVersion(Base):
             "CHAR_LENGTH(TRIM(storage_key)) > 0",
             name="ck_document_versions_storage_key_nonblank",
         ),
+        CheckConstraint(
+            "chunk_max_chars IS NULL OR chunk_max_chars > 0",
+            name="ck_document_versions_chunk_max_chars_positive",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -220,6 +224,7 @@ class DocumentVersion(Base):
     storage_key: Mapped[str] = mapped_column(
         String(512, collation="utf8mb4_0900_bin"), nullable=False
     )
+    chunk_max_chars: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 

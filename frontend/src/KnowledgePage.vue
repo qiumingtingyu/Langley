@@ -9,6 +9,12 @@ type Document = { id: number; name: string; created_at: string; source: Document
 type VerifyResult = { document_version_id: number; verified: boolean; verified_at: string };
 type IndexJob = { id: number; status: string; stage: string | null; processed_chunk_count: number; total_chunk_count: number; error_code: string | null; error_message: string | null; created_at: string; started_at: string | null; finished_at: string | null };
 type IndexStatus = { index_status: string; latest_job: IndexJob | null };
+type SourceRegion = { kind: string; start_byte?: number; end_byte?: number };
+type Chunk = { ordinal: number; content: string; heading_path: string[]; source_regions: SourceRegion[] };
+type ChunksResponse = { document_version_id: number; successful_chunk_max_chars: number | null; suggested_chunk_max_chars: number; chunk_count: number; offset: number; limit: number; chunks: Chunk[] };
+type RebuildResponse = { document_version_id: number; successful_chunk_max_chars: number; chunk_count: number; resulting_index_status: string };
+
+const CHUNK_PAGE_SIZE = 50;
 
 const emit = defineEmits<{ notice: [message: string] }>();
 const knowledgeBases = ref<KnowledgeBase[]>([]);
@@ -26,9 +32,23 @@ const verifiedVersionId = ref<number | null>(null);
 const verifiedAt = ref<string | null>(null);
 const indexStatus = ref<IndexStatus | null>(null);
 const startingIndexBuild = ref(false);
+const successfulChunkMaxChars = ref<number | null>(null);
+const suggestedChunkMaxChars = ref<number | null>(null);
+const draftMaxChunkChars = ref("");
+const chunkCount = ref(0);
+const chunkOffset = ref(0);
+const chunks = ref<Chunk[]>([]);
+const chunksLoading = ref(false);
+const processingPending = ref(false);
+const processingError = ref("");
+const chunkLoadError = ref("");
+const expandedChunkOrdinals = ref<number[]>([]);
 let indexPollTimer: number | null = null;
+let documentSelectionRevision = 0;
 
 const selectedDocument = computed(() => documents.value.find((item) => item.id === selectedDocumentId.value) ?? null);
+const chunksRange = computed(() => chunkCount.value === 0 ? "显示 0–0" : `显示 ${chunkOffset.value + 1}–${Math.min(chunkOffset.value + chunks.value.length, chunkCount.value)}`);
+const processingBlockedByIndex = computed(() => indexStatus.value?.index_status === "INDEXING");
 
 function errorMessage(payload: unknown): string {
   const code = typeof payload === "object" && payload !== null && "detail" in payload ? (payload.detail as { code?: string }).code : undefined;
@@ -41,6 +61,7 @@ function errorMessage(payload: unknown): string {
   if (code === "SOURCE_STORAGE_FAILED") return "原始文件存储暂时不可用，请稍后重试。";
   if (code === "KNOWLEDGE_BASE_NOT_CHUNKED") return "当前知识库还没有可索引的分块。";
   if (code === "INDEX_BUILD_IN_PROGRESS") return "该知识库正在建立索引。";
+  if (code === "KNOWLEDGE_BASE_INDEXING") return "知识库正在建立索引，本次重新切片未生效。";
   if (code === "VALIDATION_ERROR") return "输入内容无效，请检查后重试。";
   return "操作失败，请稍后重试。";
 }
@@ -58,11 +79,138 @@ async function loadDocuments(knowledgeBaseId: number, preferredDocumentId?: numb
   const nextDocuments = await response.json() as Document[];
   if (selectedKnowledgeBaseId.value !== knowledgeBaseId) return;
   documents.value = nextDocuments;
-  selectedDocumentId.value = preferredDocumentId !== undefined && nextDocuments.some((item) => item.id === preferredDocumentId)
+  const nextDocumentId = preferredDocumentId !== undefined && nextDocuments.some((item) => item.id === preferredDocumentId)
     ? preferredDocumentId
     : nextDocuments.some((item) => item.id === selectedDocumentId.value) ? selectedDocumentId.value : nextDocuments[0]?.id ?? null;
+  await selectDocument(nextDocumentId);
   verifiedVersionId.value = null;
   verifiedAt.value = null;
+}
+
+function resetChunkState(): void {
+  successfulChunkMaxChars.value = null;
+  suggestedChunkMaxChars.value = null;
+  draftMaxChunkChars.value = "";
+  chunkCount.value = 0;
+  chunkOffset.value = 0;
+  chunks.value = [];
+  chunksLoading.value = false;
+  processingError.value = "";
+  chunkLoadError.value = "";
+  expandedChunkOrdinals.value = [];
+}
+
+function isCurrentDocument(versionId: number, revision: number): boolean {
+  return revision === documentSelectionRevision && selectedDocument.value?.source.document_version_id === versionId;
+}
+
+type ChunkLoadMode = "selection" | "page" | "after-rebuild";
+
+async function loadChunks(offset = 0, mode: ChunkLoadMode = "page"): Promise<void> {
+  const versionId = selectedDocument.value?.source.document_version_id;
+  if (versionId === undefined) return;
+  const revision = documentSelectionRevision;
+  chunksLoading.value = true;
+  try {
+    const response = await request(`/api/document-versions/${versionId}/chunks?offset=${offset}&limit=${CHUNK_PAGE_SIZE}`);
+    const page = await response.json() as ChunksResponse;
+    if (!isCurrentDocument(versionId, revision)) return;
+    successfulChunkMaxChars.value = page.successful_chunk_max_chars;
+    suggestedChunkMaxChars.value = page.suggested_chunk_max_chars;
+    if (mode === "selection") {
+      draftMaxChunkChars.value = String(page.successful_chunk_max_chars ?? page.suggested_chunk_max_chars);
+    }
+    chunkCount.value = page.chunk_count;
+    chunkOffset.value = page.offset;
+    chunks.value = page.chunks ?? [];
+    expandedChunkOrdinals.value = [];
+    chunkLoadError.value = "";
+  } catch (error) {
+    if (isCurrentDocument(versionId, revision)) {
+      const message = error instanceof Error ? error.message : "文档分块暂时不可用，请刷新后重试。";
+      if (mode === "selection") {
+        resetChunkState();
+        if (error instanceof KnowledgeRequestError && error.code === "DOCUMENT_VERSION_NOT_FOUND") {
+          const knowledgeBaseId = selectedKnowledgeBaseId.value;
+          if (knowledgeBaseId !== null) await loadDocuments(knowledgeBaseId);
+        }
+        emit("notice", message);
+      } else if (mode === "after-rebuild") {
+        chunks.value = [];
+        chunkLoadError.value = "处理已完成，但暂时无法刷新 Chunk，请刷新后查看。";
+      } else {
+        chunkLoadError.value = "暂时无法刷新 Chunk，请重试。";
+      }
+    }
+  } finally {
+    if (isCurrentDocument(versionId, revision)) chunksLoading.value = false;
+  }
+}
+
+async function selectDocument(documentId: number | null): Promise<void> {
+  documentSelectionRevision += 1;
+  selectedDocumentId.value = documentId;
+  processingPending.value = false;
+  resetChunkState();
+  if (documentId !== null) await loadChunks(0, "selection");
+}
+
+function validDraftMaxChunkChars(): number | null {
+  const value = Number(draftMaxChunkChars.value);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+async function rebuildChunks(): Promise<void> {
+  const versionId = selectedDocument.value?.source.document_version_id;
+  const knowledgeBaseId = selectedKnowledgeBaseId.value;
+  const maxChunkChars = validDraftMaxChunkChars();
+  if (versionId === undefined || maxChunkChars === null || processingBlockedByIndex.value) {
+    if (maxChunkChars === null) processingError.value = "max_chunk_chars 必须是正整数。";
+    return;
+  }
+  const revision = documentSelectionRevision;
+  processingPending.value = true;
+  processingError.value = "";
+  try {
+    const response = await request(`/api/document-versions/${versionId}/chunks/rebuild`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ max_chunk_chars: maxChunkChars }),
+    });
+    const result = await response.json() as RebuildResponse;
+    if (isCurrentDocument(versionId, revision)) {
+      successfulChunkMaxChars.value = result.successful_chunk_max_chars;
+      draftMaxChunkChars.value = String(result.successful_chunk_max_chars);
+      chunkCount.value = result.chunk_count;
+      chunkOffset.value = 0;
+      chunks.value = [];
+      indexStatus.value = indexStatus.value === null ? null : { ...indexStatus.value, index_status: result.resulting_index_status };
+      await loadChunks(0, "after-rebuild");
+    }
+    if (knowledgeBaseId !== null && selectedKnowledgeBaseId.value === knowledgeBaseId) await loadIndexStatus(knowledgeBaseId);
+  } catch (error) {
+    if (!isCurrentDocument(versionId, revision)) {
+      if (knowledgeBaseId !== null && selectedKnowledgeBaseId.value === knowledgeBaseId) await loadIndexStatus(knowledgeBaseId);
+      return;
+    }
+    if (error instanceof KnowledgeRequestError && error.code === "KNOWLEDGE_BASE_INDEXING") {
+      processingError.value = "知识库正在建立索引，本次重新切片未生效。";
+      if (knowledgeBaseId !== null && selectedKnowledgeBaseId.value === knowledgeBaseId) await loadIndexStatus(knowledgeBaseId);
+    } else processingError.value = error instanceof Error ? error.message : "文档处理失败，请稍后重试。";
+  } finally {
+    if (isCurrentDocument(versionId, revision)) processingPending.value = false;
+  }
+}
+
+function sourceRegionText(region: SourceRegion): string {
+  if (region.kind === "text_span") return `text_span [${region.start_byte}, ${region.end_byte})`;
+  return region.kind;
+}
+
+function toggleChunk(ordinal: number): void {
+  expandedChunkOrdinals.value = expandedChunkOrdinals.value.includes(ordinal)
+    ? expandedChunkOrdinals.value.filter((value) => value !== ordinal)
+    : [...expandedChunkOrdinals.value, ordinal];
 }
 
 function stopIndexPolling(): void {
@@ -308,7 +456,7 @@ onBeforeUnmount(stopIndexPolling);
             :key="document.id"
             class="block w-full rounded border p-3 text-left"
             :class="document.id === selectedDocumentId ? 'border-slate-700 bg-stone-100' : 'border-stone-200 bg-white'"
-            @click="selectedDocumentId = document.id; verifiedVersionId = null; verifiedAt = null"
+            @click="selectDocument(document.id); verifiedVersionId = null; verifiedAt = null"
           >
             <span class="block font-medium">{{ document.name }}</span><span class="mt-1 block text-xs text-slate-500">{{ document.source.filename }}</span>
           </button>
@@ -372,6 +520,144 @@ onBeforeUnmount(stopIndexPolling);
           >
             {{ verifiedAt }}
           </p>
+          <section class="mt-6 border-t border-stone-200 pt-5">
+            <h3 class="font-semibold text-slate-900">
+              文档处理
+            </h3>
+            <p
+              v-if="successfulChunkMaxChars !== null"
+              class="mt-2 text-slate-600"
+            >
+              当前 Chunk 配置：{{ successfulChunkMaxChars }}
+            </p>
+            <p
+              v-else-if="chunkCount === 0 && !chunksLoading"
+              class="mt-2 text-slate-600"
+            >
+              尚未处理
+            </p>
+            <p
+              v-else-if="!chunksLoading"
+              class="mt-2 text-amber-800"
+            >
+              当前切片配置未知，请重新处理文档。
+            </p>
+            <p
+              v-if="processingBlockedByIndex"
+              class="mt-2 text-amber-800"
+            >
+              正在建立索引，请等待完成后再重新处理文档。
+            </p>
+            <p
+              v-if="processingError"
+              role="alert"
+              class="mt-2 text-red-700"
+            >
+              {{ processingError }}
+            </p>
+            <form
+              class="mt-3 flex flex-wrap items-end gap-3"
+              @submit.prevent="rebuildChunks"
+            >
+              <label class="block text-sm">
+                {{ successfulChunkMaxChars === null ? "max_chunk_chars" : "本次 max_chunk_chars" }}
+                <input
+                  v-model="draftMaxChunkChars"
+                  class="mt-1 block w-40 rounded border border-stone-300 p-2"
+                  inputmode="numeric"
+                  :disabled="processingPending || processingBlockedByIndex"
+                >
+              </label>
+              <Button
+                type="submit"
+                :disabled="processingPending || processingBlockedByIndex"
+              >
+                {{ processingPending ? "处理中…" : successfulChunkMaxChars === null ? "处理文档" : "重新切片" }}
+              </Button>
+            </form>
+          </section>
+          <section class="mt-6 border-t border-stone-200 pt-5">
+            <div class="flex items-baseline justify-between gap-3">
+              <h3 class="font-semibold text-slate-900">
+                Chunk Inspector
+              </h3>
+              <p class="text-xs text-slate-500">
+                共 {{ chunkCount }} 个 Chunk · {{ chunksRange }}
+              </p>
+            </div>
+            <p
+              v-if="chunksLoading"
+              class="mt-3 text-slate-500"
+            >
+              正在读取 Chunk…
+            </p>
+            <p
+              v-if="chunkLoadError"
+              role="alert"
+              class="mt-3 text-red-700"
+            >
+              {{ chunkLoadError }}
+            </p>
+            <p
+              v-else-if="chunkCount === 0"
+              class="mt-3 text-slate-500"
+            >
+              暂无 Chunk。
+            </p>
+            <div
+              v-else
+              class="mt-3 space-y-3"
+            >
+              <article
+                v-for="chunk in chunks"
+                :key="chunk.ordinal"
+                class="rounded border border-stone-200 bg-stone-50 p-3"
+              >
+                <p class="font-medium text-slate-900">
+                  #{{ chunk.ordinal }}
+                </p>
+                <p
+                  v-if="chunk.heading_path.length > 0"
+                  class="mt-1 text-xs text-slate-600"
+                >
+                  heading path: {{ chunk.heading_path.join(" > ") }}
+                </p>
+                <p class="mt-2 whitespace-pre-wrap text-slate-700">
+                  {{ expandedChunkOrdinals.includes(chunk.ordinal) ? chunk.content : `${chunk.content.slice(0, 240)}${chunk.content.length > 240 ? "…" : ""}` }}
+                </p>
+                <button
+                  class="mt-2 text-sm text-slate-700 underline"
+                  type="button"
+                  @click="toggleChunk(chunk.ordinal)"
+                >
+                  {{ expandedChunkOrdinals.includes(chunk.ordinal) ? "收起" : "展开" }}
+                </button>
+                <p class="mt-2 text-xs text-slate-600">
+                  source regions: {{ chunk.source_regions.map(sourceRegionText).join("；") }}
+                </p>
+              </article>
+            </div>
+            <div class="mt-4 flex items-center gap-3">
+              <Button
+                type="button"
+                variant="outline"
+                size="small"
+                :disabled="chunksLoading || chunkOffset === 0"
+                @click="loadChunks(Math.max(0, chunkOffset - CHUNK_PAGE_SIZE))"
+              >
+                上一页
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="small"
+                :disabled="chunksLoading || chunkOffset + chunks.length >= chunkCount"
+                @click="loadChunks(chunkOffset + CHUNK_PAGE_SIZE)"
+              >
+                下一页
+              </Button>
+            </div>
+          </section>
         </article>
       </div>
     </main>

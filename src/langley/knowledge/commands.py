@@ -42,6 +42,21 @@ class SourceIntegrityError(Exception):
     """Raised when an admitted source no longer matches its persisted facts."""
 
 
+class DocumentRebuildConflictError(Exception):
+    """Raised when an active Knowledge index build blocks a rebuild commit."""
+
+
+class DocumentRebuildResult:
+    """The small durable result of one successful chunk replacement."""
+
+    def __init__(
+        self, *, document_version_id: int, chunk_count: int, index_status: str
+    ) -> None:
+        self.document_version_id = document_version_id
+        self.chunk_count = chunk_count
+        self.index_status = index_status
+
+
 def canonicalize_source_media_type(source_media_type: str) -> str:
     """Canonicalize one unparameterized source media type before support checks."""
     canonical = source_media_type.strip(_ASCII_WHITESPACE).lower()
@@ -179,7 +194,7 @@ async def rebuild_document_version_chunks(
     user_id: int,
     document_version_id: int,
     config: ChunkingConfig,
-) -> None:
+) -> DocumentRebuildResult:
     """Atomically replace current chunks from one verified immutable source."""
 
     source_ref = await load_document_source_ref(
@@ -188,11 +203,12 @@ async def rebuild_document_version_chunks(
     source_bytes = await read_verified_source(file_storage, source_ref)
     candidates = build_candidate_chunks(parse_markdown(source_bytes), config)
     prepared_rows = _materialize_chunk_rows(document_version_id, candidates)
-    await _replace_document_version_chunks(
+    return await _replace_document_version_chunks(
         session_factory=session_factory,
         user_id=user_id,
         source_ref=source_ref,
         prepared_rows=prepared_rows,
+        successful_chunk_max_chars=config.max_chunk_chars,
     )
 
 
@@ -221,18 +237,27 @@ async def _replace_document_version_chunks(
     user_id: int,
     source_ref: DocumentSourceRef,
     prepared_rows: list[KnowledgeChunk],
-) -> None:
-    owned_document_ids = (
-        select(Document.id).join(KnowledgeBase).where(KnowledgeBase.user_id == user_id)
-    )
+    successful_chunk_max_chars: int | None = None,
+) -> DocumentRebuildResult:
     async with session_factory() as session:
         async with session.begin():
-            version = await session.scalar(
-                select(DocumentVersion)
+            knowledge_base = await session.scalar(
+                select(KnowledgeBase)
+                .join(Document, Document.knowledge_base_id == KnowledgeBase.id)
+                .join(DocumentVersion, DocumentVersion.document_id == Document.id)
                 .where(
                     DocumentVersion.id == source_ref.document_version_id,
-                    DocumentVersion.document_id.in_(owned_document_ids),
+                    KnowledgeBase.user_id == user_id,
                 )
+                .with_for_update()
+            )
+            if knowledge_base is None:
+                raise DocumentVersionNotFoundError
+            if knowledge_base.index_status == "INDEXING":
+                raise DocumentRebuildConflictError("KNOWLEDGE_BASE_INDEXING")
+            version = await session.scalar(
+                select(DocumentVersion)
+                .where(DocumentVersion.id == source_ref.document_version_id)
                 .with_for_update()
             )
             if version is None:
@@ -245,21 +270,19 @@ async def _replace_document_version_chunks(
                 )
             )
             session.add_all(prepared_rows)
-            knowledge_base = await session.scalar(
-                select(KnowledgeBase)
-                .join(Document, Document.knowledge_base_id == KnowledgeBase.id)
-                .where(Document.id == version.document_id)
-                .with_for_update()
+            if successful_chunk_max_chars is not None:
+                version.chunk_max_chars = successful_chunk_max_chars
+            knowledge_base.index_status = (
+                "STALE"
+                if knowledge_base.active_generation_id is not None
+                else "CHUNKED"
             )
-            if knowledge_base is None:
-                raise RuntimeError("document knowledge base disappeared during rebuild")
-            if knowledge_base.index_status != "INDEXING":
-                knowledge_base.index_status = (
-                    "STALE"
-                    if knowledge_base.active_generation_id is not None
-                    else "CHUNKED"
-                )
             await session.flush()
+            return DocumentRebuildResult(
+                document_version_id=version.id,
+                chunk_count=len(prepared_rows),
+                index_status=knowledge_base.index_status,
+            )
 
 
 def _document_version_matches_source_ref(

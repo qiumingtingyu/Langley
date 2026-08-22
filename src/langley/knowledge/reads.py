@@ -3,10 +3,16 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from langley.infrastructure.models import Document, DocumentVersion, KnowledgeBase
+from langley.infrastructure.models import (
+    Document,
+    DocumentVersion,
+    KnowledgeBase,
+    KnowledgeChunk,
+)
+from langley.knowledge.chunking import ChunkingConfig
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,23 @@ class DocumentRead:
     name: str
     created_at: datetime
     source: DocumentSourceRead
+
+
+@dataclass(frozen=True)
+class ChunkRead:
+    ordinal: int
+    content: str
+    heading_path: list[str]
+    source_regions: list[object]
+
+
+@dataclass(frozen=True)
+class DocumentVersionChunksRead:
+    document_version_id: int
+    successful_chunk_max_chars: int | None
+    suggested_chunk_max_chars: int
+    chunk_count: int
+    chunks: tuple[ChunkRead, ...]
 
 
 async def list_knowledge_bases(
@@ -99,4 +122,63 @@ async def list_documents_for_knowledge_base(
             ),
         )
         for row in rows
+    )
+
+
+async def read_document_version_chunks(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    document_version_id: int,
+    offset: int,
+    limit: int,
+) -> DocumentVersionChunksRead | None:
+    """Read one owned Version's current chunk set and its successful config fact."""
+
+    version = (
+        await session.execute(
+            select(DocumentVersion.id, DocumentVersion.chunk_max_chars)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+            .where(
+                DocumentVersion.id == document_version_id,
+                KnowledgeBase.user_id == user_id,
+            )
+        )
+    ).one_or_none()
+    if version is None:
+        return None
+    chunk_count = await session.scalar(
+        select(func.count())
+        .select_from(KnowledgeChunk)
+        .where(KnowledgeChunk.document_version_id == document_version_id)
+    )
+    rows = (
+        await session.execute(
+            select(
+                KnowledgeChunk.ordinal,
+                KnowledgeChunk.content,
+                KnowledgeChunk.heading_path,
+                KnowledgeChunk.source_regions,
+            )
+            .where(KnowledgeChunk.document_version_id == document_version_id)
+            .order_by(KnowledgeChunk.ordinal.asc())
+            .offset(offset)
+            .limit(limit)
+        )
+    ).all()
+    return DocumentVersionChunksRead(
+        document_version_id=version.id,
+        successful_chunk_max_chars=version.chunk_max_chars,
+        suggested_chunk_max_chars=ChunkingConfig().max_chunk_chars,
+        chunk_count=chunk_count or 0,
+        chunks=tuple(
+            ChunkRead(
+                ordinal=row.ordinal,
+                content=row.content,
+                heading_path=list(row.heading_path),
+                source_regions=list(row.source_regions),
+            )
+            for row in rows
+        ),
     )

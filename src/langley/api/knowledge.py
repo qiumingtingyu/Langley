@@ -2,7 +2,16 @@
 
 from pathlib import Path, PurePosixPath
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -16,7 +25,9 @@ from langley.api.dependencies import (
 from langley.api.responses import as_utc
 from langley.business_time import utc_now
 from langley.infrastructure.local_file_storage import LocalFileStorage
+from langley.knowledge.chunking import ChunkingConfig
 from langley.knowledge.commands import (
+    DocumentRebuildConflictError,
     DocumentVersionNotFoundError,
     KnowledgeBaseNotFoundError,
     SourceIntegrityError,
@@ -24,6 +35,7 @@ from langley.knowledge.commands import (
     create_knowledge_base,
     load_document_source_ref,
     read_verified_source,
+    rebuild_document_version_chunks,
 )
 from langley.knowledge.index_build import (
     IndexBuildAdmissionError,
@@ -36,9 +48,11 @@ from langley.knowledge.index_build import (
 from langley.knowledge.reads import (
     DocumentRead,
     DocumentSourceRead,
+    DocumentVersionChunksRead,
     KnowledgeBaseRead,
     list_documents_for_knowledge_base,
     list_knowledge_bases,
+    read_document_version_chunks,
 )
 
 router = APIRouter(tags=["knowledge"])
@@ -46,6 +60,7 @@ router = APIRouter(tags=["knowledge"])
 MAX_MARKDOWN_UPLOAD_BYTES = 5 * 1024 * 1024
 _UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 _MAX_DOCUMENT_TEXT_LENGTH = 255
+_MAX_CHUNKS_PAGE_SIZE = 100
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
@@ -104,6 +119,36 @@ class IndexBuildAcceptedResponse(BaseModel):
     job_id: int
 
 
+class ChunkResponse(BaseModel):
+    ordinal: int
+    content: str
+    heading_path: list[str]
+    source_regions: list[object]
+
+
+class DocumentVersionChunksResponse(BaseModel):
+    document_version_id: int
+    successful_chunk_max_chars: int | None
+    suggested_chunk_max_chars: int
+    chunk_count: int
+    offset: int
+    limit: int
+    chunks: list[ChunkResponse]
+
+
+class ChunkRebuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_chunk_chars: int = Field(gt=0)
+
+
+class ChunkRebuildResponse(BaseModel):
+    document_version_id: int
+    successful_chunk_max_chars: int
+    chunk_count: int
+    resulting_index_status: str
+
+
 def _validation_error() -> HTTPException:
     return HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR"})
 
@@ -157,6 +202,28 @@ def _index_status_response(value: IndexStatusRead) -> IndexStatusResponse:
         latest_job=None
         if value.latest_job is None
         else _index_job_response(value.latest_job),
+    )
+
+
+def _document_version_chunks_response(
+    value: DocumentVersionChunksRead, *, offset: int, limit: int
+) -> DocumentVersionChunksResponse:
+    return DocumentVersionChunksResponse(
+        document_version_id=value.document_version_id,
+        successful_chunk_max_chars=value.successful_chunk_max_chars,
+        suggested_chunk_max_chars=value.suggested_chunk_max_chars,
+        chunk_count=value.chunk_count,
+        offset=offset,
+        limit=limit,
+        chunks=[
+            ChunkResponse(
+                ordinal=chunk.ordinal,
+                content=chunk.content,
+                heading_path=chunk.heading_path,
+                source_regions=chunk.source_regions,
+            )
+            for chunk in value.chunks
+        ],
     )
 
 
@@ -350,6 +417,66 @@ async def verify_source(
         document_version_id=document_version_id,
         verified=True,
         verified_at=as_utc(utc_now()),
+    )
+
+
+@router.get(
+    "/api/document-versions/{document_version_id}/chunks",
+    response_model=DocumentVersionChunksResponse,
+)
+async def get_document_version_chunks(
+    document_version_id: int,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, gt=0, le=_MAX_CHUNKS_PAGE_SIZE),
+    session: AsyncSession = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+) -> DocumentVersionChunksResponse:
+    value = await read_document_version_chunks(
+        session,
+        user_id=current_user_id,
+        document_version_id=document_version_id,
+        offset=offset,
+        limit=limit,
+    )
+    if value is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "DOCUMENT_VERSION_NOT_FOUND"}
+        )
+    return _document_version_chunks_response(value, offset=offset, limit=limit)
+
+
+@router.post(
+    "/api/document-versions/{document_version_id}/chunks/rebuild",
+    response_model=ChunkRebuildResponse,
+)
+async def post_document_version_chunks_rebuild(
+    document_version_id: int,
+    body: ChunkRebuildRequest,
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+    file_storage: LocalFileStorage = Depends(get_local_file_storage),
+    current_user_id: int = Depends(get_current_user_id),
+) -> ChunkRebuildResponse:
+    try:
+        result = await rebuild_document_version_chunks(
+            session_factory=session_factory,
+            file_storage=file_storage,
+            user_id=current_user_id,
+            document_version_id=document_version_id,
+            config=ChunkingConfig(max_chunk_chars=body.max_chunk_chars),
+        )
+    except DocumentVersionNotFoundError as error:
+        raise HTTPException(
+            status_code=404, detail={"code": "DOCUMENT_VERSION_NOT_FOUND"}
+        ) from error
+    except DocumentRebuildConflictError as error:
+        raise HTTPException(status_code=409, detail={"code": str(error)}) from error
+    except (SourceIntegrityError, OSError) as error:
+        _raise_verify_error(error)
+    return ChunkRebuildResponse(
+        document_version_id=result.document_version_id,
+        successful_chunk_max_chars=body.max_chunk_chars,
+        chunk_count=result.chunk_count,
+        resulting_index_status=result.index_status,
     )
 
 
