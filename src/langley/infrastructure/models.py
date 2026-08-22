@@ -42,6 +42,10 @@ class KnowledgeBase(Base):
         CheckConstraint(
             "CHAR_LENGTH(TRIM(name)) > 0", name="ck_knowledge_bases_name_nonblank"
         ),
+        CheckConstraint(
+            "index_status IN ('CHUNKED', 'INDEXING', 'READY', 'FAILED', 'STALE')",
+            name="ck_knowledge_bases_index_status_valid",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -51,7 +55,102 @@ class KnowledgeBase(Base):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    index_status: Mapped[str] = mapped_column(
+        String(16, collation="utf8mb4_0900_bin"),
+        default="CHUNKED",
+        server_default="CHUNKED",
+        nullable=False,
+    )
+    active_generation_id: Mapped[str | None] = mapped_column(
+        String(36, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    building_generation_id: Mapped[str | None] = mapped_column(
+        String(36, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    active_embedding_model: Mapped[str | None] = mapped_column(
+        String(255, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    active_embedding_revision: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    active_embedding_dimension: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    active_embedding_representation: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    active_chunk_snapshot_sha256: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
+class KnowledgeIndexJob(Base):
+    """One durable manual attempt to build a complete Knowledge dense index."""
+
+    __tablename__ = "knowledge_index_jobs"
+    __table_args__ = (
+        UniqueConstraint("generation_id", name="uq_knowledge_index_jobs_generation"),
+        Index(
+            "ix_knowledge_index_jobs_base_created", "knowledge_base_id", "created_at"
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'INTERRUPTED')",
+            name="ck_knowledge_index_jobs_status_valid",
+        ),
+        CheckConstraint(
+            "stage IS NULL OR stage IN ('SNAPSHOT', 'EMBEDDING', 'UPLOADING_INDEX', "
+            "'VERIFYING', 'ACTIVATING')",
+            name="ck_knowledge_index_jobs_stage_valid",
+        ),
+        CheckConstraint(
+            "processed_chunk_count >= 0 AND total_chunk_count >= 0 AND "
+            "processed_chunk_count <= total_chunk_count",
+            name="ck_knowledge_index_jobs_progress_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    knowledge_base_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "knowledge_bases.id",
+            name="fk_knowledge_index_jobs_knowledge_base",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    generation_id: Mapped[str] = mapped_column(
+        String(36, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(16, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    stage: Mapped[str | None] = mapped_column(
+        String(32, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    processed_chunk_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    total_chunk_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    embedding_model: Mapped[str] = mapped_column(
+        String(255, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    embedding_revision: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    embedding_dimension: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    embedding_representation: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    chunk_snapshot_sha256: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
 
 class Document(Base):

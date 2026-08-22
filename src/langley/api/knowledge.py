@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.api.dependencies import (
     get_current_user_id,
+    get_knowledge_index_runtime,
     get_local_file_storage,
     get_session,
     get_session_factory,
@@ -23,6 +24,14 @@ from langley.knowledge.commands import (
     create_knowledge_base,
     load_document_source_ref,
     read_verified_source,
+)
+from langley.knowledge.index_build import (
+    IndexBuildAdmissionError,
+    IndexJobRead,
+    IndexStatusRead,
+    KnowledgeIndexBuildRuntime,
+    admit_index_build,
+    read_index_status,
 )
 from langley.knowledge.reads import (
     DocumentRead,
@@ -73,6 +82,28 @@ class VerifySourceResponse(BaseModel):
     verified_at: str
 
 
+class IndexJobResponse(BaseModel):
+    id: int
+    status: str
+    stage: str | None
+    processed_chunk_count: int
+    total_chunk_count: int
+    error_code: str | None
+    error_message: str | None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+
+
+class IndexStatusResponse(BaseModel):
+    index_status: str
+    latest_job: IndexJobResponse | None
+
+
+class IndexBuildAcceptedResponse(BaseModel):
+    job_id: int
+
+
 def _validation_error() -> HTTPException:
     return HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR"})
 
@@ -102,6 +133,30 @@ def _document_response(value: DocumentRead) -> DocumentResponse:
         name=value.name,
         created_at=as_utc(value.created_at),
         source=_source_response(value.source),
+    )
+
+
+def _index_job_response(value: IndexJobRead) -> IndexJobResponse:
+    return IndexJobResponse(
+        id=value.id,
+        status=value.status,
+        stage=value.stage,
+        processed_chunk_count=value.processed_chunk_count,
+        total_chunk_count=value.total_chunk_count,
+        error_code=value.error_code,
+        error_message=value.error_message,
+        created_at=as_utc(value.created_at),
+        started_at=None if value.started_at is None else as_utc(value.started_at),
+        finished_at=None if value.finished_at is None else as_utc(value.finished_at),
+    )
+
+
+def _index_status_response(value: IndexStatusRead) -> IndexStatusResponse:
+    return IndexStatusResponse(
+        index_status=value.index_status,
+        latest_job=None
+        if value.latest_job is None
+        else _index_job_response(value.latest_job),
     )
 
 
@@ -296,3 +351,50 @@ async def verify_source(
         verified=True,
         verified_at=as_utc(utc_now()),
     )
+
+
+@router.post(
+    "/api/knowledge-bases/{knowledge_base_id}/index-build",
+    response_model=IndexBuildAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def post_index_build(
+    knowledge_base_id: int,
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+    current_user_id: int = Depends(get_current_user_id),
+    runtime: KnowledgeIndexBuildRuntime = Depends(get_knowledge_index_runtime),
+) -> IndexBuildAcceptedResponse:
+    try:
+        admitted = await admit_index_build(
+            session_factory,
+            user_id=current_user_id,
+            knowledge_base_id=knowledge_base_id,
+            settings=runtime.settings,
+        )
+    except IndexBuildAdmissionError as error:
+        if error.code == "KNOWLEDGE_BASE_NOT_FOUND":
+            raise HTTPException(status_code=404, detail={"code": error.code}) from error
+        if error.code == "INDEX_BUILD_IN_PROGRESS":
+            raise HTTPException(status_code=409, detail={"code": error.code}) from error
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    runtime.schedule(admitted.job_id)
+    return IndexBuildAcceptedResponse(job_id=admitted.job_id)
+
+
+@router.get(
+    "/api/knowledge-bases/{knowledge_base_id}/index-status",
+    response_model=IndexStatusResponse,
+)
+async def get_index_status(
+    knowledge_base_id: int,
+    session: AsyncSession = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+) -> IndexStatusResponse:
+    value = await read_index_status(
+        session, user_id=current_user_id, knowledge_base_id=knowledge_base_id
+    )
+    if value is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "KNOWLEDGE_BASE_NOT_FOUND"}
+        )
+    return _index_status_response(value)

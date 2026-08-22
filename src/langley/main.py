@@ -31,6 +31,11 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.qwen_provider import QwenProvider
+from langley.knowledge.index_build import (
+    KnowledgeIndexBuildRuntime,
+    reconcile_interrupted_index_builds,
+    reconcile_stale_ready_index_configurations,
+)
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy
 from langley.memory.processing import (
@@ -201,6 +206,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         execution_manager = getattr(app.state, "execution_manager", None)
         if session_factory is not None:
             await interrupt_active_runs(session_factory)
+            await reconcile_interrupted_index_builds(session_factory)
+            await reconcile_stale_ready_index_configurations(
+                session_factory, settings=app.state.settings
+            )
         yield
     finally:
         if session_factory is not None:
@@ -219,6 +228,7 @@ def create_app(
     provider: LLMProvider | None = None,
     memory_provider: LLMProvider | None = None,
     tracer: Tracer | None = None,
+    knowledge_index_runtime: KnowledgeIndexBuildRuntime | None = None,
 ) -> FastAPI:
     """Create the Langley FastAPI application."""
 
@@ -277,6 +287,13 @@ def create_app(
             memory_background_drain=(
                 memory_callbacks[2] if memory_callbacks is not None else None
             ),
+        )
+        app.state.knowledge_index_runtime = (
+            knowledge_index_runtime
+            if knowledge_index_runtime is not None
+            else KnowledgeIndexBuildRuntime(
+                app.state.session_factory, resolved_settings
+            )
         )
 
     @app.middleware("http")

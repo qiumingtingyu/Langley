@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from langley.answer_execution import AnswerExecutionManager
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.models import User
+from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy
 
@@ -74,6 +75,13 @@ def get_memory_subscribers(request: Request) -> MemoryEventSubscribers:
     if subscribers is None:
         raise HTTPException(status_code=500, detail={"code": "DATABASE_NOT_CONFIGURED"})
     return subscribers
+
+
+def get_knowledge_index_runtime(request: Request) -> KnowledgeIndexBuildRuntime:
+    runtime = getattr(request.app.state, "knowledge_index_runtime", None)
+    if runtime is None:
+        raise HTTPException(status_code=500, detail={"code": "DATABASE_NOT_CONFIGURED"})
+    return runtime
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:

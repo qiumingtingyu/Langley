@@ -245,6 +245,20 @@ async def _replace_document_version_chunks(
                 )
             )
             session.add_all(prepared_rows)
+            knowledge_base = await session.scalar(
+                select(KnowledgeBase)
+                .join(Document, Document.knowledge_base_id == KnowledgeBase.id)
+                .where(Document.id == version.document_id)
+                .with_for_update()
+            )
+            if knowledge_base is None:
+                raise RuntimeError("document knowledge base disappeared during rebuild")
+            if knowledge_base.index_status != "INDEXING":
+                knowledge_base.index_status = (
+                    "STALE"
+                    if knowledge_base.active_generation_id is not None
+                    else "CHUNKED"
+                )
             await session.flush()
 
 

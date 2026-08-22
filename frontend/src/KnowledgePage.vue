@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { Button } from "@/components/ui/button";
 
@@ -7,6 +7,8 @@ type KnowledgeBase = { id: number; name: string; created_at: string };
 type DocumentSource = { document_version_id: number; filename: string; media_type: string; size_bytes: number; sha256: string; created_at: string };
 type Document = { id: number; name: string; created_at: string; source: DocumentSource };
 type VerifyResult = { document_version_id: number; verified: boolean; verified_at: string };
+type IndexJob = { id: number; status: string; stage: string | null; processed_chunk_count: number; total_chunk_count: number; error_code: string | null; error_message: string | null; created_at: string; started_at: string | null; finished_at: string | null };
+type IndexStatus = { index_status: string; latest_job: IndexJob | null };
 
 const emit = defineEmits<{ notice: [message: string] }>();
 const knowledgeBases = ref<KnowledgeBase[]>([]);
@@ -22,6 +24,9 @@ const uploading = ref(false);
 const verifying = ref(false);
 const verifiedVersionId = ref<number | null>(null);
 const verifiedAt = ref<string | null>(null);
+const indexStatus = ref<IndexStatus | null>(null);
+const startingIndexBuild = ref(false);
+let indexPollTimer: number | null = null;
 
 const selectedDocument = computed(() => documents.value.find((item) => item.id === selectedDocumentId.value) ?? null);
 
@@ -34,6 +39,8 @@ function errorMessage(payload: unknown): string {
   if (code === "SOURCE_MISSING") return "原始文件缺失，无法验证。";
   if (code === "SOURCE_INTEGRITY_MISMATCH") return "原始文件与保存时的完整性信息不一致。";
   if (code === "SOURCE_STORAGE_FAILED") return "原始文件存储暂时不可用，请稍后重试。";
+  if (code === "KNOWLEDGE_BASE_NOT_CHUNKED") return "当前知识库还没有可索引的分块。";
+  if (code === "INDEX_BUILD_IN_PROGRESS") return "该知识库正在建立索引。";
   if (code === "VALIDATION_ERROR") return "输入内容无效，请检查后重试。";
   return "操作失败，请稍后重试。";
 }
@@ -58,6 +65,22 @@ async function loadDocuments(knowledgeBaseId: number, preferredDocumentId?: numb
   verifiedAt.value = null;
 }
 
+function stopIndexPolling(): void {
+  if (indexPollTimer !== null) window.clearTimeout(indexPollTimer);
+  indexPollTimer = null;
+}
+
+async function loadIndexStatus(knowledgeBaseId: number): Promise<void> {
+  const response = await request(`/api/knowledge-bases/${knowledgeBaseId}/index-status`);
+  const next = await response.json() as IndexStatus;
+  if (selectedKnowledgeBaseId.value !== knowledgeBaseId) return;
+  indexStatus.value = next;
+  stopIndexPolling();
+  if (next.latest_job?.status === "PENDING" || next.latest_job?.status === "RUNNING") {
+    indexPollTimer = window.setTimeout(() => void loadIndexStatus(knowledgeBaseId).catch((error: unknown) => emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。")), 3000);
+  }
+}
+
 async function load(): Promise<void> {
   loading.value = true;
   try {
@@ -67,9 +90,10 @@ async function load(): Promise<void> {
     selectedKnowledgeBaseId.value = nextId;
     documents.value = [];
     selectedDocumentId.value = null;
+    indexStatus.value = null;
     verifiedVersionId.value = null;
     verifiedAt.value = null;
-    if (nextId !== null) await loadDocuments(nextId);
+    if (nextId !== null) { await loadDocuments(nextId); await loadIndexStatus(nextId); }
   } catch (error) { emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。"); }
   finally { loading.value = false; }
 }
@@ -78,9 +102,11 @@ async function selectKnowledgeBase(id: number): Promise<void> {
   selectedKnowledgeBaseId.value = id;
   documents.value = [];
   selectedDocumentId.value = null;
+  indexStatus.value = null;
+  stopIndexPolling();
   verifiedVersionId.value = null;
   verifiedAt.value = null;
-  try { await loadDocuments(id); }
+  try { await loadDocuments(id); await loadIndexStatus(id); }
   catch (error) { emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。"); }
 }
 
@@ -134,8 +160,20 @@ async function verifySource(): Promise<void> {
   finally { verifying.value = false; }
 }
 
+async function startIndexBuild(): Promise<void> {
+  const knowledgeBaseId = selectedKnowledgeBaseId.value;
+  if (knowledgeBaseId === null) return;
+  startingIndexBuild.value = true;
+  try {
+    await request(`/api/knowledge-bases/${knowledgeBaseId}/index-build`, { method: "POST" });
+    await loadIndexStatus(knowledgeBaseId);
+  } catch (error) { emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。"); }
+  finally { startingIndexBuild.value = false; }
+}
+
 defineExpose({ load });
 onMounted(() => void load());
+onBeforeUnmount(stopIndexPolling);
 </script>
 
 <template>
@@ -157,6 +195,50 @@ onMounted(() => void load());
           {{ creating ? "正在创建…" : "创建知识库" }}
         </Button>
       </form>
+      <section class="rounded-lg border border-stone-200 bg-white p-4 text-sm">
+        <div class="flex items-center justify-between gap-3">
+          <div>
+            <h2 class="font-semibold text-slate-900">
+              知识索引
+            </h2>
+            <p class="mt-1 text-slate-600">
+              状态：{{ indexStatus?.index_status === "READY" ? "可检索" : indexStatus?.index_status === "STALE" ? "需要重建" : indexStatus?.index_status ?? "正在读取" }}
+            </p>
+          </div>
+          <Button
+            type="button"
+            :disabled="startingIndexBuild || indexStatus?.index_status === 'INDEXING'"
+            @click="startIndexBuild"
+          >
+            {{ startingIndexBuild ? "正在提交…" : "建立索引" }}
+          </Button>
+        </div>
+        <div
+          v-if="indexStatus?.latest_job"
+          class="mt-3 rounded border border-stone-100 bg-stone-50 p-3"
+        >
+          <p
+            v-if="indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING'"
+            class="font-medium"
+          >
+            正在建立索引
+          </p>
+          <p>阶段：{{ indexStatus.latest_job.stage ?? "等待执行" }}</p>
+          <p>进度：{{ indexStatus.latest_job.processed_chunk_count }} / {{ indexStatus.latest_job.total_chunk_count }}</p>
+          <p
+            v-if="indexStatus.latest_job.status === 'SUCCEEDED'"
+            class="text-emerald-700"
+          >
+            索引已就绪，可用于后续检索。
+          </p>
+          <p
+            v-if="indexStatus.latest_job.status === 'FAILED' || indexStatus.latest_job.status === 'INTERRUPTED'"
+            class="text-red-700"
+          >
+            {{ indexStatus.latest_job.error_message ?? "索引建立失败，请重试。" }}
+          </p>
+        </div>
+      </section>
       <p
         v-if="loading"
         class="text-sm text-slate-500"

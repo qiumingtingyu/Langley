@@ -10,6 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 LogFormat = Literal["console", "json"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 LLMProviderName = Literal["qwen"]
+KnowledgeEmbeddingRepresentation = Literal["content_only"]
 
 _DEFAULT_QWEN_MODEL = "qwen3.7-plus-2026-05-26"
 
@@ -25,6 +26,15 @@ class Settings(BaseSettings):
     database_url: str | None = None
     test_database_url: str | None = None
     knowledge_storage_root: Path = Path("data/knowledge")
+    qdrant_url: str = "http://127.0.0.1:6333"
+    knowledge_embedding_model: str = "BAAI/bge-m3"
+    knowledge_embedding_revision: str = "5617a9f61b028005a4858fdac845db406aefb181"
+    knowledge_embedding_device: str = "cuda:0"
+    knowledge_embedding_dimension: int = Field(default=1024, ge=1)
+    knowledge_embedding_representation: KnowledgeEmbeddingRepresentation = (
+        "content_only"
+    )
+    knowledge_index_build_concurrency: int = Field(default=1, ge=1, le=4)
     local_user_id: int | None = None
     llm_provider: LLMProviderName = "qwen"
     qwen_api_key: SecretStr | None = None
