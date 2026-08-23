@@ -7,7 +7,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.business_time import utc_now
-from langley.infrastructure.models import Conversation, Message, Run, User
+from langley.infrastructure.models import (
+    Conversation,
+    KnowledgeBase,
+    Message,
+    Run,
+    User,
+)
+from langley.knowledge.commands import KnowledgeBaseNotFoundError
 
 
 class AdmissionDisposition(StrEnum):
@@ -68,6 +75,7 @@ async def admit_new_question(
     conversation_id: int,
     content: str,
     client_request_id: str,
+    knowledge_base_id: int | None = None,
 ) -> AnswerCommandResult:
     """Atomically persist a new USER and PENDING Run or return a same-key replay."""
 
@@ -97,7 +105,12 @@ async def admit_new_question(
             existing_message = await session.get(Message, existing_run.input_message_id)
             if existing_message is None:
                 raise RuntimeError("persisted run input message is missing")
-            if not _is_new_question_replay(existing_run, existing_message, content):
+            if not _is_new_question_replay(
+                existing_run,
+                existing_message,
+                content,
+                knowledge_base_id,
+            ):
                 raise ClientRequestIdReusedError
             return AnswerCommandResult(
                 user_id=user_id,
@@ -121,6 +134,18 @@ async def admit_new_question(
 
         if not content.strip():
             raise ValueError("content must not be blank")
+
+        if knowledge_base_id is not None:
+            knowledge_base = await session.scalar(
+                select(KnowledgeBase)
+                .where(
+                    KnowledgeBase.id == knowledge_base_id,
+                    KnowledgeBase.user_id == user_id,
+                )
+                .with_for_update()
+            )
+            if knowledge_base is None:
+                raise KnowledgeBaseNotFoundError
 
         memory_catchup_through_message_id = await _canonical_user_high_water(
             session, user_id
@@ -149,6 +174,7 @@ async def admit_new_question(
         run = Run(
             conversation_id=conversation_id,
             input_message_id=user_message.id,
+            knowledge_base_id=knowledge_base_id,
             client_request_id=client_request_id,
             attempt_no=1,
             status="PENDING",
@@ -172,7 +198,12 @@ async def admit_new_question(
     )
 
 
-def _is_new_question_replay(run: Run, message: Message, content: str) -> bool:
+def _is_new_question_replay(
+    run: Run,
+    message: Message,
+    content: str,
+    knowledge_base_id: int | None,
+) -> bool:
     """Determine whether existing facts represent this endpoint's exact command."""
 
     return (
@@ -180,6 +211,7 @@ def _is_new_question_replay(run: Run, message: Message, content: str) -> bool:
         and message.role == "USER"
         and message.regenerated_from_message_id is None
         and message.content == content
+        and run.knowledge_base_id == knowledge_base_id
     )
 
 
@@ -262,8 +294,8 @@ async def admit_retry(
             .with_for_update()
             .limit(1)
         )
-        prior_failed_or_cancelled_run_id = await session.scalar(
-            select(Run.id)
+        prior_failed_or_cancelled_run = await session.scalar(
+            select(Run)
             .where(
                 Run.input_message_id == latest_user.id,
                 Run.status.in_(("FAILED", "CANCELLED")),
@@ -271,7 +303,7 @@ async def admit_retry(
             .with_for_update()
             .limit(1)
         )
-        if succeeded_run_id is not None or prior_failed_or_cancelled_run_id is None:
+        if succeeded_run_id is not None or prior_failed_or_cancelled_run is None:
             raise RetryNotAllowedError
 
         last_attempt_no = await session.scalar(
@@ -291,6 +323,7 @@ async def admit_retry(
         run = Run(
             conversation_id=conversation_id,
             input_message_id=latest_user.id,
+            knowledge_base_id=prior_failed_or_cancelled_run.knowledge_base_id,
             client_request_id=client_request_id,
             attempt_no=last_attempt_no + 1,
             status="PENDING",
@@ -385,8 +418,8 @@ async def admit_regenerate(
         if latest_user is None:
             raise RegenerateNotAllowedError
 
-        succeeded_run_id = await session.scalar(
-            select(Run.id)
+        succeeded_run = await session.scalar(
+            select(Run)
             .where(
                 Run.input_message_id == latest_user.id,
                 Run.status == "SUCCEEDED",
@@ -394,7 +427,7 @@ async def admit_regenerate(
             .with_for_update()
             .limit(1)
         )
-        if succeeded_run_id is None:
+        if succeeded_run is None:
             raise RegenerateNotAllowedError
 
         original_user_id = (
@@ -428,6 +461,7 @@ async def admit_regenerate(
         run = Run(
             conversation_id=conversation_id,
             input_message_id=copied_user.id,
+            knowledge_base_id=succeeded_run.knowledge_base_id,
             client_request_id=client_request_id,
             attempt_no=1,
             status="PENDING",

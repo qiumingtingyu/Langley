@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel
 
+from langley.conversations import MessageCitationRead
 from langley.infrastructure.models import Message, Run
 
 
@@ -17,6 +18,16 @@ class MessageResponse(BaseModel):
     run_id: int | None
     regenerated_from_message_id: int | None
     created_at: str
+    citations: list["MessageCitationResponse"] = []
+
+
+class MessageCitationResponse(BaseModel):
+    evidence_handle: int
+    document_version_id: int
+    evidence_text: str
+    source_display_name: str
+    heading_path: list[object]
+    source_regions: list[object]
 
 
 class RunResponse(BaseModel):
@@ -43,7 +54,9 @@ def as_optional_utc(value: datetime | None) -> str | None:
     return as_utc(value) if value is not None else None
 
 
-def message_response(message: Message) -> MessageResponse:
+def message_response(
+    message: Message, citations: list[MessageCitationRead] | None = None
+) -> MessageResponse:
     """Project one persisted Message without deriving transient content."""
 
     return MessageResponse(
@@ -54,6 +67,19 @@ def message_response(message: Message) -> MessageResponse:
         run_id=message.run_id,
         regenerated_from_message_id=message.regenerated_from_message_id,
         created_at=as_utc(message.created_at),
+        citations=[]
+        if citations is None
+        else [
+            MessageCitationResponse(
+                evidence_handle=citation.evidence_handle,
+                document_version_id=citation.document_version_id,
+                evidence_text=citation.evidence_text,
+                source_display_name=citation.source_display_name,
+                heading_path=citation.heading_path,
+                source_regions=citation.source_regions,
+            )
+            for citation in citations
+        ],
     )
 
 

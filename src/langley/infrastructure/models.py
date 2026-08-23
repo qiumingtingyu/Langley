@@ -342,6 +342,64 @@ class Message(Base):
     )
 
 
+class MessageCitation(Base):
+    """One durable answer-time evidence/provenance snapshot."""
+
+    __tablename__ = "message_citations"
+    __table_args__ = (
+        UniqueConstraint(
+            "message_id",
+            "evidence_handle",
+            name="uq_message_citations_message_evidence_handle",
+        ),
+        CheckConstraint(
+            "evidence_handle > 0", name="ck_message_citations_evidence_handle_positive"
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(evidence_text)) > 0",
+            name="ck_message_citations_evidence_text_nonblank",
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(source_display_name_snapshot)) > 0",
+            name="ck_message_citations_source_display_name_nonblank",
+        ),
+        CheckConstraint(
+            "JSON_TYPE(heading_path_snapshot) = 'ARRAY'",
+            name="ck_message_citations_heading_path_snapshot_array",
+        ),
+        CheckConstraint(
+            "JSON_TYPE(source_regions_snapshot) = 'ARRAY' "
+            "AND JSON_LENGTH(source_regions_snapshot) > 0",
+            name="ck_message_citations_source_regions_snapshot_nonempty_array",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "messages.id", name="fk_message_citations_message", ondelete="RESTRICT"
+        ),
+        nullable=False,
+    )
+    document_version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "document_versions.id",
+            name="fk_message_citations_document_version",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    evidence_handle: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    evidence_text: Mapped[str] = mapped_column(LONGTEXT, nullable=False)
+    source_display_name_snapshot: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    heading_path_snapshot: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+    source_regions_snapshot: Mapped[list[object]] = mapped_column(JSON, nullable=False)
+
+
 class Memory(Base):
     """A current, user-owned Personal Context Memory item."""
 
@@ -408,6 +466,13 @@ class Run(Base):
         BigInteger,
         ForeignKey("messages.id", name="fk_runs_input_message"),
         nullable=False,
+    )
+    knowledge_base_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "knowledge_bases.id", name="fk_runs_knowledge_base", ondelete="RESTRICT"
+        ),
+        nullable=True,
     )
     client_request_id: Mapped[str] = mapped_column(
         String(64, collation="utf8mb4_0900_bin"), nullable=False

@@ -16,6 +16,7 @@ from langley.answer_lifecycle import interrupt_active_runs
 from langley.answering.context_builder import AnswerContextBuilder
 from langley.answering.contracts import LLMProvider, LLMRequest, LLMStreamEvent
 from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.knowledge_qa import KnowledgeQAFlow
 from langley.answering.tools import ToolExecutor
 from langley.answering.tracing import LangSmithTracer, Tracer
 from langley.answering.workflow import LearningAssistantWorkflow
@@ -275,6 +276,13 @@ def create_app(
                 app.state.memory_lane,
                 app.state.memory_subscribers.publish,
             )
+        app.state.knowledge_index_runtime = (
+            knowledge_index_runtime
+            if knowledge_index_runtime is not None
+            else KnowledgeIndexBuildRuntime(
+                app.state.session_factory, resolved_settings
+            )
+        )
         app.state.execution_manager = AnswerExecutionManager(
             app.state.session_factory,
             _workflow_factory_for(resolved_settings, configured_provider, tracer),
@@ -287,13 +295,11 @@ def create_app(
             memory_background_drain=(
                 memory_callbacks[2] if memory_callbacks is not None else None
             ),
-        )
-        app.state.knowledge_index_runtime = (
-            knowledge_index_runtime
-            if knowledge_index_runtime is not None
-            else KnowledgeIndexBuildRuntime(
-                app.state.session_factory, resolved_settings
-            )
+            knowledge_qa_flow=KnowledgeQAFlow(
+                app.state.session_factory,
+                app.state.knowledge_index_runtime,
+                configured_provider,
+            ),
         )
 
     @app.middleware("http")

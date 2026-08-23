@@ -37,6 +37,7 @@ from langley.conversations import (
     rename_conversation,
 )
 from langley.infrastructure.models import Conversation, Message, Run
+from langley.knowledge.commands import KnowledgeBaseNotFoundError
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -56,6 +57,7 @@ class NewQuestionRequest(BaseModel):
 
     content: str
     client_request_id: str = Field(min_length=1, max_length=64)
+    knowledge_base_id: int | None = None
 
 
 class RenameConversationRequest(BaseModel):
@@ -128,6 +130,11 @@ def _raise_command_http_error(error: Exception) -> None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "CONVERSATION_NOT_FOUND"},
+        ) from error
+    if isinstance(error, KnowledgeBaseNotFoundError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "KNOWLEDGE_BASE_NOT_FOUND"},
         ) from error
     if isinstance(error, ActiveRunExistsError):
         code = "ACTIVE_RUN_EXISTS"
@@ -243,9 +250,12 @@ async def get_messages(
             detail={"code": "CONVERSATION_NOT_FOUND"},
         )
 
-    _, messages, latest_run = result
+    _, messages, latest_run, citations_by_message = result
     return ConversationMessagesResponse(
-        messages=[message_response(message) for message in messages],
+        messages=[
+            message_response(message, citations_by_message.get(message.id))
+            for message in messages
+        ],
         latest_run=run_response(latest_run) if latest_run is not None else None,
     )
 
@@ -268,6 +278,7 @@ async def post_new_question(
             conversation_id=conversation_id,
             content=body.content,
             client_request_id=body.client_request_id,
+            knowledge_base_id=body.knowledge_base_id,
         )
         await execution_manager.schedule(command)
     except Exception as error:

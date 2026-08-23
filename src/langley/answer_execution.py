@@ -10,10 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answer_runtime import ActiveAnswer, StreamItem
 from langley.answering.errors import WorkflowFailure
+from langley.answering.knowledge_qa import CitationDraft, KnowledgeQAFlow
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.business_time import utc_now
 from langley.conversation_commands import AnswerCommandResult
-from langley.infrastructure.models import Conversation, Message, Run
+from langley.infrastructure.models import Conversation, Message, MessageCitation, Run
 
 
 class RunExecutionStateError(RuntimeError):
@@ -37,6 +38,7 @@ class AnswerExecutionManager:
         memory_catch_up: MemoryCatchUp | None = None,
         memory_boundary_capture: MemoryBoundaryCapture | None = None,
         memory_background_drain: MemoryBackgroundDrain | None = None,
+        knowledge_qa_flow: KnowledgeQAFlow | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._workflow_factory = workflow_factory
@@ -46,6 +48,7 @@ class AnswerExecutionManager:
         self._memory_boundary_capture = memory_boundary_capture
         self._memory_background_drain = memory_background_drain
         self._memory_tasks: set[asyncio.Task[None]] = set()
+        self._knowledge_qa_flow = knowledge_qa_flow
 
     async def schedule(self, command: AnswerCommandResult) -> None:
         """Schedule exactly one newly accepted Run without making HTTP its owner."""
@@ -155,21 +158,37 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
             )
             self._publish(answer, ("run.started", {"run_id": command.run.id}))
-            await self._run_memory_catch_up(command)
-            success = await workflow.execute(
-                self._session_factory,
-                run_id=command.run.id,
-                conversation_id=command.run.conversation_id,
-                input_message_id=command.user_message.id,
-                on_assistant_delta=lambda delta: self._publish_delta(
-                    answer, command.run.id, delta
-                ),
-            )
+            citation_drafts: tuple[CitationDraft, ...] = ()
+            if command.run.knowledge_base_id is None:
+                await self._run_memory_catch_up(command)
+                success = await workflow.execute(
+                    self._session_factory,
+                    run_id=command.run.id,
+                    conversation_id=command.run.conversation_id,
+                    input_message_id=command.user_message.id,
+                    on_assistant_delta=lambda delta: self._publish_delta(
+                        answer, command.run.id, delta
+                    ),
+                )
+            else:
+                if self._knowledge_qa_flow is None:
+                    raise RuntimeError("knowledge QA flow is not configured")
+                qa_completion = await self._knowledge_qa_flow.execute(
+                    user_id=command.user_id,
+                    knowledge_base_id=command.run.knowledge_base_id,
+                    question=command.user_message.content,
+                    on_assistant_delta=lambda delta: self._publish_delta(
+                        answer, command.run.id, delta
+                    ),
+                )
+                success = qa_completion.content
+                citation_drafts = qa_completion.citations
             await _commit_success(
                 self._session_factory,
                 conversation_id=command.run.conversation_id,
                 run_id=command.run.id,
                 content=success,
+                citation_drafts=citation_drafts,
             )
             self._close_after_terminal(
                 answer, ("run.succeeded", {"run_id": command.run.id})
@@ -355,8 +374,9 @@ async def _commit_success(
     conversation_id: int,
     run_id: int,
     content: str,
+    citation_drafts: tuple[CitationDraft, ...] = (),
 ) -> Message:
-    """Atomically append ASSISTANT and conditionally mark the Run successful."""
+    """Atomically append ASSISTANT/citations and conditionally mark success."""
 
     now = utc_now()
     async with session_factory() as session:
@@ -369,16 +389,12 @@ async def _commit_success(
             if conversation is None:
                 raise RunExecutionStateError("run conversation is missing")
 
-            result = await session.execute(
-                update(Run)
-                .where(
-                    Run.id == run_id,
-                    Run.conversation_id == conversation_id,
-                    Run.status == "RUNNING",
-                )
-                .values(status="SUCCEEDED", finished_at=now, updated_at=now)
+            run = await session.scalar(
+                select(Run)
+                .where(Run.id == run_id, Run.conversation_id == conversation_id)
+                .with_for_update()
             )
-            if not isinstance(result, CursorResult) or result.rowcount != 1:
+            if run is None or run.status != "RUNNING":
                 raise RunExecutionStateError(
                     "run was not running when success committed"
                 )
@@ -402,6 +418,24 @@ async def _commit_success(
             session.add(assistant_message)
             conversation.last_message_at = now
             conversation.updated_at = now
+            await session.flush()
+            session.add_all(
+                [
+                    MessageCitation(
+                        message_id=assistant_message.id,
+                        document_version_id=draft.document_version_id,
+                        evidence_handle=draft.evidence_handle,
+                        evidence_text=draft.evidence_text,
+                        source_display_name_snapshot=draft.source_display_name_snapshot,
+                        heading_path_snapshot=list(draft.heading_path_snapshot),
+                        source_regions_snapshot=list(draft.source_regions_snapshot),
+                    )
+                    for draft in citation_drafts
+                ]
+            )
+            run.status = "SUCCEEDED"
+            run.finished_at = now
+            run.updated_at = now
             await session.flush()
 
     structlog.get_logger(__name__).info(

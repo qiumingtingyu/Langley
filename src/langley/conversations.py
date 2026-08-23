@@ -1,14 +1,31 @@
 """Conversation persistence operations for the Slice 2 read and create APIs."""
 
+from dataclasses import dataclass
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.business_time import utc_now
-from langley.infrastructure.models import Conversation, Message, Run
+from langley.infrastructure.models import (
+    Conversation,
+    Message,
+    MessageCitation,
+    Run,
+)
 
 
 class ConversationHasActiveRunError(Exception):
     """Raised when an active Conversation cannot be logically deleted."""
+
+
+@dataclass(frozen=True)
+class MessageCitationRead:
+    evidence_handle: int
+    document_version_id: int
+    evidence_text: str
+    source_display_name: str
+    heading_path: list[object]
+    source_regions: list[object]
 
 
 async def create_conversation(
@@ -114,7 +131,15 @@ async def delete_conversation(
 
 async def get_conversation_messages(
     session: AsyncSession, user_id: int, conversation_id: int
-) -> tuple[Conversation, list[Message], Run | None] | None:
+) -> (
+    tuple[
+        Conversation,
+        list[Message],
+        Run | None,
+        dict[int, list[MessageCitationRead]],
+    ]
+    | None
+):
     """Load owned message history and the latest Run for its latest USER Message."""
 
     conversation = await session.scalar(
@@ -140,7 +165,7 @@ async def get_conversation_messages(
         (message for message in reversed(messages) if message.role == "USER"), None
     )
     if latest_user is None:
-        return conversation, messages, None
+        return conversation, messages, None, await _message_citations(session, messages)
 
     latest_run = await session.scalar(
         select(Run)
@@ -148,4 +173,45 @@ async def get_conversation_messages(
         .order_by(Run.attempt_no.desc())
         .limit(1)
     )
-    return conversation, messages, latest_run
+    citations = await _message_citations(session, messages)
+    return conversation, messages, latest_run, citations
+
+
+async def _message_citations(
+    session: AsyncSession, messages: list[Message]
+) -> dict[int, list[MessageCitationRead]]:
+    """Bulk-load authoritative citation display facts for persisted messages."""
+
+    message_ids = [message.id for message in messages if message.role == "ASSISTANT"]
+    if not message_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(
+                MessageCitation.message_id,
+                MessageCitation.evidence_handle,
+                MessageCitation.document_version_id,
+                MessageCitation.evidence_text,
+                MessageCitation.source_display_name_snapshot,
+                MessageCitation.heading_path_snapshot,
+                MessageCitation.source_regions_snapshot,
+            )
+            .where(MessageCitation.message_id.in_(message_ids))
+            .order_by(
+                MessageCitation.message_id.asc(), MessageCitation.evidence_handle.asc()
+            )
+        )
+    ).all()
+    citations: dict[int, list[MessageCitationRead]] = {}
+    for row in rows:
+        citations.setdefault(row[0], []).append(
+            MessageCitationRead(
+                evidence_handle=row[1],
+                document_version_id=row[2],
+                evidence_text=row[3],
+                source_display_name=row[4],
+                heading_path=list(row[5]),
+                source_regions=list(row[6]),
+            )
+        )
+    return citations
