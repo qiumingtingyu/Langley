@@ -295,9 +295,11 @@ def _validate_case(corpus: LoadedGoldenCorpus, case: GoldenCase) -> None:
         )
 
 
-def _candidate_is_hit(
+def candidate_is_golden_hit(
     corpus: LoadedGoldenCorpus, case: GoldenCase, candidate: DetachedCandidate
 ) -> bool:
+    """Apply the frozen Golden full-containment relevance definition."""
+
     if candidate.document_key not in corpus.source_bytes_by_document:
         raise RetrievalEvalError(
             f"candidate {candidate.identity!r} has no source document"
@@ -394,7 +396,8 @@ def evaluate_case(
     ):
         raise RetrievalEvalError("ranking must contain every candidate exactly once")
     is_matchable = any(
-        _candidate_is_hit(corpus, case, candidate) for candidate in corpus.candidates
+        candidate_is_golden_hit(corpus, case, candidate)
+        for candidate in corpus.candidates
     )
     result_ranking: list[RankedCandidate] = []
     for rank, (candidate, raw_score, exact_tie) in enumerate(ranked, start=1):
@@ -405,7 +408,7 @@ def evaluate_case(
                 rank=rank,
                 candidate=candidate,
                 raw_score=raw_score,
-                is_hit=_candidate_is_hit(corpus, case, candidate),
+                is_hit=candidate_is_golden_hit(corpus, case, candidate),
                 exact_tie=exact_tie,
             )
         )
@@ -491,7 +494,7 @@ def corpus_preflight(corpus: LoadedGoldenCorpus) -> CorpusPreflight:
         case.case_id
         for case in corpus.cases
         if not any(
-            _candidate_is_hit(corpus, case, candidate)
+            candidate_is_golden_hit(corpus, case, candidate)
             for candidate in corpus.candidates
         )
     )
