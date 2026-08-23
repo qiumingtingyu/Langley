@@ -256,6 +256,7 @@ async function refreshFacts(preferredConversationId?: number, revision = viewRev
 }
 
 async function selectConversation(conversationId: number): Promise<void> {
+  activeView.value = "chat";
   const revision = beginView(conversationId);
   isLoading.value = true;
   try {

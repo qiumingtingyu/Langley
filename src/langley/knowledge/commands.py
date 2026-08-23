@@ -46,6 +46,10 @@ class DocumentRebuildConflictError(Exception):
     """Raised when an active Knowledge index build blocks a rebuild commit."""
 
 
+class DocumentAdmissionConflictError(Exception):
+    """Raised when an active Knowledge index build blocks source publication."""
+
+
 class DocumentRebuildResult:
     """The small durable result of one successful chunk replacement."""
 
@@ -110,10 +114,18 @@ async def create_initial_document(
 
     async with session_factory() as admission_session:
         async with admission_session.begin():
-            if not await _knowledge_base_belongs_to_user(
-                admission_session, knowledge_base_id, user_id
-            ):
+            knowledge_base = await admission_session.scalar(
+                select(KnowledgeBase)
+                .where(
+                    KnowledgeBase.id == knowledge_base_id,
+                    KnowledgeBase.user_id == user_id,
+                )
+                .with_for_update()
+            )
+            if knowledge_base is None:
                 raise KnowledgeBaseNotFoundError
+            if knowledge_base.index_status == "INDEXING":
+                raise DocumentAdmissionConflictError("KNOWLEDGE_BASE_INDEXING")
             now = utc_now()
             document = Document(
                 knowledge_base_id=knowledge_base_id,
@@ -132,6 +144,7 @@ async def create_initial_document(
                 created_at=now,
             )
             admission_session.add(version)
+            _invalidate_knowledge_base_index(knowledge_base)
             await admission_session.flush()
     return version
 
@@ -272,11 +285,7 @@ async def _replace_document_version_chunks(
             session.add_all(prepared_rows)
             if successful_chunk_max_chars is not None:
                 version.chunk_max_chars = successful_chunk_max_chars
-            knowledge_base.index_status = (
-                "STALE"
-                if knowledge_base.active_generation_id is not None
-                else "CHUNKED"
-            )
+            _invalidate_knowledge_base_index(knowledge_base)
             await session.flush()
             return DocumentRebuildResult(
                 document_version_id=version.id,
@@ -294,6 +303,13 @@ def _document_version_matches_source_ref(
         and version.source_media_type == source_ref.source_media_type
         and version.source_sha256 == source_ref.source_sha256
         and version.source_size_bytes == source_ref.source_size_bytes
+    )
+
+
+def _invalidate_knowledge_base_index(knowledge_base: KnowledgeBase) -> None:
+    """Make an active generation ineligible after its source set changes."""
+    knowledge_base.index_status = (
+        "STALE" if knowledge_base.active_generation_id is not None else "CHUNKED"
     )
 
 

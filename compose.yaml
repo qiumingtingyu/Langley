@@ -17,7 +17,7 @@ services:
       start_period: 20s
 
   qdrant:
-    image: qdrant/qdrant:v1.16.2
+    image: qdrant/qdrant:v1.19.0
     ports:
       - "127.0.0.1:6333:6333"
     volumes:

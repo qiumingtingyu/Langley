@@ -158,6 +158,17 @@ async def admit_index_build(
                 raise IndexBuildAdmissionError("KNOWLEDGE_BASE_NOT_FOUND")
             if knowledge_base.index_status == "INDEXING":
                 raise IndexBuildAdmissionError("INDEX_BUILD_IN_PROGRESS")
+            unprocessed_version_id = await session.scalar(
+                select(DocumentVersion.id)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    DocumentVersion.chunk_max_chars.is_(None),
+                )
+                .limit(1)
+            )
+            if unprocessed_version_id is not None:
+                raise IndexBuildAdmissionError("KNOWLEDGE_BASE_DOCUMENTS_UNPROCESSED")
             chunks = await _current_chunks(session, knowledge_base_id)
             if not chunks:
                 raise IndexBuildAdmissionError("KNOWLEDGE_BASE_NOT_CHUNKED")

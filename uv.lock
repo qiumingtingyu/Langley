@@ -741,7 +741,7 @@ eval = [
     { name = "torch", marker = "sys_platform == 'win32'", specifier = ">=2.13,<3", index = "https://download.pytorch.org/whl/cu130" },
 ]
 retrieval = [
-    { name = "qdrant-client", specifier = ">=1.14,<2" },
+    { name = "qdrant-client", specifier = "==1.19.0" },
     { name = "sentence-transformers", specifier = ">=5.0,<6" },
     { name = "torch", marker = "sys_platform != 'win32'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "sys_platform == 'win32'", specifier = ">=2.13,<3", index = "https://download.pytorch.org/whl/cu130" },

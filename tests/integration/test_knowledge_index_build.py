@@ -88,6 +88,7 @@ async def _seed_chunked_knowledge_base(
                 source_size_bytes=8,
                 storage_key=f"fixture/{knowledge_base.id}.md",
                 created_at=now,
+                chunk_max_chars=1200,
             )
             session.add(version)
             await session.flush()
@@ -278,6 +279,118 @@ def test_index_build_rejects_a_chunkless_owned_knowledge_base(
         knowledge_base_id = client.post(
             "/api/knowledge-bases", json={"name": "Empty"}
         ).json()["id"]
+        response = client.post(f"/api/knowledge-bases/{knowledge_base_id}/index-build")
+    assert response.status_code == 409
+    assert response.json() == {"detail": {"code": "KNOWLEDGE_BASE_NOT_CHUNKED"}}
+    assert runtime.scheduled == []
+
+
+def test_index_build_rejects_an_unprocessed_current_document(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    settings = _settings(migrated_database, tmp_path / "knowledge")
+    knowledge_base_id, _ = asyncio.run(_seed_chunked_knowledge_base(migrated_database))
+
+    async def add_unprocessed_document() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session, session.begin():
+                now = utc_now()
+                document = Document(
+                    knowledge_base_id=knowledge_base_id,
+                    name="Unprocessed",
+                    created_at=now,
+                )
+                session.add(document)
+                await session.flush()
+                session.add(
+                    DocumentVersion(
+                        document_id=document.id,
+                        source_filename="unprocessed.md",
+                        source_media_type="text/markdown",
+                        source_sha256="b" * 64,
+                        source_size_bytes=12,
+                        storage_key="fixture/unprocessed.md",
+                        created_at=now,
+                    )
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(add_unprocessed_document())
+    runtime = _DeferredRuntime(settings)
+    with TestClient(create_app(settings, knowledge_index_runtime=runtime)) as client:  # type: ignore[arg-type]
+        response = client.post(f"/api/knowledge-bases/{knowledge_base_id}/index-build")
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {"code": "KNOWLEDGE_BASE_DOCUMENTS_UNPROCESSED"}
+    }
+    assert runtime.scheduled == []
+
+    async def inspect() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session:
+                knowledge_base = await session.get(KnowledgeBase, knowledge_base_id)
+                assert knowledge_base is not None
+                assert knowledge_base.index_status == "CHUNKED"
+                assert (
+                    await session.scalar(
+                        select(KnowledgeIndexJob.id).where(
+                            KnowledgeIndexJob.knowledge_base_id == knowledge_base_id
+                        )
+                    )
+                    is None
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(inspect())
+
+
+def test_index_build_keeps_zero_chunk_processed_document_distinct_from_unprocessed(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    settings = _settings(migrated_database, tmp_path / "knowledge")
+    assert asyncio.run(bootstrap_local_user(settings))
+    runtime = _DeferredRuntime(settings)
+    with TestClient(create_app(settings, knowledge_index_runtime=runtime)) as client:  # type: ignore[arg-type]
+        knowledge_base_id = client.post(
+            "/api/knowledge-bases", json={"name": "Zero chunks"}
+        ).json()["id"]
+
+    async def add_processed_zero_chunk_document() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session, session.begin():
+                now = utc_now()
+                document = Document(
+                    knowledge_base_id=knowledge_base_id,
+                    name="Processed empty",
+                    created_at=now,
+                )
+                session.add(document)
+                await session.flush()
+                session.add(
+                    DocumentVersion(
+                        document_id=document.id,
+                        source_filename="processed-empty.md",
+                        source_media_type="text/markdown",
+                        source_sha256="c" * 64,
+                        source_size_bytes=12,
+                        storage_key="fixture/processed-empty.md",
+                        created_at=now,
+                        chunk_max_chars=1200,
+                    )
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(add_processed_zero_chunk_document())
+    with TestClient(create_app(settings, knowledge_index_runtime=runtime)) as client:  # type: ignore[arg-type]
         response = client.post(f"/api/knowledge-bases/{knowledge_base_id}/index-build")
     assert response.status_code == 409
     assert response.json() == {"detail": {"code": "KNOWLEDGE_BASE_NOT_CHUNKED"}}

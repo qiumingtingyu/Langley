@@ -15,6 +15,7 @@ type ChunksResponse = { document_version_id: number; successful_chunk_max_chars:
 type RebuildResponse = { document_version_id: number; successful_chunk_max_chars: number; chunk_count: number; resulting_index_status: string };
 
 const CHUNK_PAGE_SIZE = 50;
+const INDEX_POLL_INTERVAL_MS = 5000;
 
 const emit = defineEmits<{ notice: [message: string] }>();
 const knowledgeBases = ref<KnowledgeBase[]>([]);
@@ -50,6 +51,15 @@ const selectedDocument = computed(() => documents.value.find((item) => item.id =
 const chunksRange = computed(() => chunkCount.value === 0 ? "显示 0–0" : `显示 ${chunkOffset.value + 1}–${Math.min(chunkOffset.value + chunks.value.length, chunkCount.value)}`);
 const processingBlockedByIndex = computed(() => indexStatus.value?.index_status === "INDEXING");
 
+function currentIndexStatusText(status: string | undefined): string {
+  if (status === "READY") return "可检索";
+  if (status === "STALE") return "需要重建";
+  if (status === "CHUNKED") return "尚未建立";
+  if (status === "INDEXING") return "正在建立";
+  if (status === "FAILED") return "建立失败";
+  return status ?? "正在读取";
+}
+
 function errorMessage(payload: unknown): string {
   const code = typeof payload === "object" && payload !== null && "detail" in payload ? (payload.detail as { code?: string }).code : undefined;
   if (code === "KNOWLEDGE_BASE_NOT_FOUND" || code === "DOCUMENT_VERSION_NOT_FOUND") return "该知识库或文档已不存在，请刷新后重试。";
@@ -61,7 +71,8 @@ function errorMessage(payload: unknown): string {
   if (code === "SOURCE_STORAGE_FAILED") return "原始文件存储暂时不可用，请稍后重试。";
   if (code === "KNOWLEDGE_BASE_NOT_CHUNKED") return "当前知识库还没有可索引的分块。";
   if (code === "INDEX_BUILD_IN_PROGRESS") return "该知识库正在建立索引。";
-  if (code === "KNOWLEDGE_BASE_INDEXING") return "知识库正在建立索引，本次重新切片未生效。";
+  if (code === "KNOWLEDGE_BASE_INDEXING") return "知识库正在建立索引，请等待完成后重试。";
+  if (code === "KNOWLEDGE_BASE_DOCUMENTS_UNPROCESSED") return "还有文档尚未处理，请先完成文档处理后再建立索引。";
   if (code === "VALIDATION_ERROR") return "输入内容无效，请检查后重试。";
   return "操作失败，请稍后重试。";
 }
@@ -213,6 +224,14 @@ function toggleChunk(ordinal: number): void {
     : [...expandedChunkOrdinals.value, ordinal];
 }
 
+function previousChunkPage(): void {
+  void loadChunks(Math.max(0, chunkOffset.value - CHUNK_PAGE_SIZE));
+}
+
+function nextChunkPage(): void {
+  void loadChunks(chunkOffset.value + CHUNK_PAGE_SIZE);
+}
+
 function stopIndexPolling(): void {
   if (indexPollTimer !== null) window.clearTimeout(indexPollTimer);
   indexPollTimer = null;
@@ -225,7 +244,7 @@ async function loadIndexStatus(knowledgeBaseId: number): Promise<void> {
   indexStatus.value = next;
   stopIndexPolling();
   if (next.latest_job?.status === "PENDING" || next.latest_job?.status === "RUNNING") {
-    indexPollTimer = window.setTimeout(() => void loadIndexStatus(knowledgeBaseId).catch((error: unknown) => emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。")), 3000);
+    indexPollTimer = window.setTimeout(() => void loadIndexStatus(knowledgeBaseId).catch((error: unknown) => emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。")), INDEX_POLL_INTERVAL_MS);
   }
 }
 
@@ -291,6 +310,7 @@ async function upload(): Promise<void> {
     selectedFile.value = null;
     documentName.value = "";
     await loadDocuments(knowledgeBaseId, created.id);
+    await loadIndexStatus(knowledgeBaseId);
   } catch (error) {
     emit("notice", error instanceof TypeError || error instanceof KnowledgeRequestError && error.code === "KNOWLEDGE_ADMISSION_FAILED" ? "上传结果不明确，请先刷新文档列表确认后再试。" : error instanceof Error ? error.message : "操作失败，请稍后重试。");
   } finally { uploading.value = false; }
@@ -350,7 +370,7 @@ onBeforeUnmount(stopIndexPolling);
               知识索引
             </h2>
             <p class="mt-1 text-slate-600">
-              状态：{{ indexStatus?.index_status === "READY" ? "可检索" : indexStatus?.index_status === "STALE" ? "需要重建" : indexStatus?.index_status ?? "正在读取" }}
+              当前索引状态：{{ currentIndexStatusText(indexStatus?.index_status) }}
             </p>
           </div>
           <Button
@@ -369,7 +389,7 @@ onBeforeUnmount(stopIndexPolling);
             v-if="indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING'"
             class="font-medium"
           >
-            正在建立索引
+            最近一次构建：进行中
           </p>
           <p>阶段：{{ indexStatus.latest_job.stage ?? "等待执行" }}</p>
           <p>进度：{{ indexStatus.latest_job.processed_chunk_count }} / {{ indexStatus.latest_job.total_chunk_count }}</p>
@@ -377,7 +397,7 @@ onBeforeUnmount(stopIndexPolling);
             v-if="indexStatus.latest_job.status === 'SUCCEEDED'"
             class="text-emerald-700"
           >
-            索引已就绪，可用于后续检索。
+            最近一次构建：已完成
           </p>
           <p
             v-if="indexStatus.latest_job.status === 'FAILED' || indexStatus.latest_job.status === 'INTERRUPTED'"
@@ -420,13 +440,16 @@ onBeforeUnmount(stopIndexPolling);
         <h1 class="font-semibold text-slate-900">
           知识文档
         </h1>
-        <label class="block text-sm">Markdown 文件<input
-          class="mt-1 block"
+        <label class="inline-flex cursor-pointer items-center rounded border border-stone-300 bg-stone-50 px-3 py-2 text-sm font-medium text-slate-800 hover:bg-stone-100 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-slate-700">选择 Markdown 文件<input
+          class="sr-only"
           type="file"
           accept=".md,text/markdown"
           :disabled="uploading"
           @change="chooseFile"
         ></label>
+        <p class="text-sm text-slate-600">
+          {{ selectedFile === null ? "未选择文件" : `已选择：${selectedFile.name}` }}
+        </p>
         <label class="block text-sm">文档名称（可编辑）<input
           v-model="documentName"
           class="mt-1 w-full rounded border border-stone-300 p-2"
@@ -581,9 +604,6 @@ onBeforeUnmount(stopIndexPolling);
               <h3 class="font-semibold text-slate-900">
                 Chunk Inspector
               </h3>
-              <p class="text-xs text-slate-500">
-                共 {{ chunkCount }} 个 Chunk · {{ chunksRange }}
-              </p>
             </div>
             <p
               v-if="chunksLoading"
@@ -608,6 +628,29 @@ onBeforeUnmount(stopIndexPolling);
               v-else
               class="mt-3 space-y-3"
             >
+              <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
+                <p>共 {{ chunkCount }} 个 Chunk · {{ chunksRange }}</p>
+                <div class="flex items-center gap-3">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="small"
+                    :disabled="chunksLoading || chunkOffset === 0"
+                    @click="previousChunkPage"
+                  >
+                    上一页
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="small"
+                    :disabled="chunksLoading || chunkOffset + chunks.length >= chunkCount"
+                    @click="nextChunkPage"
+                  >
+                    下一页
+                  </Button>
+                </div>
+              </div>
               <article
                 v-for="chunk in chunks"
                 :key="chunk.ordinal"
@@ -637,25 +680,31 @@ onBeforeUnmount(stopIndexPolling);
                 </p>
               </article>
             </div>
-            <div class="mt-4 flex items-center gap-3">
-              <Button
-                type="button"
-                variant="outline"
-                size="small"
-                :disabled="chunksLoading || chunkOffset === 0"
-                @click="loadChunks(Math.max(0, chunkOffset - CHUNK_PAGE_SIZE))"
-              >
-                上一页
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="small"
-                :disabled="chunksLoading || chunkOffset + chunks.length >= chunkCount"
-                @click="loadChunks(chunkOffset + CHUNK_PAGE_SIZE)"
-              >
-                下一页
-              </Button>
+            <div
+              v-if="chunkCount > 0"
+              class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500"
+            >
+              <p>共 {{ chunkCount }} 个 Chunk · {{ chunksRange }}</p>
+              <div class="flex items-center gap-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="small"
+                  :disabled="chunksLoading || chunkOffset === 0"
+                  @click="previousChunkPage"
+                >
+                  上一页
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="small"
+                  :disabled="chunksLoading || chunkOffset + chunks.length >= chunkCount"
+                  @click="nextChunkPage"
+                >
+                  下一页
+                </Button>
+              </div>
             </div>
           </section>
         </article>

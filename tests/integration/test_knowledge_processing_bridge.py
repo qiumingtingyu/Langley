@@ -18,9 +18,15 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.local_file_storage import LocalFileStorage
-from langley.infrastructure.models import DocumentVersion, KnowledgeBase, KnowledgeChunk
+from langley.infrastructure.models import (
+    Document,
+    DocumentVersion,
+    KnowledgeBase,
+    KnowledgeChunk,
+)
 from langley.knowledge.chunking import CandidateChunk, ChunkingConfig
 from langley.knowledge.commands import (
+    DocumentAdmissionConflictError,
     DocumentRebuildConflictError,
     _materialize_chunk_rows,
     _replace_document_version_chunks,
@@ -206,6 +212,106 @@ def test_zero_chunk_success_and_index_status_transitions(
                         )
                         == resulting_status
                     )
+        finally:
+            await dispose_database_engine(engine)
+
+    _bootstrap(migrated_database, tmp_path / "sources")
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("status", "active_generation_id", "expected_status"),
+    [
+        ("READY", "active-ready", "STALE"),
+        ("STALE", "active-stale", "STALE"),
+        ("CHUNKED", None, "CHUNKED"),
+        ("FAILED", "active-failed", "STALE"),
+        ("FAILED", None, "CHUNKED"),
+    ],
+)
+def test_upload_invalidates_current_index_readiness(
+    migrated_database: str,
+    tmp_path: Path,
+    status: str,
+    active_generation_id: str | None,
+    expected_status: str,
+) -> None:
+    async def scenario() -> None:
+        engine = create_database_engine(migrated_database)
+        try:
+            factory = create_session_factory(engine)
+            storage = LocalFileStorage(tmp_path / "sources")
+            async with factory() as session:
+                base = await create_knowledge_base(session, user_id=1, name="Bridge")
+            async with factory() as session, session.begin():
+                current = await session.get(
+                    KnowledgeBase, base.id, with_for_update=True
+                )
+                assert current is not None
+                current.index_status = status
+                current.active_generation_id = active_generation_id
+            version = await create_initial_document(
+                factory,
+                storage,
+                user_id=1,
+                knowledge_base_id=base.id,
+                name="New source",
+                source_filename="new-source.md",
+                source_media_type="text/markdown",
+                source_bytes=b"# New\nUnprocessed content.\n",
+            )
+            async with factory() as session:
+                current = await session.get(KnowledgeBase, base.id)
+                persisted = await session.get(DocumentVersion, version.id)
+                assert current is not None
+                assert persisted is not None
+                assert persisted.chunk_max_chars is None
+                assert current.index_status == expected_status
+                assert current.active_generation_id == active_generation_id
+        finally:
+            await dispose_database_engine(engine)
+
+    _bootstrap(migrated_database, tmp_path / "sources")
+    asyncio.run(scenario())
+
+
+def test_indexing_rejects_upload_publication_without_document_facts(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine = create_database_engine(migrated_database)
+        try:
+            factory = create_session_factory(engine)
+            storage = LocalFileStorage(tmp_path / "sources")
+            async with factory() as session:
+                base = await create_knowledge_base(session, user_id=1, name="Bridge")
+            async with factory() as session, session.begin():
+                current = await session.get(
+                    KnowledgeBase, base.id, with_for_update=True
+                )
+                assert current is not None
+                current.index_status = "INDEXING"
+                current.building_generation_id = "building"
+            with pytest.raises(
+                DocumentAdmissionConflictError, match="KNOWLEDGE_BASE_INDEXING"
+            ):
+                await create_initial_document(
+                    factory,
+                    storage,
+                    user_id=1,
+                    knowledge_base_id=base.id,
+                    name="Rejected source",
+                    source_filename="rejected.md",
+                    source_media_type="text/markdown",
+                    source_bytes=b"# Rejected\nContent.\n",
+                )
+            async with factory() as session:
+                current = await session.get(KnowledgeBase, base.id)
+                assert current is not None
+                assert current.index_status == "INDEXING"
+                assert current.building_generation_id == "building"
+                assert (await session.scalar(select(Document.id))) is None
+                assert (await session.scalar(select(DocumentVersion.id))) is None
         finally:
             await dispose_database_engine(engine)
 

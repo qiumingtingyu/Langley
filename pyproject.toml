@@ -35,7 +35,7 @@ eval = [
     "torch>=2.13,<3",
 ]
 retrieval = [
-    "qdrant-client>=1.14,<2",
+    "qdrant-client==1.19.0",
     "sentence-transformers>=5.0,<6",
     "torch>=2.13,<3",
 ]

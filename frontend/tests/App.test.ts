@@ -237,6 +237,22 @@ describe("App user behavior", () => {
     wrapper.unmount();
   });
 
+  it("opens the selected conversation when it is clicked from Knowledge", async () => {
+    const wrapper = await mountInitial();
+    enqueue(response([]));
+    await button(wrapper, "知识库").trigger("click");
+    await settle();
+
+    enqueue(response({ messages: [message(2, "问题 B")], latest_run: null }));
+    await button(wrapper, "B").trigger("click");
+    await settle();
+
+    expect(wrapper.find("header").text()).toContain("B");
+    expect(wrapper.get("textarea").exists()).toBe(true);
+    expect(wrapper.text()).not.toContain("创建或选择一个知识库后即可上传 Markdown 文档。");
+    wrapper.unmount();
+  });
+
   it("maps Memory errors, handles direct and conversational source lazily, and forgets idempotently", async () => {
     vi.stubGlobal("confirm", () => true);
     const wrapper = await mountInitial();

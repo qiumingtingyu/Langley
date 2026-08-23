@@ -63,6 +63,8 @@ describe("KnowledgePage", () => {
       value: [new File(["# new"], "new.md", { type: "text/markdown" })],
     });
     await input.trigger("change");
+    expect(wrapper.text()).toContain("已选择：new.md");
+    expect(wrapper.text()).toContain("选择 Markdown 文件");
     await wrapper.findAll("form")[1]!.trigger("submit");
     await settle();
 
@@ -139,6 +141,30 @@ describe("KnowledgePage", () => {
     wrapper.unmount();
   });
 
+  it("refreshes index status after a successful upload so stale readiness is visible", async () => {
+    let indexStatusCalls = 0;
+    const created = { id: 2, name: "New", created_at: "x", source: { document_version_id: 12, filename: "new.md", media_type: "text/markdown", size_bytes: 2, sha256: "b", created_at: "x" } };
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents" && init?.method !== "POST") return response([created]);
+      if (path.includes("/chunks?")) return response({ document_version_id: 12, successful_chunk_max_chars: null, suggested_chunk_max_chars: 1200, chunk_count: 0, offset: 0, limit: 50, chunks: [] });
+      if (path === "/api/knowledge-bases/4/index-status") { indexStatusCalls += 1; return response(indexStatus(indexStatusCalls === 1 ? "READY" : "STALE")); }
+      if (path === "/api/knowledge-bases/4/documents" && init?.method === "POST") return response(created);
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    const input = wrapper.get('input[type="file"]');
+    Object.defineProperty(input.element, "files", { value: [new File(["# new"], "new.md")] });
+    await input.trigger("change");
+    await wrapper.findAll("form")[1]!.trigger("submit");
+    await settle();
+    expect(indexStatusCalls).toBe(2);
+    expect(wrapper.text()).toContain("当前索引状态：需要重建");
+    wrapper.unmount();
+  });
+
   it("offers a CHUNKED build, submits one POST, and renders active progress", async () => {
     let statusCall = 0;
     const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
@@ -161,7 +187,8 @@ describe("KnowledgePage", () => {
     await settle();
 
     expect(fetchMock.mock.calls.filter(([path, init]) => path === "/api/knowledge-bases/4/index-build" && init?.method === "POST")).toHaveLength(1);
-    expect(wrapper.text()).toContain("正在建立索引");
+    expect(wrapper.text()).toContain("当前索引状态：正在建立");
+    expect(wrapper.text()).toContain("最近一次构建：进行中");
     expect(wrapper.text()).toContain("进度：0 / 2");
     wrapper.unmount();
   });
@@ -184,11 +211,11 @@ describe("KnowledgePage", () => {
     await settle();
     expect(wrapper.text()).toContain("进度：1 / 2");
 
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(5000);
     await settle();
     expect(wrapper.text()).toContain("可检索");
     const settledCalls = statusCall;
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(5000);
     expect(statusCall).toBe(settledCalls);
 
     wrapper.unmount();
@@ -229,7 +256,7 @@ describe("KnowledgePage", () => {
     await build!.trigger("click");
     await settle();
     expect(fetchMock.mock.calls.filter(([path, init]) => path === "/api/knowledge-bases/4/index-build" && init?.method === "POST")).toHaveLength(1);
-    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(5000);
     wrapper.unmount();
   });
 
@@ -249,6 +276,23 @@ describe("KnowledgePage", () => {
     wrapper.unmount();
   });
 
+  it("keeps current stale readiness distinct from a previously succeeded build", async () => {
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents") return response([]);
+      if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("STALE", "SUCCEEDED", 120, 120));
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    expect(wrapper.text()).toContain("当前索引状态：需要重建");
+    expect(wrapper.text()).toContain("最近一次构建：已完成");
+    expect(wrapper.text()).toContain("进度：120 / 120");
+    expect(wrapper.text()).not.toContain("索引已就绪，可用于后续检索。");
+    wrapper.unmount();
+  });
+
   it("prevents a duplicate UI submission while the index is active", async () => {
     const fetchMock = vi.fn(async (path: string) => {
       if (path === "/api/knowledge-bases") return response(knowledgeBase);
@@ -263,6 +307,24 @@ describe("KnowledgePage", () => {
     expect(build?.attributes("disabled")).toBeDefined();
     await build!.trigger("click");
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/knowledge-bases/4/index-build")).toHaveLength(0);
+    wrapper.unmount();
+  });
+
+  it("shows an actionable error when unprocessed documents block index admission", async () => {
+    const notice = vi.fn();
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents") return response([]);
+      if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("CHUNKED"));
+      if (path === "/api/knowledge-bases/4/index-build" && init?.method === "POST") return response({ detail: { code: "KNOWLEDGE_BASE_DOCUMENTS_UNPROCESSED" } }, false);
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage, { attrs: { onNotice: notice } });
+    await settle();
+    await wrapper.findAll("button").find((item) => item.text().includes("建立索引"))!.trigger("click");
+    await settle();
+    expect(notice).toHaveBeenCalledWith("还有文档尚未处理，请先完成文档处理后再建立索引。");
     wrapper.unmount();
   });
 });
@@ -411,6 +473,7 @@ describe("KnowledgePage processing bridge", () => {
     const wrapper = mount(KnowledgePage);
     await settle();
     const next = wrapper.findAll("button").find((item) => item.text() === "下一页")!;
+    expect(wrapper.findAll("button").filter((item) => item.text() === "下一页")).toHaveLength(2);
     expect(next.attributes("disabled")).toBeUndefined();
     await next.trigger("click");
     await settle();

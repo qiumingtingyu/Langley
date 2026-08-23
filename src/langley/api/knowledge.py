@@ -27,6 +27,7 @@ from langley.business_time import utc_now
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.knowledge.chunking import ChunkingConfig
 from langley.knowledge.commands import (
+    DocumentAdmissionConflictError,
     DocumentRebuildConflictError,
     DocumentVersionNotFoundError,
     KnowledgeBaseNotFoundError,
@@ -252,6 +253,8 @@ def _raise_upload_error(error: Exception) -> None:
         raise HTTPException(
             status_code=404, detail={"code": "KNOWLEDGE_BASE_NOT_FOUND"}
         ) from error
+    if isinstance(error, DocumentAdmissionConflictError):
+        raise HTTPException(status_code=409, detail={"code": str(error)}) from error
     if isinstance(error, UnicodeDecodeError):
         raise HTTPException(
             status_code=422, detail={"code": "INVALID_SOURCE_ENCODING"}
