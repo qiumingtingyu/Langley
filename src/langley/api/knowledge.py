@@ -55,6 +55,19 @@ from langley.knowledge.reads import (
     list_knowledge_bases,
     read_document_version_chunks,
 )
+from langley.knowledge.retrieval import (
+    IndexNotReadyError,
+    KnowledgeBaseRetrievalNotFoundError,
+    RetrievalEmbeddingInvalidError,
+    RetrievalEmbeddingUnavailableError,
+    RetrievalError,
+    RetrievalGenerationChangedError,
+    RetrievalHit,
+    RetrievalIndexInconsistentError,
+    RetrievalQdrantUnavailableError,
+    RetrievalResult,
+    retrieve_dense,
+)
 
 router = APIRouter(tags=["knowledge"])
 
@@ -62,6 +75,7 @@ MAX_MARKDOWN_UPLOAD_BYTES = 5 * 1024 * 1024
 _UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 _MAX_DOCUMENT_TEXT_LENGTH = 255
 _MAX_CHUNKS_PAGE_SIZE = 100
+_MAX_RETRIEVAL_TOP_K = 50
 
 
 class KnowledgeBaseCreateRequest(BaseModel):
@@ -150,6 +164,33 @@ class ChunkRebuildResponse(BaseModel):
     resulting_index_status: str
 
 
+class RetrievalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str
+    top_k: int = Field(ge=1, le=_MAX_RETRIEVAL_TOP_K)
+
+
+class RetrievalHitResponse(BaseModel):
+    knowledge_chunk_id: int
+    rank: int
+    score: float
+    chunk_ordinal: int
+    content: str
+    heading_path: list[str]
+    source_regions: list[object]
+    document_id: int
+    document_version_id: int
+    source_display_name: str
+    source_sha256: str
+
+
+class RetrievalResponse(BaseModel):
+    knowledge_base_id: int
+    generation_id: str
+    hits: list[RetrievalHitResponse]
+
+
 def _validation_error() -> HTTPException:
     return HTTPException(status_code=422, detail={"code": "VALIDATION_ERROR"})
 
@@ -226,6 +267,43 @@ def _document_version_chunks_response(
             for chunk in value.chunks
         ],
     )
+
+
+def _retrieval_hit_response(value: RetrievalHit) -> RetrievalHitResponse:
+    return RetrievalHitResponse(
+        knowledge_chunk_id=value.knowledge_chunk_id,
+        rank=value.rank,
+        score=value.score,
+        chunk_ordinal=value.chunk_ordinal,
+        content=value.content,
+        heading_path=list(value.heading_path),
+        source_regions=list(value.source_regions),
+        document_id=value.document_id,
+        document_version_id=value.document_version_id,
+        source_display_name=value.source_display_name,
+        source_sha256=value.source_sha256,
+    )
+
+
+def _raise_retrieval_error(error: RetrievalError) -> None:
+    if isinstance(error, KnowledgeBaseRetrievalNotFoundError):
+        raise HTTPException(status_code=404, detail={"code": error.code}) from error
+    if isinstance(error, (IndexNotReadyError, RetrievalGenerationChangedError)):
+        raise HTTPException(status_code=409, detail={"code": error.code}) from error
+    if isinstance(
+        error,
+        (
+            RetrievalIndexInconsistentError,
+            RetrievalEmbeddingInvalidError,
+        ),
+    ):
+        raise HTTPException(status_code=500, detail={"code": error.code}) from error
+    if isinstance(
+        error,
+        (RetrievalEmbeddingUnavailableError, RetrievalQdrantUnavailableError),
+    ):
+        raise HTTPException(status_code=503, detail={"code": error.code}) from error
+    raise error
 
 
 def _upload_document_name(document_name: str | None, filename: str) -> str:
@@ -509,6 +587,37 @@ async def post_index_build(
         raise HTTPException(status_code=409, detail={"code": error.code}) from error
     runtime.schedule(admitted.job_id)
     return IndexBuildAcceptedResponse(job_id=admitted.job_id)
+
+
+@router.post(
+    "/api/knowledge-bases/{knowledge_base_id}/retrieval",
+    response_model=RetrievalResponse,
+)
+async def post_knowledge_base_retrieval(
+    knowledge_base_id: int,
+    body: RetrievalRequest,
+    session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
+    current_user_id: int = Depends(get_current_user_id),
+    runtime: KnowledgeIndexBuildRuntime = Depends(get_knowledge_index_runtime),
+) -> RetrievalResponse:
+    if not body.query.strip():
+        raise _validation_error()
+    try:
+        result: RetrievalResult = await retrieve_dense(
+            session_factory,
+            runtime,
+            user_id=current_user_id,
+            knowledge_base_id=knowledge_base_id,
+            query=body.query,
+            top_k=body.top_k,
+        )
+    except RetrievalError as error:
+        _raise_retrieval_error(error)
+    return RetrievalResponse(
+        knowledge_base_id=result.knowledge_base_id,
+        generation_id=result.generation_id,
+        hits=[_retrieval_hit_response(hit) for hit in result.hits],
+    )
 
 
 @router.get(

@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+from math import isfinite
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -45,11 +46,23 @@ class IndexBuildFailure(Exception):
         self.stale = stale
 
 
+class DenseSearchResultError(Exception):
+    """A Qdrant response cannot safely represent authoritative retrieval hits."""
+
+
 @dataclass(frozen=True)
 class IndexChunk:
     id: int
     document_version_id: int
     content: str
+
+
+@dataclass(frozen=True)
+class DenseSearchHit:
+    """One validated dense-search result, retaining Qdrant's rank order."""
+
+    knowledge_chunk_id: int
+    score: float
 
 
 @dataclass(frozen=True)
@@ -108,23 +121,35 @@ def _normalize_embedding_rows(
     return matrix.tolist()
 
 
+def _normalize_query_embedding(values: object, *, dimension: int) -> list[float]:
+    """Reject a malformed production query vector before Qdrant search."""
+
+    import numpy as np
+
+    matrix = np.asarray(values)
+    if matrix.dtype != np.float32 or matrix.shape != (1, dimension):
+        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入维度不符合索引配置。")
+    if not np.isfinite(matrix).all():
+        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入包含无效数值。")
+    norm = float(np.linalg.norm(matrix[0]))
+    if not np.isfinite(norm) or norm <= 0:
+        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入向量不能为空。")
+    normalized = np.asarray(matrix[0] / norm, dtype=np.float32)
+    if not np.isfinite(normalized).all():
+        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入包含无效数值。")
+    return normalized.tolist()
+
+
 async def _current_chunks(
     session: AsyncSession, knowledge_base_id: int
 ) -> tuple[IndexChunk, ...]:
     rows = (
         await session.execute(
-            select(
+            current_knowledge_chunks_statement(knowledge_base_id).with_only_columns(
                 KnowledgeChunk.id,
                 KnowledgeChunk.document_version_id,
                 KnowledgeChunk.content,
             )
-            .join(
-                DocumentVersion,
-                DocumentVersion.id == KnowledgeChunk.document_version_id,
-            )
-            .join(Document, Document.id == DocumentVersion.document_id)
-            .where(Document.knowledge_base_id == knowledge_base_id)
-            .order_by(KnowledgeChunk.id.asc())
         )
     ).all()
     return tuple(
@@ -132,6 +157,18 @@ async def _current_chunks(
             id=row.id, document_version_id=row.document_version_id, content=row.content
         )
         for row in rows
+    )
+
+
+def current_knowledge_chunks_statement(knowledge_base_id: int):
+    """Select the exact KnowledgeChunk membership indexed for one KnowledgeBase."""
+
+    return (
+        select(KnowledgeChunk)
+        .join(DocumentVersion, DocumentVersion.id == KnowledgeChunk.document_version_id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .where(Document.knowledge_base_id == knowledge_base_id)
+        .order_by(KnowledgeChunk.id.asc())
     )
 
 
@@ -408,10 +445,114 @@ class KnowledgeIndexBuildRuntime:
             values, row_count=len(contents), dimension=job.embedding_dimension
         )
 
+    async def encode_query(
+        self,
+        query: str,
+        *,
+        model: str,
+        revision: str,
+        dimension: int,
+        representation: str,
+    ) -> list[float]:
+        """Encode one exact query using the active generation's BGE configuration."""
+
+        if representation != "content_only":
+            raise IndexBuildFailure(
+                "EMBEDDING_REPRESENTATION_UNSUPPORTED", "嵌入表示配置不受支持。"
+            )
+        return await asyncio.to_thread(
+            self._encode_query,
+            query,
+            model=model,
+            revision=revision,
+            dimension=dimension,
+        )
+
+    def _encode_query(
+        self, query: str, *, model: str, revision: str, dimension: int
+    ) -> list[float]:
+        """Perform heavy local BGE-M3 query encoding outside the event loop."""
+
+        from sentence_transformers import SentenceTransformer
+
+        configured_device = self._settings.knowledge_embedding_device
+        embedding_model = SentenceTransformer(
+            model, revision=revision, device=configured_device
+        )
+        if str(embedding_model.device) != configured_device:
+            raise IndexBuildFailure(
+                "EMBEDDING_DEVICE_UNAVAILABLE", "配置的嵌入设备不可用。"
+            )
+        values = embedding_model.encode_query(
+            [query], convert_to_numpy=True, show_progress_bar=False
+        )
+        return _normalize_query_embedding(values, dimension=dimension)
+
     async def _qdrant_client(self):
         from qdrant_client import AsyncQdrantClient
 
         return AsyncQdrantClient(url=self._settings.qdrant_url)
+
+    async def search_dense(
+        self,
+        query_vector: list[float],
+        *,
+        user_id: int,
+        knowledge_base_id: int,
+        generation_id: str,
+        top_k: int,
+        dimension: int,
+    ) -> tuple[DenseSearchHit, ...]:
+        """Search one active dense generation with its complete ownership filter."""
+
+        from qdrant_client.http import models as qmodels
+
+        client = await self._qdrant_client()
+        try:
+            await self._require_collection(client, dimension=dimension)
+            response = await client.query_points(
+                collection_name=COLLECTION_NAME,
+                query=query_vector,
+                query_filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="user_id", match=qmodels.MatchValue(value=user_id)
+                        ),
+                        qmodels.FieldCondition(
+                            key="knowledge_base_id",
+                            match=qmodels.MatchValue(value=knowledge_base_id),
+                        ),
+                        qmodels.FieldCondition(
+                            key="generation_id",
+                            match=qmodels.MatchValue(value=generation_id),
+                        ),
+                    ]
+                ),
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if len(response.points) > top_k:
+                raise DenseSearchResultError("Qdrant returned more points than top_k")
+            hits: list[DenseSearchHit] = []
+            seen_chunk_ids: set[int] = set()
+            for point in response.points:
+                payload = point.payload
+                chunk_id = (
+                    None if payload is None else payload.get("knowledge_chunk_id")
+                )
+                if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
+                    raise DenseSearchResultError("malformed knowledge_chunk_id")
+                if chunk_id in seen_chunk_ids:
+                    raise DenseSearchResultError("duplicate knowledge_chunk_id")
+                score = float(point.score)
+                if not isfinite(score):
+                    raise DenseSearchResultError("non-finite Qdrant score")
+                seen_chunk_ids.add(chunk_id)
+                hits.append(DenseSearchHit(knowledge_chunk_id=chunk_id, score=score))
+            return tuple(hits)
+        finally:
+            await client.close()
 
     @staticmethod
     async def _ensure_collection(client, *, dimension: int) -> None:
@@ -425,6 +566,18 @@ class KnowledgeIndexBuildRuntime:
                 ),
             )
             return
+        await KnowledgeIndexBuildRuntime._require_collection(
+            client, dimension=dimension
+        )
+
+    @staticmethod
+    async def _require_collection(client, *, dimension: int) -> None:
+        """Validate an existing collection without mutating the secondary index."""
+
+        from qdrant_client.http import models as qmodels
+
+        if not await client.collection_exists(COLLECTION_NAME):
+            raise IndexBuildFailure("INDEX_COLLECTION_MISSING", "知识索引集合不存在。")
         vectors = (await client.get_collection(COLLECTION_NAME)).config.params.vectors
         if (
             not isinstance(vectors, qmodels.VectorParams)

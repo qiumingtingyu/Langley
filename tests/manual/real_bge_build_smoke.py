@@ -1,4 +1,4 @@
-"""One controlled, evidence-writing Task 5.1 real BGE-M3 build smoke.
+"""One controlled, evidence-writing Task 5.1/5.2 real BGE-M3 retrieval smoke.
 
 This is deliberately invoked directly, never by the ordinary test suite.
 """
@@ -39,7 +39,7 @@ from langley.knowledge.index_build import (
 from langley.main import create_app
 from langley.settings import Settings
 
-_EVIDENCE_PATH = Path(".review/slice6/task05/evidence/real-bge-build-smoke.txt")
+_EVIDENCE_PATH = Path(".review/slice6/task05/evidence/real-bge-retrieval-smoke.txt")
 
 
 class CaptureBgeRuntime(KnowledgeIndexBuildRuntime):
@@ -99,6 +99,7 @@ async def _seed(session_factory: async_sessionmaker) -> tuple[int, int]:
             source_sha256="b" * 64,
             source_size_bytes=35,
             storage_key="manual/real-bge-smoke.md",
+            chunk_max_chars=1200,
             created_at=now,
         )
         session.add(version)
@@ -181,6 +182,33 @@ def main() -> None:
                 sleep(0.25)
             else:
                 raise RuntimeError("timed out waiting for build terminal state")
+            if latest["status"] != "SUCCEEDED" or current["index_status"] != "READY":
+                raise RuntimeError(f"build terminal state: {latest} / {current}")
+            retrieval_response = client.post(
+                f"/api/knowledge-bases/{knowledge_base_id}/retrieval",
+                json={
+                    "query": "BGE-M3 CUDA smoke document content.",
+                    "top_k": 1,
+                },
+            )
+            observed["retrieval_http_status"] = retrieval_response.status_code
+            retrieval_payload = retrieval_response.json()
+            observed["retrieval_hit_count"] = len(retrieval_payload.get("hits", []))
+            if retrieval_response.status_code != 200:
+                raise RuntimeError(f"retrieval failed: {retrieval_response.text}")
+            if not 1 <= len(retrieval_payload["hits"]) <= 1:
+                raise RuntimeError(f"retrieval hit count: {retrieval_payload}")
+            retrieval_hit = retrieval_payload["hits"][0]
+            observed["retrieval_first_chunk_id"] = retrieval_hit["knowledge_chunk_id"]
+            if (
+                retrieval_hit["rank"] != 1
+                or retrieval_hit["content"] != "BGE-M3 CUDA smoke document content."
+                or retrieval_hit["source_display_name"] != "real-bge-smoke"
+                or not retrieval_hit["source_sha256"] == "b" * 64
+            ):
+                raise RuntimeError(
+                    f"retrieval hit is not authoritative: {retrieval_hit}"
+                )
         observed["actual_embedding_device"] = runtime.actual_embedding_device
         observed["observed_lifecycle"] = " -> ".join(lifecycle)
         observed["processed_chunk_count"] = latest["processed_chunk_count"]
@@ -189,8 +217,6 @@ def main() -> None:
         observed["final_index_status"] = current["index_status"]
         observed["active_generation_id"] = "unavailable"
         observed["generation_id"] = "unavailable"
-        if latest["status"] != "SUCCEEDED" or current["index_status"] != "READY":
-            raise RuntimeError(f"build terminal state: {latest} / {current}")
 
         async def inspect_qdrant() -> tuple[int, set[str], str]:
             client = AsyncQdrantClient(url=settings.qdrant_url)
