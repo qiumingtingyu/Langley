@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -58,6 +59,70 @@ def _chunk(chunk_id: int, ordinal: int) -> _AuthoritativeChunk:
         source_display_name="source.md",
         source_sha256="b" * 64,
     )
+
+
+@pytest.mark.parametrize(
+    ("changed_model", "changed_revision", "changed_device"),
+    [
+        ("other-model", "a" * 40, "cpu"),
+        ("active-model", "b" * 40, "cpu"),
+        ("active-model", "a" * 40, "cuda:0"),
+    ],
+)
+def test_embedding_runtime_reuses_one_model_and_replaces_changed_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_model: str,
+    changed_revision: str,
+    changed_device: str,
+) -> None:
+    constructions: list[tuple[str, str, str]] = []
+    roles: list[str] = []
+
+    class FakeSentenceTransformer:
+        def __init__(self, model: str, *, revision: str, device: str) -> None:
+            constructions.append((model, revision, device))
+            self.device = device
+
+        def encode_document(self, values: list[str], **kwargs: object) -> np.ndarray:
+            del values, kwargs
+            roles.append("document")
+            return np.asarray([[3.0, 4.0]], dtype=np.float32)
+
+        def encode_query(self, values: list[str], **kwargs: object) -> np.ndarray:
+            del values, kwargs
+            roles.append("query")
+            return np.asarray([[3.0, 4.0]], dtype=np.float32)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer=FakeSentenceTransformer),
+    )
+    settings = SimpleNamespace(
+        knowledge_embedding_device="cpu", knowledge_index_build_concurrency=1
+    )
+    runtime = KnowledgeIndexBuildRuntime(None, settings)  # type: ignore[arg-type]
+    job = SimpleNamespace(
+        embedding_model="active-model",
+        embedding_revision="a" * 40,
+        embedding_dimension=2,
+    )
+
+    runtime._encode_documents(["document"], job)
+    runtime._encode_query("query", model="active-model", revision="a" * 40, dimension=2)
+
+    assert constructions == [("active-model", "a" * 40, "cpu")]
+    assert roles == ["document", "query"]
+
+    runtime._settings.knowledge_embedding_device = changed_device
+    runtime._encode_query(
+        "query", model=changed_model, revision=changed_revision, dimension=2
+    )
+
+    assert constructions == [
+        ("active-model", "a" * 40, "cpu"),
+        (changed_model, changed_revision, changed_device),
+    ]
 
 
 class _FakeRuntime:
