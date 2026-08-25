@@ -406,7 +406,7 @@ def test_tool_execution_persists_only_the_final_visible_assistant_message(
             ScriptedProviderRound(
                 events=(
                     LLMResponseCompleted(
-                        assistant_content="",
+                        assistant_content="I will check the time first.",
                         tool_calls=(
                             ToolCall(
                                 call_id="time-1",

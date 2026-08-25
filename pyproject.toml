@@ -34,10 +34,12 @@ eval = [
     "sentence-transformers>=5.0,<6",
     "torch>=2.13,<3",
 ]
-retrieval = [
+qdrant = [
     "qdrant-client==1.19.0",
-    "sentence-transformers>=5.0,<6",
-    "torch>=2.13,<3",
+]
+retrieval = [
+    { include-group = "eval" },
+    { include-group = "qdrant" },
 ]
 
 [tool.uv.sources]

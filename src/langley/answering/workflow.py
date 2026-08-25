@@ -24,7 +24,6 @@ from langley.answering.contracts import (
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.knowledge_qa import (
-    INSUFFICIENT_EVIDENCE_SENTINEL,
     AnswerCompletion,
     validated_answer_completion,
 )
@@ -50,6 +49,7 @@ _SYSTEM_INPUT = (
     "successful search_knowledge call, do not call it again. Stop calling tools "
     "once you can answer or know the evidence is insufficient."
 )
+_KNOWLEDGE_SEARCH_UNAVAILABLE_ANSWER = "知识库检索未成功，暂时无法基于资料可靠回答。"
 
 
 class _AgentState(TypedDict):
@@ -59,11 +59,11 @@ class _AgentState(TypedDict):
     last_completion: LLMResponseCompleted | None
     llm_rounds: int
     tool_calls_used: int
-    visible_segments: tuple[str, ...]
     personal_context: tuple[str, ...] | None
     current_user_message_index: int
     tool_context: ToolContext
     retrieval_hits: tuple[RetrievalHit, ...]
+    knowledge_search_attempted: bool
     successful_searches: int
 
 
@@ -172,7 +172,6 @@ class LearningAssistantWorkflow:
             "last_completion": None,
             "llm_rounds": 0,
             "tool_calls_used": 0,
-            "visible_segments": (),
             "personal_context": (
                 None
                 if context.personal_context is None
@@ -181,6 +180,7 @@ class LearningAssistantWorkflow:
             "current_user_message_index": len(transcript) - 1,
             "tool_context": tool_context,
             "retrieval_hits": (),
+            "knowledge_search_attempted": False,
             "successful_searches": 0,
         }
         # Langley owns the only external trace projection. This scoped override
@@ -225,9 +225,6 @@ class LearningAssistantWorkflow:
                 raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
             self._trace(lambda: trace.llm(request, completion, state["llm_rounds"] + 1))
 
-            visible_segments = state["visible_segments"]
-            if completion.assistant_content:
-                visible_segments += (completion.assistant_content,)
             return {
                 "transcript": state["transcript"]
                 + (
@@ -238,7 +235,6 @@ class LearningAssistantWorkflow:
                 ),
                 "last_completion": completion,
                 "llm_rounds": state["llm_rounds"] + 1,
-                "visible_segments": visible_segments,
             }
 
         async def tool_node(state: _AgentState) -> dict[str, object]:
@@ -279,6 +275,9 @@ class LearningAssistantWorkflow:
                 "transcript": state["transcript"] + results,
                 "tool_calls_used": state["tool_calls_used"] + len(calls),
                 "retrieval_hits": retrieval_hits,
+                "knowledge_search_attempted": (
+                    state["knowledge_search_attempted"] or bool(search_calls)
+                ),
                 "successful_searches": successful_searches,
             }
 
@@ -366,13 +365,25 @@ class LearningAssistantWorkflow:
         ):
             raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
 
-        assistant_content = (
-            completion.assistant_content
-            if completion.assistant_content == INSUFFICIENT_EVIDENCE_SENTINEL
-            else "\n\n".join(state["visible_segments"])
-        )
+        assistant_content = completion.assistant_content
         if not assistant_content:
             raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+        if state["knowledge_search_attempted"] and state["successful_searches"] == 0:
+            result = AnswerCompletion(
+                content=_KNOWLEDGE_SEARCH_UNAVAILABLE_ANSWER,
+                citations=(),
+                abstained=False,
+            )
+            self._trace(
+                lambda: trace.citation_validate(
+                    available_evidence_count=0,
+                    cited_handles=(),
+                    cited_document_version_ids=(),
+                    abstained=False,
+                    error_code=None,
+                )
+            )
+            return result
         try:
             result = validated_answer_completion(
                 assistant_content,

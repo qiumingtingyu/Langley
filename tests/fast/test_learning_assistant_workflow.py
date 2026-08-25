@@ -24,6 +24,7 @@ from langley.answering.contracts import (
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
+from langley.answering.knowledge_qa import INSUFFICIENT_EVIDENCE_ANSWER
 from langley.answering.tools import (
     CurrentTimeTool,
     SearchKnowledgeTool,
@@ -33,6 +34,7 @@ from langley.answering.tools import (
 )
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
+from langley.knowledge.retrieval_service import KnowledgeSearchError
 
 
 @dataclass
@@ -152,11 +154,14 @@ def _hit() -> RetrievalHit:
 @dataclass
 class _FakeRetrievalService:
     calls: list[tuple[int, int, str, int]] = field(default_factory=list)
+    error: KnowledgeSearchError | None = None
 
     async def search(
         self, *, user_id: int, knowledge_base_id: int, query: str, top_k: int
     ) -> RetrievalResult:
         self.calls.append((user_id, knowledge_base_id, query, top_k))
+        if self.error is not None:
+            raise self.error
         return RetrievalResult(
             knowledge_base_id=knowledge_base_id,
             generation_id="generation",
@@ -218,7 +223,7 @@ async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
             ScriptedProviderRound(
                 events=(
                     _completion(
-                        content="",
+                        content="I will search first [K999].",
                         tool_calls=(search_call,),
                         finish_reason=LLMFinishReason.TOOL_CALLS,
                     ),
@@ -237,6 +242,7 @@ async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
         "search_knowledge",
     )
     assert service.calls == [(1, 44, "TCP", 5)]
+    assert completion.content == "TCP uses [K1]."
     assert [
         (draft.evidence_handle, draft.document_version_id)
         for draft in completion.citations
@@ -372,6 +378,41 @@ async def test_grounded_citation_validation_and_second_search_stop_before_servic
 
 
 @pytest.mark.anyio
+async def test_failed_knowledge_search_returns_safe_unavailable_completion() -> None:
+    service = _FakeRetrievalService(
+        error=KnowledgeSearchError("KNOWLEDGE_INDEX_NOT_READY", retryable=False)
+    )
+    search_call = ToolCall("search-1", "search_knowledge", '{"query":"TCP"}')
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(_completion(content="[[INSUFFICIENT_EVIDENCE]]"),)
+            ),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert completion.content == "知识库检索未成功，暂时无法基于资料可靠回答。"
+    assert completion.content != INSUFFICIENT_EVIDENCE_ANSWER
+    assert completion.abstained is False
+    assert completion.citations == ()
+    assert service.calls == [(1, 44, "TCP", 5)]
+
+
+@pytest.mark.anyio
 async def test_tool_loop_round_trips_tool_observation() -> None:
     tool_call = ToolCall(
         call_id="time-1", name="get_current_time", raw_arguments='{"timezone":"UTC"}'
@@ -394,7 +435,7 @@ async def test_tool_loop_round_trips_tool_observation() -> None:
 
     success = await _execute_workflow(_workflow(provider))
 
-    assert success.content == "我来查询。\n\n现在是 09:00 UTC。"
+    assert success.content == "现在是 09:00 UTC。"
     second_request = provider.requests[1]
     assert second_request.transcript[1].tool_calls == (tool_call,)
     tool_result = cast(ToolResult, second_request.transcript[2])

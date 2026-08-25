@@ -24,16 +24,33 @@ jobs:
           enable-cache: false
       - name: Install Python from .python-version
         run: uv python install "$(cat .python-version)"
-      - name: Sync locked dependencies
-        run: uv sync --locked
+      - name: Sync locked fast-test dependencies
+        run: uv sync --locked --group qdrant
       - name: Check formatting
-        run: uv run ruff format --check .
+        run: uv run --no-sync ruff format --check .
       - name: Lint backend
-        run: uv run ruff check .
-      - name: Type check backend
-        run: uv run mypy src/langley
+        run: uv run --no-sync ruff check .
       - name: Run fast tests
-        run: uv run pytest
+        run: uv run --no-sync pytest
+
+  backend-retrieval-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.31"
+          enable-cache: false
+      - name: Install Python from .python-version
+        run: uv python install "$(cat .python-version)"
+      - name: Sync locked retrieval dependencies
+        run: uv sync --locked --group retrieval
+      - name: Type check backend
+        run: uv run --no-sync mypy src/langley
 
   frontend:
     runs-on: ubuntu-latest
@@ -96,6 +113,8 @@ jobs:
       - name: Install Python from .python-version
         run: uv python install "$(cat .python-version)"
       - name: Sync locked dependencies
-        run: uv sync --locked
+        run: uv sync --locked --group qdrant
       - name: Run MySQL integration tests
-        run: uv run pytest tests/integration
+        run: >-
+          uv run --no-sync pytest tests/integration
+          --ignore=tests/integration/test_knowledge_retrieval_qdrant.py
