@@ -24,7 +24,7 @@ evaluation.
 Run the deterministic, filesystem-only validation with:
 
 ```powershell
-uv run pytest tests/fast/test_retrieval_golden_dataset.py -q --basetemp="G:\college\Langley\.test-tmp-task3"
+uv run pytest tests/fast/test_retrieval_golden_dataset.py -q --basetemp=".test-tmp-task3"
 ```
 
 The validator checks JSON shape/identity and safe paths, strict UTF-8/LF-only fixture
