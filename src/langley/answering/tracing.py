@@ -2,6 +2,8 @@
 
 import asyncio
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -29,11 +31,19 @@ class ExecutionTrace(Protocol):
         self, request: LLMRequest, response: LLMResponseCompleted, round_: int
     ) -> None: ...
 
-    def tool(
-        self, calls: tuple[ToolCall, ...], results: tuple[ToolResult, ...], total: int
+    def begin_tool(self, call: ToolCall, tool_calls_used: int) -> "ToolTrace": ...
+
+    def citation_validate(
+        self,
+        *,
+        available_evidence_count: int,
+        cited_handles: tuple[int, ...],
+        cited_document_version_ids: tuple[int, ...],
+        abstained: bool,
+        error_code: str | None,
     ) -> None: ...
 
-    def success(self, answer: str) -> None: ...
+    def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None: ...
 
     def failure(self, error_code: str) -> None: ...
 
@@ -42,6 +52,47 @@ class Tracer(Protocol):
     def start(
         self, run_id: int, provider: str, model: str, include_content: bool
     ) -> ExecutionTrace: ...
+
+
+class ToolTrace(Protocol):
+    def begin_knowledge_search(
+        self,
+        *,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> "KnowledgeSearchTrace": ...
+
+    def finish(
+        self, result: ToolResult | None, error_code: str | None = None
+    ) -> None: ...
+
+
+class KnowledgeSearchTrace(Protocol):
+    def finish(self, hit_count: int | None, error_code: str | None = None) -> None: ...
+
+
+_current_tool_trace: ContextVar[ToolTrace | None] = ContextVar(
+    "current_tool_trace", default=None
+)
+
+
+@contextmanager
+def tool_trace_context(trace: ToolTrace | None):
+    """Keep Agent-tool trace parenting out of business context and DTOs."""
+
+    if trace is None:
+        yield
+        return
+    token = _current_tool_trace.set(trace)
+    try:
+        yield
+    finally:
+        _current_tool_trace.reset(token)
+
+
+def current_tool_trace() -> ToolTrace | None:
+    return _current_tool_trace.get()
 
 
 class LangSmithTracer:
@@ -89,13 +140,29 @@ class _NoopTrace:
     ) -> None:
         del request, response, round_
 
-    def tool(
-        self, calls: tuple[ToolCall, ...], results: tuple[ToolResult, ...], total: int
-    ) -> None:
-        del calls, results, total
+    def begin_tool(self, call: ToolCall, tool_calls_used: int) -> ToolTrace:
+        del call, tool_calls_used
+        return _NoopToolTrace()
 
-    def success(self, answer: str) -> None:
-        del answer
+    def citation_validate(
+        self,
+        *,
+        available_evidence_count: int,
+        cited_handles: tuple[int, ...],
+        cited_document_version_ids: tuple[int, ...],
+        abstained: bool,
+        error_code: str | None,
+    ) -> None:
+        del (
+            available_evidence_count,
+            cited_handles,
+            cited_document_version_ids,
+            abstained,
+            error_code,
+        )
+
+    def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
+        del answer, stop_reason
 
     def failure(self, error_code: str) -> None:
         del error_code
@@ -149,31 +216,46 @@ class _LangSmithTrace:
             True,
         )
 
-    def tool(
-        self, calls: tuple[ToolCall, ...], results: tuple[ToolResult, ...], total: int
+    def begin_tool(self, call: ToolCall, tool_calls_used: int) -> ToolTrace:
+        return _LangSmithToolTrace(self, call, tool_calls_used)
+
+    def citation_validate(
+        self,
+        *,
+        available_evidence_count: int,
+        cited_handles: tuple[int, ...],
+        cited_document_version_ids: tuple[int, ...],
+        abstained: bool,
+        error_code: str | None,
     ) -> None:
-        inputs: dict[str, JSONValue] = {}
-        outputs: dict[str, JSONValue] = {}
-        if self._include_content:
-            inputs = {"tool_calls": [_tool_call(call) for call in calls]}
-            outputs = {"tool_results": [_tool_result(result) for result in results]}
+        metadata: dict[str, JSONValue] = {
+            "available_evidence_count": available_evidence_count,
+            "citation_count": len(cited_handles),
+            "evidence_handles": list(cited_handles),
+            "document_version_ids": list(cited_document_version_ids),
+            "abstained": abstained,
+            "success": error_code is None,
+        }
+        if error_code is not None:
+            metadata["error_code"] = error_code
         self._create(
-            "learning_assistant_tool",
-            "tool",
-            inputs,
-            outputs,
-            {
-                "tool_call_count": len(calls),
-                "tool_calls_used": total,
-                "tool_result_kinds": [result.kind.value for result in results],
-            },
+            "citation.validate",
+            "chain",
+            {},
+            {},
+            metadata,
             self._root_id,
             True,
         )
 
-    def success(self, answer: str) -> None:
+    def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
         self._update(
-            {"assistant_content": answer} if self._include_content else {}, None
+            (
+                {"assistant_content": answer, "stop_reason": stop_reason}
+                if self._include_content
+                else {"stop_reason": stop_reason}
+            ),
+            None,
         )
 
     def failure(self, error_code: str) -> None:
@@ -189,9 +271,32 @@ class _LangSmithTrace:
         parent_run_id: UUID | None,
         completed: bool,
     ) -> None:
-        now = datetime.now(UTC)
+        self._create_with_id(
+            self._root_id if parent_run_id is None else uuid4(),
+            name,
+            run_type,
+            inputs,
+            outputs,
+            metadata,
+            parent_run_id,
+            completed,
+            datetime.now(UTC),
+        )
+
+    def _create_with_id(
+        self,
+        run_id: UUID,
+        name: str,
+        run_type: str,
+        inputs: dict[str, JSONValue],
+        outputs: dict[str, JSONValue],
+        metadata: dict[str, JSONValue],
+        parent_run_id: UUID | None,
+        completed: bool,
+        started_at: datetime,
+    ) -> None:
         kwargs: dict[str, object] = {
-            "id": self._root_id if parent_run_id is None else uuid4(),
+            "id": run_id,
             "name": name,
             "run_type": run_type,
             "inputs": inputs,
@@ -199,10 +304,10 @@ class _LangSmithTrace:
             "project_name": self._project,
             "parent_run_id": parent_run_id,
             "extra": {"metadata": self._metadata | metadata},
-            "start_time": now,
+            "start_time": started_at,
         }
         if completed:
-            kwargs["end_time"] = now
+            kwargs["end_time"] = datetime.now(UTC)
         self._submit("create", self._client.create_run, **kwargs)
 
     def _update(self, outputs: dict[str, JSONValue], error: str | None) -> None:
@@ -229,6 +334,144 @@ class _LangSmithTrace:
                 logger.warning("langsmith_tracing_export_failed", operation=operation)
 
         asyncio.create_task(export())
+
+
+class _NoopToolTrace:
+    def begin_knowledge_search(
+        self,
+        *,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> KnowledgeSearchTrace:
+        del knowledge_base_id, top_k, query
+        return _NoopKnowledgeSearchTrace()
+
+    def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
+        del result, error_code
+
+
+class _NoopKnowledgeSearchTrace:
+    def finish(self, hit_count: int | None, error_code: str | None = None) -> None:
+        del hit_count, error_code
+
+
+class _LangSmithToolTrace:
+    def __init__(
+        self, trace: _LangSmithTrace, call: ToolCall, tool_calls_used: int
+    ) -> None:
+        self._trace = trace
+        self._call = call
+        self._id = uuid4()
+        self._started_at = datetime.now(UTC)
+        inputs: dict[str, JSONValue] = (
+            {"tool_call": _tool_call(call)} if trace._include_content else {}
+        )
+        trace._create_with_id(
+            self._id,
+            f"tool.{call.name}",
+            "tool",
+            inputs,
+            {},
+            {
+                "tool_name": call.name,
+                "tool_call_id": call.call_id,
+                "tool_calls_used": tool_calls_used,
+            },
+            trace._root_id,
+            False,
+            self._started_at,
+        )
+
+    def begin_knowledge_search(
+        self,
+        *,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> KnowledgeSearchTrace:
+        return _LangSmithKnowledgeSearchTrace(
+            self,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+            query=query,
+        )
+
+    def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
+        metadata: dict[str, JSONValue] = {
+            "tool_duration_ms": round(
+                (datetime.now(UTC) - self._started_at).total_seconds() * 1000,
+                3,
+            )
+        }
+        if result is not None:
+            metadata["tool_result_kind"] = result.kind.value
+        if error_code is not None:
+            metadata["error_code"] = error_code
+        self._trace._submit(
+            "update",
+            self._trace._client.update_run,
+            self._id,
+            outputs=(
+                {"tool_result": _tool_result(result)}
+                if self._trace._include_content and result is not None
+                else {}
+            ),
+            error=error_code,
+            end_time=datetime.now(UTC),
+            extra={"metadata": metadata},
+        )
+
+
+class _LangSmithKnowledgeSearchTrace:
+    def __init__(
+        self,
+        tool_trace: _LangSmithToolTrace,
+        *,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> None:
+        self._tool_trace = tool_trace
+        self._id = uuid4()
+        self._started_at = datetime.now(UTC)
+        metadata: dict[str, JSONValue] = {
+            "knowledge_base_id": knowledge_base_id,
+            "top_k": top_k,
+        }
+        self._tool_trace._trace._create_with_id(
+            self._id,
+            "knowledge.search",
+            "retriever",
+            ({"query": query} if self._tool_trace._trace._include_content else {}),
+            {},
+            metadata,
+            self._tool_trace._id,
+            False,
+            self._started_at,
+        )
+
+    def finish(self, hit_count: int | None, error_code: str | None = None) -> None:
+        metadata: dict[str, JSONValue] = {
+            "success": error_code is None,
+            "knowledge_search_duration_ms": round(
+                (datetime.now(UTC) - self._started_at).total_seconds() * 1000,
+                3,
+            ),
+        }
+        if hit_count is not None:
+            metadata["hit_count"] = hit_count
+        if error_code is not None:
+            metadata["error_code"] = error_code
+        self._tool_trace._trace._submit(
+            "update",
+            self._tool_trace._trace._client.update_run,
+            self._id,
+            outputs={},
+            error=error_code,
+            end_time=datetime.now(UTC),
+            extra={"metadata": metadata},
+        )
 
 
 def _transcript_item(item: RuntimeTranscriptItem) -> dict[str, JSONValue]:

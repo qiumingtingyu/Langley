@@ -23,7 +23,7 @@ def workflow_for(
     return LearningAssistantWorkflow(
         context_builder=AnswerContextBuilder(history_estimated_token_budget=16_000),
         provider=provider,
-        tool_executor=ToolExecutor(CurrentTimeTool(clock=fixed_clock)),
+        tool_executor=ToolExecutor(tools=(CurrentTimeTool(clock=fixed_clock),)),
         max_llm_rounds=max_llm_rounds,
         max_tool_calls=max_tool_calls,
         overall_deadline_seconds=overall_deadline_seconds,

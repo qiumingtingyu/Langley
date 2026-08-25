@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answer_runtime import ActiveAnswer, StreamItem
 from langley.answering.errors import WorkflowFailure
-from langley.answering.knowledge_qa import CitationDraft, KnowledgeQAFlow
+from langley.answering.knowledge_qa import CitationDraft
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.business_time import utc_now
 from langley.conversation_commands import AnswerCommandResult
@@ -38,7 +38,6 @@ class AnswerExecutionManager:
         memory_catch_up: MemoryCatchUp | None = None,
         memory_boundary_capture: MemoryBoundaryCapture | None = None,
         memory_background_drain: MemoryBackgroundDrain | None = None,
-        knowledge_qa_flow: KnowledgeQAFlow | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._workflow_factory = workflow_factory
@@ -48,7 +47,6 @@ class AnswerExecutionManager:
         self._memory_boundary_capture = memory_boundary_capture
         self._memory_background_drain = memory_background_drain
         self._memory_tasks: set[asyncio.Task[None]] = set()
-        self._knowledge_qa_flow = knowledge_qa_flow
 
     async def schedule(self, command: AnswerCommandResult) -> None:
         """Schedule exactly one newly accepted Run without making HTTP its owner."""
@@ -158,37 +156,24 @@ class AnswerExecutionManager:
                 run_id=command.run.id,
             )
             self._publish(answer, ("run.started", {"run_id": command.run.id}))
-            citation_drafts: tuple[CitationDraft, ...] = ()
-            if command.run.knowledge_base_id is None:
-                await self._run_memory_catch_up(command)
-                success = await workflow.execute(
-                    self._session_factory,
-                    run_id=command.run.id,
-                    conversation_id=command.run.conversation_id,
-                    input_message_id=command.user_message.id,
-                    on_assistant_delta=lambda delta: self._publish_delta(
-                        answer, command.run.id, delta
-                    ),
-                )
-            else:
-                if self._knowledge_qa_flow is None:
-                    raise RuntimeError("knowledge QA flow is not configured")
-                qa_completion = await self._knowledge_qa_flow.execute(
-                    user_id=command.user_id,
-                    knowledge_base_id=command.run.knowledge_base_id,
-                    question=command.user_message.content,
-                    on_assistant_delta=lambda delta: self._publish_delta(
-                        answer, command.run.id, delta
-                    ),
-                )
-                success = qa_completion.content
-                citation_drafts = qa_completion.citations
+            await self._run_memory_catch_up(command)
+            completion = await workflow.execute(
+                self._session_factory,
+                run_id=command.run.id,
+                user_id=command.user_id,
+                conversation_id=command.run.conversation_id,
+                input_message_id=command.user_message.id,
+                knowledge_base_id=command.run.knowledge_base_id,
+                on_assistant_delta=lambda delta: self._publish_delta(
+                    answer, command.run.id, delta
+                ),
+            )
             await _commit_success(
                 self._session_factory,
                 conversation_id=command.run.conversation_id,
                 run_id=command.run.id,
-                content=success,
-                citation_drafts=citation_drafts,
+                content=completion.content,
+                citation_drafts=completion.citations,
             )
             self._close_after_terminal(
                 answer, ("run.succeeded", {"run_id": command.run.id})

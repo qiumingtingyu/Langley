@@ -25,6 +25,7 @@ from langley.answering.contracts import (
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
+from langley.answering.knowledge_qa import AnswerCompletion
 from langley.bootstrap import bootstrap_local_user
 from langley.conversation_commands import (
     AdmissionDisposition,
@@ -649,10 +650,12 @@ def test_memory_catch_up_precedes_workflow_and_terminal_drain_is_finite(
             background_completed.set()
 
         class CheckingWorkflow:
-            async def execute(self, *args, **kwargs) -> str:
+            async def execute(self, *args, **kwargs) -> AnswerCompletion:
                 del args, kwargs
                 assert catch_up_completed.is_set()
-                return "second answer"
+                return AnswerCompletion(
+                    content="second answer", citations=(), abstained=False
+                )
 
         manager = AnswerExecutionManager(
             session_factory,

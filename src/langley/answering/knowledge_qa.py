@@ -4,8 +4,6 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
 from langley.answering.contracts import (
     AssistantContentDelta,
     LLMFinishReason,
@@ -15,11 +13,11 @@ from langley.answering.contracts import (
     UserRuntimeMessage,
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
-from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
-from langley.knowledge.retrieval import RetrievalHit, retrieve_dense
+from langley.knowledge.retrieval import RetrievalHit
+from langley.knowledge.retrieval_service import KnowledgeRetrievalService
 
 _CITATION_HANDLE = re.compile(r"\[K([0-9]+)\]")
-_INSUFFICIENT_EVIDENCE_SENTINEL = "[[INSUFFICIENT_EVIDENCE]]"
+INSUFFICIENT_EVIDENCE_SENTINEL = "[[INSUFFICIENT_EVIDENCE]]"
 INSUFFICIENT_EVIDENCE_ANSWER = "提供的知识库证据不足，无法可靠回答。"
 AssistantDeltaSink = Callable[[str], Awaitable[None]]
 
@@ -35,23 +33,23 @@ class CitationDraft:
 
 
 @dataclass(frozen=True)
-class KnowledgeQACompletion:
+class AnswerCompletion:
+    """Detached final answer facts for either Agent or deterministic QA."""
+
     content: str
     citations: tuple[CitationDraft, ...]
     abstained: bool
 
 
 class KnowledgeQAFlow:
-    """Retrieve bounded evidence and complete one grounded provider round."""
+    """Deterministic internal QA harness, not a production Run route."""
 
     def __init__(
         self,
-        session_factory: async_sessionmaker[AsyncSession],
-        runtime: KnowledgeIndexBuildRuntime,
+        retrieval_service: KnowledgeRetrievalService,
         provider: LLMProvider,
     ) -> None:
-        self._session_factory = session_factory
-        self._runtime = runtime
+        self._retrieval_service = retrieval_service
         self._provider = provider
 
     async def execute(
@@ -61,12 +59,10 @@ class KnowledgeQAFlow:
         knowledge_base_id: int,
         question: str,
         on_assistant_delta: AssistantDeltaSink,
-    ) -> KnowledgeQACompletion:
+    ) -> AnswerCompletion:
         """Run retrieval and provider work with no DB resource held by this flow."""
 
-        result = await retrieve_dense(
-            self._session_factory,
-            self._runtime,
+        result = await self._retrieval_service.search(
             user_id=user_id,
             knowledge_base_id=knowledge_base_id,
             query=question,
@@ -74,7 +70,7 @@ class KnowledgeQAFlow:
         )
         completion: LLMResponseCompleted | None = None
         request = LLMRequest(
-            system_input=_prompt(result.hits),
+            system_input=grounding_prompt(result.hits),
             transcript=(UserRuntimeMessage(content=question),),
             allowed_tools=(),
             personal_context=None,
@@ -98,10 +94,14 @@ class KnowledgeQAFlow:
             or completion.finish_reason is not LLMFinishReason.STOP
         ):
             raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-        return _validated_completion(completion.assistant_content, result.hits)
+        return validated_answer_completion(
+            completion.assistant_content,
+            result.hits,
+            requires_citation=True,
+        )
 
 
-def _prompt(hits: tuple[RetrievalHit, ...]) -> str:
+def grounding_prompt(hits: tuple[RetrievalHit, ...]) -> str:
     """Build the fixed, data-delimited prompt from authoritative evidence."""
 
     blocks = []
@@ -116,18 +116,21 @@ def _prompt(hits: tuple[RetrievalHit, ...]) -> str:
     return (
         "Answer only from the supplied evidence blocks. Cite every normal answer "
         "with one or more inline handles such as [K1]. If the evidence is "
-        f"insufficient, output exactly {_INSUFFICIENT_EVIDENCE_SENTINEL}.\n\n"
+        f"insufficient, output exactly {INSUFFICIENT_EVIDENCE_SENTINEL}.\n\n"
         + "\n\n".join(blocks)
     )
 
 
-def _validated_completion(
-    content: str, hits: tuple[RetrievalHit, ...]
-) -> KnowledgeQACompletion:
+def validated_answer_completion(
+    content: str,
+    hits: tuple[RetrievalHit, ...],
+    *,
+    requires_citation: bool,
+) -> AnswerCompletion:
     """Map model-visible handles back to authoritative evidence deterministically."""
 
-    if content == _INSUFFICIENT_EVIDENCE_SENTINEL:
-        return KnowledgeQACompletion(
+    if content == INSUFFICIENT_EVIDENCE_SENTINEL:
+        return AnswerCompletion(
             content=INSUFFICIENT_EVIDENCE_ANSWER, citations=(), abstained=True
         )
     if not content.strip():
@@ -141,10 +144,10 @@ def _validated_completion(
             raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
         if handle not in cited_handles:
             cited_handles.append(handle)
-    if not cited_handles:
+    if requires_citation and not cited_handles:
         raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
 
-    return KnowledgeQACompletion(
+    return AnswerCompletion(
         content=content,
         citations=tuple(
             CitationDraft(
@@ -159,3 +162,11 @@ def _validated_completion(
         ),
         abstained=False,
     )
+
+
+def _validated_completion(
+    content: str, hits: tuple[RetrievalHit, ...]
+) -> AnswerCompletion:
+    """Compatibility seam for frozen deterministic QA validation tests."""
+
+    return validated_answer_completion(content, hits, requires_citation=True)

@@ -16,8 +16,7 @@ from langley.answer_lifecycle import interrupt_active_runs
 from langley.answering.context_builder import AnswerContextBuilder
 from langley.answering.contracts import LLMProvider, LLMRequest, LLMStreamEvent
 from langley.answering.errors import RunErrorCode, WorkflowFailure
-from langley.answering.knowledge_qa import KnowledgeQAFlow
-from langley.answering.tools import ToolExecutor
+from langley.answering.tools import CurrentTimeTool, SearchKnowledgeTool, ToolExecutor
 from langley.answering.tracing import LangSmithTracer, Tracer
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.api.conversations import router as conversations_router
@@ -37,6 +36,7 @@ from langley.knowledge.index_build import (
     reconcile_interrupted_index_builds,
     reconcile_stale_ready_index_configurations,
 )
+from langley.knowledge.retrieval_service import KnowledgeRetrievalService
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy
 from langley.memory.processing import (
@@ -162,6 +162,8 @@ def _workflow_factory_for(
     settings: Settings,
     provider: LLMProvider,
     tracer: Tracer | None,
+    session_factory,
+    knowledge_index_runtime: KnowledgeIndexBuildRuntime,
 ):
     """Assemble one production Workflow factory without giving routes AI authority."""
 
@@ -169,7 +171,13 @@ def _workflow_factory_for(
         history_estimated_token_budget=settings.history_estimated_token_budget,
         memory_estimated_token_budget=settings.memory_estimated_token_budget,
     )
-    tool_executor = ToolExecutor()
+    retrieval_service = KnowledgeRetrievalService(
+        session_factory,
+        knowledge_index_runtime,
+    )
+    tool_executor = ToolExecutor(
+        tools=(CurrentTimeTool(), SearchKnowledgeTool(retrieval_service))
+    )
     resolved_tracer = tracer or LangSmithTracer(
         enabled=settings.tracing_enabled,
         project=settings.langsmith_project,
@@ -285,7 +293,13 @@ def create_app(
         )
         app.state.execution_manager = AnswerExecutionManager(
             app.state.session_factory,
-            _workflow_factory_for(resolved_settings, configured_provider, tracer),
+            _workflow_factory_for(
+                resolved_settings,
+                configured_provider,
+                tracer,
+                app.state.session_factory,
+                app.state.knowledge_index_runtime,
+            ),
             memory_catch_up=memory_callbacks[0]
             if memory_callbacks is not None
             else None,
@@ -294,11 +308,6 @@ def create_app(
             ),
             memory_background_drain=(
                 memory_callbacks[2] if memory_callbacks is not None else None
-            ),
-            knowledge_qa_flow=KnowledgeQAFlow(
-                app.state.session_factory,
-                app.state.knowledge_index_runtime,
-                configured_provider,
             ),
         )
 

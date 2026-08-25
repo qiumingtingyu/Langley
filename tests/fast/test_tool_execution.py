@@ -11,6 +11,8 @@ from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.tools import (
     CurrentTimeArguments,
     CurrentTimeTool,
+    ToolContext,
+    ToolExecutionOutput,
     ToolExecutor,
 )
 
@@ -28,7 +30,7 @@ async def test_time_tool_contract_drives_exposure_validation_and_dispatch() -> N
     def fixed_clock() -> datetime:
         return datetime(2026, 8, 14, 9, 0, tzinfo=UTC)
 
-    boundary = ToolExecutor(CurrentTimeTool(clock=fixed_clock))
+    boundary = ToolExecutor(tools=(CurrentTimeTool(clock=fixed_clock),))
 
     assert boundary.allowed_tools == (CurrentTimeTool.spec,)
     assert (
@@ -56,7 +58,9 @@ async def test_naive_injected_clock_is_rejected_as_a_typed_workflow_failure() ->
         return datetime(2026, 8, 14, 9, 0)
 
     with pytest.raises(WorkflowFailure) as raised:
-        await ToolExecutor(CurrentTimeTool(clock=naive_clock)).execute_batch((_call(),))
+        await ToolExecutor(tools=(CurrentTimeTool(clock=naive_clock),)).execute_batch(
+            (_call(),)
+        )
 
     assert raised.value.error_code is RunErrorCode.TOOL_EXECUTION_FAILED
 
@@ -94,19 +98,31 @@ async def test_malformed_or_schema_invalid_arguments_are_independent_safe_observ
 
 
 class _UnexpectedFailureTimeTool(CurrentTimeTool):
-    async def execute(self, arguments: dict[str, JSONValue]) -> str:
+    async def execute(
+        self,
+        arguments: dict[str, JSONValue],
+        context: ToolContext | None,
+    ) -> ToolExecutionOutput:
+        del arguments, context
         raise RuntimeError("implementation defect")
 
 
 class _CancelledTimeTool(CurrentTimeTool):
-    async def execute(self, arguments: dict[str, JSONValue]) -> str:
+    async def execute(
+        self,
+        arguments: dict[str, JSONValue],
+        context: ToolContext | None,
+    ) -> ToolExecutionOutput:
+        del arguments, context
         raise asyncio.CancelledError
 
 
 @pytest.mark.anyio
 async def test_unexpected_tool_failure_becomes_a_typed_workflow_failure() -> None:
     with pytest.raises(WorkflowFailure) as raised:
-        await ToolExecutor(_UnexpectedFailureTimeTool()).execute_batch((_call(),))
+        await ToolExecutor(tools=(_UnexpectedFailureTimeTool(),)).execute_batch(
+            (_call(),)
+        )
 
     assert raised.value.error_code is RunErrorCode.TOOL_EXECUTION_FAILED
 
@@ -114,7 +130,7 @@ async def test_unexpected_tool_failure_becomes_a_typed_workflow_failure() -> Non
 @pytest.mark.anyio
 async def test_cancellation_propagates_from_a_tool() -> None:
     with pytest.raises(asyncio.CancelledError):
-        await ToolExecutor(_CancelledTimeTool()).execute_batch((_call(),))
+        await ToolExecutor(tools=(_CancelledTimeTool(),)).execute_batch((_call(),))
 
 
 @pytest.mark.anyio

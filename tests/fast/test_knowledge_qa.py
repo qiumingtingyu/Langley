@@ -93,14 +93,29 @@ def test_exact_insufficient_evidence_sentinel_abstains_without_citations() -> No
     assert completion.citations == ()
 
 
-def test_flow_rejects_provider_tool_completion(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def fake_retrieve(*args: object, **kwargs: object) -> RetrievalResult:
-        del args, kwargs
-        return RetrievalResult(
-            knowledge_base_id=1, generation_id="generation", hits=(_hit(1),)
-        )
+def test_sentinel_embedded_in_explanation_is_not_an_abstention() -> None:
+    completion = knowledge_qa._validated_completion(
+        "解释文字 [K1] [[INSUFFICIENT_EVIDENCE]] 补充文字", (_hit(1),)
+    )
 
-    monkeypatch.setattr(knowledge_qa, "retrieve_dense", fake_retrieve)
+    assert completion.content == "解释文字 [K1] [[INSUFFICIENT_EVIDENCE]] 补充文字"
+    assert completion.abstained is False
+    assert [citation.evidence_handle for citation in completion.citations] == [1]
+
+
+def test_flow_rejects_provider_tool_completion() -> None:
+    class FakeRetrievalService:
+        async def search(self, **kwargs: object) -> RetrievalResult:
+            assert kwargs == {
+                "user_id": 1,
+                "knowledge_base_id": 1,
+                "query": "question",
+                "top_k": 5,
+            }
+            return RetrievalResult(
+                knowledge_base_id=1, generation_id="generation", hits=(_hit(1),)
+            )
+
     provider = FakeProvider(
         [
             ScriptedProviderRound(
@@ -113,7 +128,7 @@ def test_flow_rejects_provider_tool_completion(monkeypatch: pytest.MonkeyPatch) 
             )
         ]
     )
-    flow = knowledge_qa.KnowledgeQAFlow(None, None, provider)  # type: ignore[arg-type]
+    flow = knowledge_qa.KnowledgeQAFlow(FakeRetrievalService(), provider)  # type: ignore[arg-type]
 
     async def execute() -> None:
         with pytest.raises(WorkflowFailure) as raised:

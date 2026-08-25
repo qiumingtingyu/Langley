@@ -1,7 +1,7 @@
 """Deterministic production Workflow and LangGraph regression tests."""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
 
@@ -24,8 +24,15 @@ from langley.answering.contracts import (
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
-from langley.answering.tools import CurrentTimeTool, ToolExecutor
+from langley.answering.tools import (
+    CurrentTimeTool,
+    SearchKnowledgeTool,
+    ToolContext,
+    ToolExecutionOutput,
+    ToolExecutor,
+)
 from langley.answering.workflow import LearningAssistantWorkflow
+from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 
 
 @dataclass
@@ -91,7 +98,11 @@ def _workflow(
         provider=provider,
         tool_executor=tool_executor
         or ToolExecutor(
-            CurrentTimeTool(clock=lambda: datetime(2026, 8, 14, 9, 0, tzinfo=UTC))
+            tools=(
+                CurrentTimeTool(
+                    clock=lambda: datetime(2026, 8, 14, 9, 0, tzinfo=UTC),
+                ),
+            ),
         ),
         max_llm_rounds=max_llm_rounds,
         max_tool_calls=max_tool_calls,
@@ -104,6 +115,62 @@ def _workflow(
 
 async def _discard_delta(content: str) -> None:
     del content
+
+
+async def _execute_workflow(
+    workflow: LearningAssistantWorkflow,
+    on_assistant_delta=_discard_delta,
+    knowledge_base_id: int | None = None,
+):
+    return await workflow.execute(
+        cast(object, None),
+        run_id=101,
+        user_id=1,
+        conversation_id=11,
+        input_message_id=22,
+        knowledge_base_id=knowledge_base_id,
+        on_assistant_delta=on_assistant_delta,
+    )
+
+
+def _hit() -> RetrievalHit:
+    return RetrievalHit(
+        knowledge_chunk_id=11,
+        rank=1,
+        score=0.9,
+        chunk_ordinal=4,
+        content="Authoritative TCP evidence.",
+        heading_path=("TCP",),
+        source_regions=(),
+        document_id=12,
+        document_version_id=13,
+        source_display_name="tcp.md",
+        source_sha256="a" * 64,
+    )
+
+
+@dataclass
+class _FakeRetrievalService:
+    calls: list[tuple[int, int, str, int]] = field(default_factory=list)
+
+    async def search(
+        self, *, user_id: int, knowledge_base_id: int, query: str, top_k: int
+    ) -> RetrievalResult:
+        self.calls.append((user_id, knowledge_base_id, query, top_k))
+        return RetrievalResult(
+            knowledge_base_id=knowledge_base_id,
+            generation_id="generation",
+            hits=(_hit(),),
+        )
+
+
+def _rag_executor(service: _FakeRetrievalService) -> ToolExecutor:
+    return ToolExecutor(
+        tools=(
+            CurrentTimeTool(),
+            SearchKnowledgeTool(service),  # type: ignore[arg-type]
+        )
+    )
 
 
 @pytest.mark.anyio
@@ -123,18 +190,185 @@ async def test_direct_answer_uses_canonical_completion_not_stream_deltas() -> No
     async def capture_delta(content: str) -> None:
         deltas.append(content)
 
-    success = await _workflow(provider).execute(
-        cast(object, None),
-        conversation_id=11,
-        input_message_id=22,
-        on_assistant_delta=capture_delta,
-    )
+    success = await _execute_workflow(_workflow(provider), capture_delta)
 
-    assert success == "canonical final"
+    assert success.content == "canonical final"
     assert deltas == ["temporary presentation"]
     assert provider.requests[0].transcript == (
         UserRuntimeMessage(content="现在几点？"),
     )
+
+
+@pytest.mark.anyio
+async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
+    service = _FakeRetrievalService()
+    direct_provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
+    )
+    await _execute_workflow(
+        _workflow(direct_provider, tool_executor=_rag_executor(service))
+    )
+    assert tuple(tool.name for tool in direct_provider.requests[0].allowed_tools) == (
+        "get_current_time",
+    )
+
+    search_call = ToolCall("search-1", "search_knowledge", '{"query":"TCP"}')
+    grounded_provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="TCP uses [K1]."),)),
+        ]
+    )
+    completion = await _execute_workflow(
+        _workflow(grounded_provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert tuple(tool.name for tool in grounded_provider.requests[0].allowed_tools) == (
+        "get_current_time",
+        "search_knowledge",
+    )
+    assert service.calls == [(1, 44, "TCP", 5)]
+    assert [
+        (draft.evidence_handle, draft.document_version_id)
+        for draft in completion.citations
+    ] == [(1, 13)]
+    observation = cast(ToolResult, grounded_provider.requests[1].transcript[2])
+    assert "knowledge_base_id" not in observation.content
+    assert "evidence_handle" in observation.content
+
+
+@pytest.mark.anyio
+async def test_retrieval_evidence_survives_a_later_time_tool_batch() -> None:
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"TCP"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall(
+                                "time-1", "get_current_time", '{"timezone":"UTC"}'
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="TCP uses [K1]."),)),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert service.calls == [(1, 44, "TCP", 5)]
+    assert [citation.evidence_handle for citation in completion.citations] == [1]
+
+
+@pytest.mark.anyio
+async def test_grounded_citation_validation_and_second_search_stop_before_service() -> (
+    None
+):
+    service = _FakeRetrievalService()
+    search_call = ToolCall("search-1", "search_knowledge", '{"query":"TCP"}')
+    missing_citation = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="uncited"),)),
+        ]
+    )
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(missing_citation, tool_executor=_rag_executor(service)),
+            knowledge_base_id=44,
+        )
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+
+    insufficient = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(_completion(content="[[INSUFFICIENT_EVIDENCE]]"),)
+            ),
+        ]
+    )
+    abstained = await _execute_workflow(
+        _workflow(insufficient, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+    assert abstained.abstained is True
+    assert abstained.citations == ()
+
+    repeated_search = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-2", "search_knowledge", '{"query":"TCP"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+        ]
+    )
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(repeated_search, tool_executor=_rag_executor(service)),
+            knowledge_base_id=44,
+        )
+    assert raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert service.calls == [(1, 44, "TCP", 5)] * 3
 
 
 @pytest.mark.anyio
@@ -158,14 +392,9 @@ async def test_tool_loop_round_trips_tool_observation() -> None:
         ]
     )
 
-    success = await _workflow(provider).execute(
-        cast(object, None),
-        conversation_id=11,
-        input_message_id=22,
-        on_assistant_delta=_discard_delta,
-    )
+    success = await _execute_workflow(_workflow(provider))
 
-    assert success == "我来查询。\n\n现在是 09:00 UTC。"
+    assert success.content == "我来查询。\n\n现在是 09:00 UTC。"
     second_request = provider.requests[1]
     assert second_request.transcript[1].tool_calls == (tool_call,)
     tool_result = cast(ToolResult, second_request.transcript[2])
@@ -202,14 +431,11 @@ async def test_personal_context_is_not_transcript_and_stays_stable_across_rounds
         ),
     )
 
-    await _workflow(
-        provider,
-        context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
-    ).execute(
-        cast(object, None),
-        conversation_id=11,
-        input_message_id=22,
-        on_assistant_delta=_discard_delta,
+    await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+        )
     )
 
     assert provider.requests[0].personal_context == ("prefers short examples",)
@@ -250,14 +476,9 @@ async def test_nonempty_tool_calls_route_to_the_tool_node_regardless_of_finish_l
         ]
     )
 
-    success = await _workflow(provider).execute(
-        cast(object, None),
-        conversation_id=11,
-        input_message_id=22,
-        on_assistant_delta=_discard_delta,
-    )
+    success = await _execute_workflow(_workflow(provider))
 
-    assert success == "工具路径已完成。"
+    assert success.content == "工具路径已完成。"
     assert isinstance(provider.requests[1].transcript[2], ToolResult)
 
 
@@ -283,14 +504,9 @@ async def test_malformed_tool_arguments_become_a_recoverable_runtime_observation
         ]
     )
 
-    success = await _workflow(provider).execute(
-        cast(object, None),
-        conversation_id=11,
-        input_message_id=22,
-        on_assistant_delta=_discard_delta,
-    )
+    success = await _execute_workflow(_workflow(provider))
 
-    assert success == "请提供有效时区。"
+    assert success.content == "请提供有效时区。"
     tool_result = cast(ToolResult, provider.requests[1].transcript[2])
     assert tool_result.kind is ToolResultKind.INVALID_ARGUMENTS
 
@@ -302,9 +518,14 @@ class _TrackingTimeTool(CurrentTimeTool):
     def validate_arguments(self, arguments: dict[str, object]) -> bool:
         return set(arguments) == {"timezone"} and isinstance(arguments["timezone"], str)
 
-    async def execute(self, arguments: dict[str, object]) -> str:
+    async def execute(
+        self, arguments: dict[str, object], context: ToolContext | None
+    ) -> ToolExecutionOutput:
+        del context
         self.executed.append("get_current_time")
-        return '{"timezone":"UTC","datetime":"2026-08-14T09:00:00+00:00"}'
+        return ToolExecutionOutput(
+            observation='{"timezone":"UTC","datetime":"2026-08-14T09:00:00+00:00"}'
+        )
 
 
 @pytest.mark.anyio
@@ -328,15 +549,12 @@ async def test_whole_tool_batch_budget_preflight_executes_none() -> None:
     )
 
     with pytest.raises(WorkflowFailure) as raised:
-        await _workflow(
-            provider,
-            tool_executor=ToolExecutor(tracking_tool),
-            max_tool_calls=1,
-        ).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
+        await _execute_workflow(
+            _workflow(
+                provider,
+                tool_executor=ToolExecutor(tools=(tracking_tool,)),
+                max_tool_calls=1,
+            )
         )
 
     assert raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
@@ -360,12 +578,7 @@ async def test_invalid_tool_call_still_counts_against_the_agent_tool_budget() ->
     )
 
     with pytest.raises(WorkflowFailure) as raised:
-        await _workflow(provider, max_tool_calls=0).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
-        )
+        await _execute_workflow(_workflow(provider, max_tool_calls=0))
 
     assert raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
 
@@ -387,12 +600,7 @@ async def test_round_limit_and_deadline_are_typed_workflow_failures() -> None:
         ]
     )
     with pytest.raises(WorkflowFailure) as round_raised:
-        await _workflow(round_limited, max_llm_rounds=1).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
-        )
+        await _execute_workflow(_workflow(round_limited, max_llm_rounds=1))
     assert round_raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
 
     started = asyncio.Event()
@@ -401,12 +609,7 @@ async def test_round_limit_and_deadline_are_typed_workflow_failures() -> None:
         [ScriptedProviderRound(events=(), started=started, blocked_until=blocked_until)]
     )
     task = asyncio.create_task(
-        _workflow(deadline_limited, overall_deadline_seconds=0.01).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
-        )
+        _execute_workflow(_workflow(deadline_limited, overall_deadline_seconds=0.01))
     )
     await started.wait()
     with pytest.raises(WorkflowFailure) as deadline_raised:
@@ -418,15 +621,12 @@ async def test_round_limit_and_deadline_are_typed_workflow_failures() -> None:
         started=context_started, blocked_until=asyncio.Event()
     )
     context_task = asyncio.create_task(
-        _workflow(
-            FakeProvider([]),
-            context_builder=cast(AnswerContextBuilder, context_deadline_limited),
-            overall_deadline_seconds=0.01,
-        ).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
+        _execute_workflow(
+            _workflow(
+                FakeProvider([]),
+                context_builder=cast(AnswerContextBuilder, context_deadline_limited),
+                overall_deadline_seconds=0.01,
+            )
         )
     )
     await context_started.wait()
@@ -452,12 +652,7 @@ async def test_invalid_final_candidates_never_become_workflow_success(
     provider = FakeProvider([ScriptedProviderRound(events=(completion,))])
 
     with pytest.raises(WorkflowFailure) as raised:
-        await _workflow(provider).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
-        )
+        await _execute_workflow(_workflow(provider))
 
     assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
 
@@ -473,12 +668,7 @@ async def test_workflow_cancellation_propagates_through_the_blocked_provider() -
         ]
     )
     task = asyncio.create_task(
-        _workflow(provider, overall_deadline_seconds=10).execute(
-            cast(object, None),
-            conversation_id=11,
-            input_message_id=22,
-            on_assistant_delta=_discard_delta,
-        )
+        _execute_workflow(_workflow(provider, overall_deadline_seconds=10))
     )
     await started.wait()
     task.cancel()
@@ -496,13 +686,7 @@ async def test_graph_scope_disables_automatic_langsmith_tracing_despite_global_e
         FakeProvider([ScriptedProviderRound(events=(_completion(content="正常回答"),))])
     )
 
-    success = await _workflow(cast(FakeProvider, provider)).execute(
-        cast(object, None),
-        run_id=919,
-        conversation_id=11,
-        input_message_id=22,
-        on_assistant_delta=_discard_delta,
-    )
+    success = await _execute_workflow(_workflow(cast(FakeProvider, provider)))
 
-    assert success == "正常回答"
+    assert success.content == "正常回答"
     assert provider.enabled_values == [False]
