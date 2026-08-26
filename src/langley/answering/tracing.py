@@ -62,6 +62,7 @@ class ExecutionTrace(Protocol):
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
+        abstention_control_token_leaked: bool = False,
     ) -> None: ...
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None: ...
@@ -212,6 +213,7 @@ class _NoopTrace:
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
+        abstention_control_token_leaked: bool = False,
     ) -> None:
         del (
             available_evidence_count,
@@ -219,6 +221,7 @@ class _NoopTrace:
             cited_document_version_ids,
             abstained,
             error_code,
+            abstention_control_token_leaked,
         )
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
@@ -299,6 +302,7 @@ class _LangSmithTrace:
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
+        abstention_control_token_leaked: bool = False,
     ) -> None:
         metadata: dict[str, JSONValue] = {
             "available_evidence_count": available_evidence_count,
@@ -310,6 +314,8 @@ class _LangSmithTrace:
         }
         if error_code is not None:
             metadata["error_code"] = error_code
+        if abstention_control_token_leaked:
+            metadata["abstention_control_token_leaked"] = True
         self._create(
             "citation.validate",
             "chain",

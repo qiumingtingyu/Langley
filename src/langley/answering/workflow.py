@@ -3,6 +3,7 @@
 import asyncio
 import re
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import TypedDict, cast
 
 import structlog
@@ -30,9 +31,11 @@ from langley.answering.errors import (
 )
 from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import (
+    ABSTENTION_CONTROL_TOKEN_PLACEHOLDER,
     INSUFFICIENT_EVIDENCE_ANSWER,
     AnswerCompletion,
     evidence_context,
+    new_abstention_control_token,
     required_grounding_system_input,
     validated_answer_completion,
 )
@@ -53,7 +56,7 @@ AssistantDeltaSink = Callable[[str], Awaitable[None]]
 logger = structlog.get_logger(__name__)
 
 LEARNING_ASSISTANT_SYSTEM_PROMPT_ID = "learning-assistant-v1"
-REQUIRED_GROUNDING_SYSTEM_PROMPT_ID = "required-grounding-v1"
+REQUIRED_GROUNDING_SYSTEM_PROMPT_ID = "required-grounding-v2"
 LEARNING_ASSISTANT_SYSTEM_INPUT = (
     "You are Langley, a helpful learning assistant. Give accurate, clear answers "
     "and use the available tools only when they are useful. Personal Context is "
@@ -483,6 +486,7 @@ class LearningAssistantWorkflow:
                 assistant_content,
                 state["retrieval_hits"],
                 requires_citation=state["successful_searches"] > 0,
+                abstention_control_token=None,
             )
         except WorkflowFailure as error:
             subtype = error.invalid_response_subtype
@@ -564,8 +568,9 @@ class LearningAssistantWorkflow:
                 abstained=True,
             )
 
+        abstention_control_token = new_abstention_control_token()
         request = LLMRequest(
-            system_input=required_grounding_system_input(),
+            system_input=required_grounding_system_input(abstention_control_token),
             transcript=self._initial_transcript(
                 context, neutralize_historical_citations=True
             ),
@@ -575,7 +580,17 @@ class LearningAssistantWorkflow:
             evidence_context=evidence_context(result.hits),
         )
         completion: LLMResponseCompleted | None = None
-        llm_trace = self._begin_llm_trace(trace, request, 1)
+        llm_trace = self._begin_llm_trace(
+            trace,
+            replace(
+                request,
+                system_input=request.system_input.replace(
+                    abstention_control_token,
+                    ABSTENTION_CONTROL_TOKEN_PLACEHOLDER,
+                ),
+            ),
+            1,
+        )
         llm_trace_closed = False
         try:
             async for event in self._provider.stream(request):
@@ -587,7 +602,10 @@ class LearningAssistantWorkflow:
                     if completion is not None:
                         raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
                     completion = event
-                    self._trace(lambda: llm_trace.finish(event))
+                    trace_completion = _redact_abstention_control_token(
+                        event, abstention_control_token
+                    )
+                    self._trace(lambda: llm_trace.finish(trace_completion))
                     llm_trace_closed = True
                 else:
                     raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
@@ -604,7 +622,13 @@ class LearningAssistantWorkflow:
                 and error.error_code is RunErrorCode.LLM_RESPONSE_INVALID
                 and error.invalid_response_subtype is None
             ):
-                self._record_rejected_response(trace, completion, None)
+                self._record_rejected_response(
+                    trace,
+                    _redact_abstention_control_token(
+                        completion, abstention_control_token
+                    ),
+                    None,
+                )
             raise
         except Exception:
             if not llm_trace_closed:
@@ -619,17 +643,30 @@ class LearningAssistantWorkflow:
                 RunErrorCode.LLM_RESPONSE_INVALID,
                 invalid_response_subtype=InvalidResponseSubtype.FINAL_RESPONSE_EMPTY,
             )
-        self._validate_completion_shape(completion, trace)
+        self._validate_completion_shape(
+            completion,
+            trace,
+            trace_completion=_redact_abstention_control_token(
+                completion, abstention_control_token
+            ),
+        )
         try:
             answer = validated_answer_completion(
                 completion.assistant_content,
                 result.hits,
                 requires_citation=True,
+                abstention_control_token=abstention_control_token,
             )
         except WorkflowFailure as error:
             validation_subtype = error.invalid_response_subtype
             if validation_subtype is not None:
-                self._record_rejected_response(trace, completion, validation_subtype)
+                self._record_rejected_response(
+                    trace,
+                    _redact_abstention_control_token(
+                        completion, abstention_control_token
+                    ),
+                    validation_subtype,
+                )
             validation_error_code = (
                 validation_subtype.value
                 if validation_subtype is not None
@@ -656,12 +693,19 @@ class LearningAssistantWorkflow:
                 ),
                 abstained=answer.abstained,
                 error_code=None,
+                abstention_control_token_leaked=(
+                    abstention_control_token in answer.content
+                ),
             )
         )
         return answer
 
     def _validate_completion_shape(
-        self, completion: LLMResponseCompleted, trace: ExecutionTrace
+        self,
+        completion: LLMResponseCompleted,
+        trace: ExecutionTrace,
+        *,
+        trace_completion: LLMResponseCompleted | None = None,
     ) -> None:
         subtype: InvalidResponseSubtype | None = None
         if completion.tool_calls:
@@ -671,7 +715,11 @@ class LearningAssistantWorkflow:
         elif not completion.assistant_content.strip():
             subtype = InvalidResponseSubtype.FINAL_RESPONSE_EMPTY
         if subtype is not None:
-            self._record_rejected_response(trace, completion, subtype)
+            self._record_rejected_response(
+                trace,
+                completion if trace_completion is None else trace_completion,
+                subtype,
+            )
             raise WorkflowFailure(
                 RunErrorCode.LLM_RESPONSE_INVALID,
                 invalid_response_subtype=subtype,
@@ -710,4 +758,18 @@ def _neutralize_historical_citations(content: str) -> str:
 
     return _HISTORICAL_CITATION.sub(
         lambda match: f"<HISTORICAL_CITATION:K{match.group(1)}>", content
+    )
+
+
+def _redact_abstention_control_token(
+    completion: LLMResponseCompleted, abstention_control_token: str
+) -> LLMResponseCompleted:
+    """Keep the transient control token out of trace and Eval persistence."""
+
+    return replace(
+        completion,
+        assistant_content=completion.assistant_content.replace(
+            abstention_control_token,
+            ABSTENTION_CONTROL_TOKEN_PLACEHOLDER,
+        ),
     )

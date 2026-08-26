@@ -8,7 +8,11 @@ import pytest
 import langley.answer_execution as execution_module
 from langley.answer_execution import AnswerExecutionManager
 from langley.answer_runtime import ActiveAnswer
-from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.errors import (
+    InvalidResponseSubtype,
+    RunErrorCode,
+    WorkflowFailure,
+)
 from langley.answering.knowledge_qa import (
     INSUFFICIENT_EVIDENCE_ANSWER,
     AnswerCompletion,
@@ -134,7 +138,10 @@ async def test_required_publishes_only_canonical_content_after_commit(
 async def test_required_invalid_has_zero_delta_and_zero_partial_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    failure = WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+    failure = WorkflowFailure(
+        RunErrorCode.LLM_RESPONSE_INVALID,
+        invalid_response_subtype=InvalidResponseSubtype.INVALID_ABSTENTION_FORMAT,
+    )
 
     answer, items, events = await _exercise(
         monkeypatch, _Workflow(failure=failure), policy="REQUIRED"

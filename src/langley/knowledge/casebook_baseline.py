@@ -297,6 +297,7 @@ class _CasebookExecutionTrace:
             "knowledge_searches": [],
             "citation_validations": [],
             "rejected_normalized_candidate": None,
+            "abstention_control_token_leaked": False,
         }
 
     def begin_llm(self, request: LLMRequest, round_: int) -> _CasebookLLMTrace:
@@ -412,7 +413,12 @@ class _CasebookExecutionTrace:
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
+        abstention_control_token_leaked: bool = False,
     ) -> None:
+        self._value["abstention_control_token_leaked"] = bool(
+            self._value["abstention_control_token_leaked"]
+            or abstention_control_token_leaked
+        )
         self._value["citation_validations"].append(
             {
                 "available_evidence_count": available_evidence_count,
@@ -420,6 +426,7 @@ class _CasebookExecutionTrace:
                 "cited_document_version_ids": list(cited_document_version_ids),
                 "abstained": abstained,
                 "error_code": error_code,
+                "abstention_control_token_leaked": (abstention_control_token_leaked),
             }
         )
 

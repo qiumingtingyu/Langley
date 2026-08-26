@@ -1,6 +1,7 @@
 """Focused deterministic contracts for single-KnowledgeBase QA completion."""
 
 import asyncio
+import re
 
 import pytest
 
@@ -44,7 +45,9 @@ def _completion(
 
 def test_validated_completion_preserves_handles_and_deduplicates() -> None:
     completion = knowledge_qa._validated_completion(
-        "Use [K2], then [K1], and [K2] again.", (_hit(1), _hit(2))
+        "Use [K2], then [K1], and [K2] again.",
+        (_hit(1), _hit(2)),
+        abstention_control_token=None,
     )
 
     assert completion.abstained is False
@@ -90,15 +93,62 @@ def test_normal_completion_rejects_unknown_or_missing_handles(
     content: str, subtype: InvalidResponseSubtype
 ) -> None:
     with pytest.raises(WorkflowFailure) as raised:
-        knowledge_qa._validated_completion(content, (_hit(1), _hit(2)))
+        knowledge_qa._validated_completion(
+            content,
+            (_hit(1), _hit(2)),
+            abstention_control_token=None,
+        )
 
     assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
     assert raised.value.invalid_response_subtype is subtype
 
 
-def test_exact_insufficient_evidence_sentinel_abstains_without_citations() -> None:
+def test_auto_exact_legacy_sentinel_abstains_without_strip_normalization() -> None:
     completion = knowledge_qa._validated_completion(
-        "[[INSUFFICIENT_EVIDENCE]]", (_hit(1),)
+        knowledge_qa.AUTO_INSUFFICIENT_EVIDENCE_SENTINEL,
+        (_hit(1),),
+        abstention_control_token=None,
+    )
+
+    assert completion.content == knowledge_qa.INSUFFICIENT_EVIDENCE_ANSWER
+    assert completion.abstained is True
+    assert completion.citations == ()
+
+    with pytest.raises(WorkflowFailure) as raised:
+        knowledge_qa._validated_completion(
+            f" {knowledge_qa.AUTO_INSUFFICIENT_EVIDENCE_SENTINEL} ",
+            (_hit(1),),
+            abstention_control_token=None,
+        )
+    assert (
+        raised.value.invalid_response_subtype
+        is InvalidResponseSubtype.MISSING_REQUIRED_CITATION
+    )
+
+
+def test_auto_embedded_legacy_sentinel_is_ordinary_content() -> None:
+    content = "该字符串 [[INSUFFICIENT_EVIDENCE]] 可以被讨论 [K1]。"
+
+    completion = knowledge_qa._validated_completion(
+        content,
+        (_hit(1),),
+        abstention_control_token=None,
+    )
+
+    assert completion.content == content
+    assert completion.abstained is False
+    assert [citation.evidence_handle for citation in completion.citations] == [1]
+
+
+_CURRENT_TOKEN = "[[LANGLEY_ABSTAIN_0123456789abcdef0123456789abcdef]]"
+
+
+@pytest.mark.parametrize("content", [_CURRENT_TOKEN, f"  {_CURRENT_TOKEN}\n"])
+def test_exact_current_run_token_abstains_without_citations(content: str) -> None:
+    completion = knowledge_qa._validated_completion(
+        content,
+        (_hit(1),),
+        abstention_control_token=_CURRENT_TOKEN,
     )
 
     assert completion.content == knowledge_qa.INSUFFICIENT_EVIDENCE_ANSWER
@@ -106,14 +156,60 @@ def test_exact_insufficient_evidence_sentinel_abstains_without_citations() -> No
     assert completion.citations == ()
 
 
-def test_sentinel_embedded_in_explanation_is_not_an_abstention() -> None:
-    completion = knowledge_qa._validated_completion(
-        "解释文字 [K1] [[INSUFFICIENT_EVIDENCE]] 补充文字", (_hit(1),)
+@pytest.mark.parametrize(
+    "content",
+    [
+        f"解释文字 {_CURRENT_TOKEN}",
+        f"{_CURRENT_TOKEN} 补充文字",
+        f"解释文字 [K1] {_CURRENT_TOKEN}",
+    ],
+)
+def test_current_run_token_mixed_with_text_is_invalid(content: str) -> None:
+    with pytest.raises(WorkflowFailure) as raised:
+        knowledge_qa._validated_completion(
+            content,
+            (_hit(1),),
+            abstention_control_token=_CURRENT_TOKEN,
+        )
+
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert (
+        raised.value.invalid_response_subtype
+        is InvalidResponseSubtype.INVALID_ABSTENTION_FORMAT
     )
 
-    assert completion.content == "解释文字 [K1] [[INSUFFICIENT_EVIDENCE]] 补充文字"
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "`[[INSUFFICIENT_EVIDENCE]]` 是一个表示证据不足的字符串 [K1]。",
+        "另一个标记 [[LANGLEY_ABSTAIN_deadbeef]] 不是本轮控制信号 [K1]。",
+    ],
+)
+def test_legacy_or_other_run_token_like_text_is_ordinary_content(content: str) -> None:
+    completion = knowledge_qa._validated_completion(
+        content,
+        (_hit(1),),
+        abstention_control_token=_CURRENT_TOKEN,
+    )
+
+    assert completion.content == content
     assert completion.abstained is False
     assert [citation.evidence_handle for citation in completion.citations] == [1]
+
+
+def test_run_local_control_tokens_are_compact_unique_and_prompted_as_control() -> None:
+    first = knowledge_qa.new_abstention_control_token()
+    second = knowledge_qa.new_abstention_control_token()
+
+    assert first != second
+    assert re.fullmatch(r"\[\[LANGLEY_ABSTAIN_[0-9a-f]{32}\]\]", first)
+    prompt = knowledge_qa.required_grounding_system_input(first)
+    assert first in prompt
+    assert "any material part cannot be answered" in prompt
+    assert "nothing else" in prompt
+    assert "Do not provide a partial answer before or after the token" in prompt
+    assert "Do not cite the token" in prompt
 
 
 def test_flow_rejects_provider_tool_completion() -> None:
@@ -154,3 +250,44 @@ def test_flow_rejects_provider_tool_completion() -> None:
         assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
 
     asyncio.run(execute())
+
+
+def test_flow_keeps_run_local_token_out_of_delta_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeRetrievalService:
+        async def search(self, **kwargs: object) -> RetrievalResult:
+            return RetrievalResult(
+                knowledge_base_id=1, generation_id="generation", hits=(_hit(1),)
+            )
+
+    monkeypatch.setattr(
+        knowledge_qa, "new_abstention_control_token", lambda: _CURRENT_TOKEN
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    knowledge_qa.AssistantContentDelta(_CURRENT_TOKEN),
+                    _completion(_CURRENT_TOKEN),
+                )
+            )
+        ]
+    )
+    flow = knowledge_qa.KnowledgeQAFlow(FakeRetrievalService(), provider)  # type: ignore[arg-type]
+    deltas: list[str] = []
+
+    async def execute() -> None:
+        completion = await flow.execute(
+            user_id=1,
+            knowledge_base_id=1,
+            question="question",
+            on_assistant_delta=lambda content: asyncio.sleep(
+                0, result=deltas.append(content)
+            ),
+        )
+        assert completion.content == knowledge_qa.INSUFFICIENT_EVIDENCE_ANSWER
+
+    asyncio.run(execute())
+    assert deltas == [knowledge_qa.INSUFFICIENT_EVIDENCE_ANSWER]
+    assert _CURRENT_TOKEN in provider.requests[0].system_input

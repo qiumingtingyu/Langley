@@ -220,6 +220,29 @@ def test_b1_rejected_completed_candidate_is_a_formal_invariant() -> None:
     )
 
 
+def test_abstention_control_token_leak_is_a_path_independent_bad_case_flag() -> None:
+    flags = runner._case_flags(
+        case={
+            "answerability": "ANSWERABLE",
+            "agent_expectation": {"knowledge_search": "REQUIRED"},
+        },
+        final_status="SUCCEEDED",
+        error_code=None,
+        abstained=False,
+        citations=[{"evidence_handle": 1}],
+        knowledge_search_attempt_count=1,
+        retrieval={
+            "assessment": {
+                "all_supporting_evidence_retrieved": True,
+            }
+        },
+        trace_available=True,
+        abstention_control_token_leaked=True,
+    )
+
+    assert "ABSTENTION_CONTROL_TOKEN_LEAKED" in flags
+
+
 def test_verified_retrieval_hits_receive_document_key_annotation() -> None:
     hits = [
         {

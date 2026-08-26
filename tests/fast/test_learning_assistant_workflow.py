@@ -1,6 +1,7 @@
 """Deterministic production Workflow and LangGraph regression tests."""
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import cast
@@ -8,6 +9,7 @@ from typing import cast
 import pytest
 from langsmith import get_tracing_context
 
+import langley.answering.workflow as workflow_module
 from langley.answering.context_builder import (
     AnswerContext,
     AnswerContextBuilder,
@@ -46,6 +48,8 @@ from langley.answering.workflow import LearningAssistantWorkflow
 from langley.knowledge.casebook_baseline import CasebookBaselineTracer
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 from langley.knowledge.retrieval_service import KnowledgeSearchError
+
+_CURRENT_ABSTENTION_TOKEN = "[[LANGLEY_ABSTAIN_0123456789abcdef0123456789abcdef]]"
 
 
 @dataclass
@@ -652,6 +656,48 @@ async def test_grounded_citation_validation_and_second_search_stop_before_servic
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("content", "expected_abstained"),
+    [
+        ("[[INSUFFICIENT_EVIDENCE]]", True),
+        ("该字符串 [[INSUFFICIENT_EVIDENCE]] 可以被讨论 [K1]。", False),
+    ],
+)
+async def test_auto_preserves_legacy_sentinel_exact_equality_semantics(
+    content: str, expected_abstained: bool
+) -> None:
+    service = _FakeRetrievalService()
+    search_call = ToolCall("search-1", "search_knowledge", '{"query":"TCP"}')
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content=content),)),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert completion.abstained is expected_abstained
+    if expected_abstained:
+        assert completion.content == INSUFFICIENT_EVIDENCE_ANSWER
+        assert completion.citations == ()
+    else:
+        assert completion.content == content
+        assert [citation.evidence_handle for citation in completion.citations] == [1]
+
+
+@pytest.mark.anyio
 async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles() -> (
     None
 ):
@@ -698,6 +744,15 @@ async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles(
     assert request.allowed_tools == ()
     assert request.personal_context is None
     assert "[K1]" in (request.evidence_context or "")
+    token_match = re.search(
+        r"\[\[LANGLEY_ABSTAIN_[0-9a-f]{32}\]\]", request.system_input
+    )
+    assert token_match is not None
+    assert "any material part cannot be answered" in request.system_input
+    assert "nothing else" in request.system_input
+    assert "Do not provide a partial answer before or after the token" in (
+        request.system_input
+    )
     historical = cast(AssistantRuntimeMessage, request.transcript[1])
     assert historical.content == (
         "Earlier <HISTORICAL_CITATION:K2> and <HISTORICAL_CITATION:K1>."
@@ -721,15 +776,26 @@ async def test_required_zero_hits_abstains_without_calling_llm() -> None:
 
 
 @pytest.mark.anyio
-async def test_required_sentinel_never_streams_raw_candidate() -> None:
+@pytest.mark.parametrize(
+    "candidate",
+    [_CURRENT_ABSTENTION_TOKEN, f" \n{_CURRENT_ABSTENTION_TOKEN}\t"],
+)
+async def test_required_current_token_maps_to_canonical_abstention_without_streaming(
+    monkeypatch: pytest.MonkeyPatch, candidate: str
+) -> None:
+    monkeypatch.setattr(
+        workflow_module,
+        "new_abstention_control_token",
+        lambda: _CURRENT_ABSTENTION_TOKEN,
+    )
     service = _FakeRetrievalService()
     provider = FakeProvider(
         [
             ScriptedProviderRound(
                 events=(
-                    AssistantContentDelta("[[INSUFFICIENT_"),
-                    AssistantContentDelta("EVIDENCE]]"),
-                    _completion(content="[[INSUFFICIENT_EVIDENCE]]"),
+                    AssistantContentDelta(candidate[:10]),
+                    AssistantContentDelta(candidate[10:]),
+                    _completion(content=candidate),
                 )
             )
         ]
@@ -744,7 +810,106 @@ async def test_required_sentinel_never_streams_raw_candidate() -> None:
     )
 
     assert completion.content == INSUFFICIENT_EVIDENCE_ANSWER
+    assert _CURRENT_ABSTENTION_TOKEN not in completion.content
     assert deltas == []
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        f"partial answer {_CURRENT_ABSTENTION_TOKEN}",
+        f"{_CURRENT_ABSTENTION_TOKEN} trailing answer",
+        f"partial answer [K1] {_CURRENT_ABSTENTION_TOKEN}",
+    ],
+)
+@pytest.mark.anyio
+async def test_required_mixed_control_output_fails_closed_and_is_redacted_in_eval(
+    monkeypatch: pytest.MonkeyPatch, candidate: str
+) -> None:
+    monkeypatch.setattr(
+        workflow_module,
+        "new_abstention_control_token",
+        lambda: _CURRENT_ABSTENTION_TOKEN,
+    )
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    AssistantContentDelta(candidate),
+                    _completion(content=candidate),
+                )
+            )
+        ]
+    )
+    tracer = CasebookBaselineTracer()
+    deltas: list[str] = []
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(provider, retrieval_service=service, tracer=tracer),
+            deltas.append,
+            knowledge_base_id=44,
+            grounding_policy=GroundingPolicy.REQUIRED,
+        )
+
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert (
+        raised.value.invalid_response_subtype
+        is InvalidResponseSubtype.INVALID_ABSTENTION_FORMAT
+    )
+    assert deltas == []
+    snapshot = tracer.snapshot(101)
+    assert snapshot is not None
+    assert snapshot["invalid_response_subtype"] == "INVALID_ABSTENTION_FORMAT"
+    assert snapshot["abstention_control_token_leaked"] is False
+    rejected = snapshot["rejected_normalized_candidate"]
+    assert rejected["invalid_response_subtype"] == "INVALID_ABSTENTION_FORMAT"
+    assert _CURRENT_ABSTENTION_TOKEN not in rejected["assistant_content"]
+    assert "[[LANGLEY_ABSTAIN_<RUN_LOCAL_TOKEN>]]" in rejected["assistant_content"]
+
+
+@pytest.mark.parametrize(
+    ("query", "answer"),
+    [
+        (
+            '"[[INSUFFICIENT_EVIDENCE]]" 是什么意思？',
+            "`[[INSUFFICIENT_EVIDENCE]]` 是表示证据不足的字符串 [K1]。",
+        ),
+        (
+            "解释另一轮 token-like 字符串",
+            "`[[LANGLEY_ABSTAIN_deadbeef]]` 不是本轮控制信号 [K1]。",
+        ),
+    ],
+)
+@pytest.mark.anyio
+async def test_required_legacy_or_other_run_token_like_text_is_ordinary_content(
+    monkeypatch: pytest.MonkeyPatch, query: str, answer: str
+) -> None:
+    monkeypatch.setattr(
+        workflow_module,
+        "new_abstention_control_token",
+        lambda: _CURRENT_ABSTENTION_TOKEN,
+    )
+    context = AnswerContext(completed_turns=(), current_user_content=query)
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content=answer),))]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            retrieval_service=_FakeRetrievalService(),
+        ),
+        knowledge_base_id=44,
+        grounding_policy=GroundingPolicy.REQUIRED,
+    )
+
+    assert completion.content == answer
+    assert completion.abstained is False
+    assert _CURRENT_ABSTENTION_TOKEN not in completion.content
+    assert [citation.evidence_handle for citation in completion.citations] == [1]
 
 
 @pytest.mark.anyio
