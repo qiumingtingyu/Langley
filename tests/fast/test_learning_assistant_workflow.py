@@ -16,6 +16,8 @@ from langley.answering.context_builder import (
 from langley.answering.contracts import (
     AssistantContentDelta,
     LLMFinishReason,
+    LLMProvider,
+    LLMRequest,
     LLMResponseCompleted,
     ToolCall,
     ToolResult,
@@ -32,6 +34,7 @@ from langley.answering.tools import (
     ToolExecutionOutput,
     ToolExecutor,
 )
+from langley.answering.tracing import Tracer
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 from langley.knowledge.retrieval_service import KnowledgeSearchError
@@ -85,7 +88,7 @@ def _completion(
 
 
 def _workflow(
-    provider: FakeProvider,
+    provider: LLMProvider,
     *,
     context_builder: AnswerContextBuilder | None = None,
     tool_executor: ToolExecutor | None = None,
@@ -93,6 +96,7 @@ def _workflow(
     max_llm_rounds: int = 4,
     max_tool_calls: int = 3,
     overall_deadline_seconds: float = 1.0,
+    tracer: Tracer | None = None,
 ) -> LearningAssistantWorkflow:
     return LearningAssistantWorkflow(
         context_builder=context_builder
@@ -112,6 +116,7 @@ def _workflow(
         provider_name="fake",
         model="fake-script",
         trace_content_enabled=trace_content_enabled,
+        tracer=tracer,
     )
 
 
@@ -133,6 +138,77 @@ async def _execute_workflow(
         knowledge_base_id=knowledge_base_id,
         on_assistant_delta=on_assistant_delta,
     )
+
+
+class _LifecycleLLMTrace:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def content_delta(self, delta: AssistantContentDelta) -> None:
+        assert delta.content == "answer"
+        self._events.append("delta")
+
+    def finish(self, response: LLMResponseCompleted) -> None:
+        assert response.assistant_content == "answer"
+        self._events.append("finish")
+
+    def failure(self, error_code: str) -> None:
+        self._events.append(f"failure:{error_code}")
+
+
+class _LifecycleExecutionTrace:
+    def __init__(self, events: list[str], *, fail_begin: bool = False) -> None:
+        self._events = events
+        self._fail_begin = fail_begin
+
+    def begin_llm(self, request: LLMRequest, round_: int) -> _LifecycleLLMTrace:
+        del request
+        if self._fail_begin:
+            raise RuntimeError("trace unavailable")
+        assert round_ == 1
+        self._events.append("begin")
+        return _LifecycleLLMTrace(self._events)
+
+    def begin_tool(self, call: ToolCall, tool_calls_used: int):
+        del call, tool_calls_used
+        raise AssertionError("no tool call expected")
+
+    def citation_validate(self, **kwargs: object) -> None:
+        del kwargs
+
+    def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
+        del answer, stop_reason
+        self._events.append("success")
+
+    def failure(self, error_code: str) -> None:
+        self._events.append(f"root_failure:{error_code}")
+
+
+class _LifecycleTracer:
+    def __init__(self, events: list[str], *, fail_begin: bool = False) -> None:
+        self._trace = _LifecycleExecutionTrace(events, fail_begin=fail_begin)
+
+    def start(
+        self, run_id: int, provider: str, model: str, include_content: bool
+    ) -> _LifecycleExecutionTrace:
+        del run_id, provider, model, include_content
+        return self._trace
+
+
+class _BoundaryCheckingProvider:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def stream(self, request: LLMRequest):
+        del request
+
+        async def events():
+            assert self._events == ["begin"]
+            self._events.append("provider_started")
+            yield AssistantContentDelta("answer")
+            yield _completion(content="answer")
+
+        return events()
 
 
 def _hit() -> RetrievalHit:
@@ -176,6 +252,59 @@ def _rag_executor(service: _FakeRetrievalService) -> ToolExecutor:
             SearchKnowledgeTool(service),  # type: ignore[arg-type]
         )
     )
+
+
+@pytest.mark.anyio
+async def test_llm_trace_begins_before_provider_stream_and_finishes_on_completion() -> (
+    None
+):
+    events: list[str] = []
+    provider = _BoundaryCheckingProvider(events)
+
+    result = await _execute_workflow(
+        _workflow(provider, tracer=_LifecycleTracer(events))
+    )
+
+    assert result.content == "answer"
+    assert events[:4] == ["begin", "provider_started", "delta", "finish"]
+
+
+@pytest.mark.anyio
+async def test_llm_trace_begin_failure_is_fail_open() -> None:
+    events: list[str] = []
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="answer"),))]
+    )
+
+    result = await _execute_workflow(
+        _workflow(provider, tracer=_LifecycleTracer(events, fail_begin=True))
+    )
+
+    assert result.content == "answer"
+    assert events == ["success"]
+
+
+@pytest.mark.anyio
+async def test_provider_failure_closes_the_open_llm_trace_with_error() -> None:
+    events: list[str] = []
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(),
+                failure=WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED),
+            )
+        ]
+    )
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(_workflow(provider, tracer=_LifecycleTracer(events)))
+
+    assert raised.value.error_code is RunErrorCode.LLM_PROVIDER_FAILED
+    assert events == [
+        "begin",
+        "failure:LLM_PROVIDER_FAILED",
+        "root_failure:LLM_PROVIDER_FAILED",
+    ]
 
 
 @pytest.mark.anyio
@@ -701,6 +830,7 @@ async def test_invalid_final_candidates_never_become_workflow_success(
 @pytest.mark.anyio
 async def test_workflow_cancellation_propagates_through_the_blocked_provider() -> None:
     started = asyncio.Event()
+    events: list[str] = []
     provider = FakeProvider(
         [
             ScriptedProviderRound(
@@ -709,13 +839,20 @@ async def test_workflow_cancellation_propagates_through_the_blocked_provider() -
         ]
     )
     task = asyncio.create_task(
-        _execute_workflow(_workflow(provider, overall_deadline_seconds=10))
+        _execute_workflow(
+            _workflow(
+                provider,
+                overall_deadline_seconds=10,
+                tracer=_LifecycleTracer(events),
+            )
+        )
     )
     await started.wait()
     task.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert events == ["begin", "failure:CANCELLED", "root_failure:CANCELLED"]
 
 
 @pytest.mark.anyio

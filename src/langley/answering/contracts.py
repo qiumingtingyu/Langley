@@ -107,6 +107,7 @@ class LLMResponseCompleted:
     tool_calls: tuple[ToolCall, ...]
     finish_reason: LLMFinishReason
     usage: LLMUsage | None
+    provider_model: str | None = None
 
 
 @dataclass(frozen=True)

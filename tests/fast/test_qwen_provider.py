@@ -297,7 +297,11 @@ def test_qwen_provider_normalizes_optional_usage() -> None:
                         {"delta": {"content": "answer"}, "finish_reason": "stop"}
                     ]
                 },
-                {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+                {
+                    "model": "qwen-provider-reported",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2},
+                },
             ),
         )
 
@@ -307,6 +311,7 @@ def test_qwen_provider_normalizes_optional_usage() -> None:
     assert events[-1].usage is not None
     assert events[-1].usage.input_tokens == 10
     assert events[-1].usage.output_tokens == 2
+    assert events[-1].provider_model == "qwen-provider-reported"
 
 
 @pytest.mark.parametrize(

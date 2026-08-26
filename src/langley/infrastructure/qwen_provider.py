@@ -70,6 +70,7 @@ class QwenProvider:
         tool_parts: dict[int, _ToolCallParts] = {}
         finish_reason = LLMFinishReason.UNKNOWN
         usage: LLMUsage | None = None
+        provider_model: str | None = None
         saw_done = False
 
         try:
@@ -89,6 +90,19 @@ class QwenProvider:
                             saw_done = True
                             break
                         event = self._parse_event(data)
+                        event_model = event.get("model")
+                        if event_model is not None:
+                            if (
+                                not isinstance(event_model, str)
+                                or not event_model.strip()
+                            ):
+                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                            if (
+                                provider_model is not None
+                                and provider_model != event_model
+                            ):
+                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                            provider_model = event_model
                         event_usage = event.get("usage")
                         if event_usage is not None:
                             usage = self._normalize_usage(event_usage)
@@ -150,6 +164,7 @@ class QwenProvider:
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             usage=usage,
+            provider_model=provider_model,
         )
 
     def _request_payload(self, request: LLMRequest) -> dict[str, Any]:

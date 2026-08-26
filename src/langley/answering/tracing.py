@@ -5,6 +5,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from time import monotonic
 from typing import Protocol
 from uuid import UUID, uuid4
 
@@ -12,6 +13,7 @@ import structlog
 from langsmith import Client
 
 from langley.answering.contracts import (
+    AssistantContentDelta,
     AssistantRuntimeMessage,
     JSONValue,
     LLMRequest,
@@ -27,9 +29,7 @@ LangSmithClientFactory = Callable[[], Client]
 
 
 class ExecutionTrace(Protocol):
-    def llm(
-        self, request: LLMRequest, response: LLMResponseCompleted, round_: int
-    ) -> None: ...
+    def begin_llm(self, request: LLMRequest, round_: int) -> "LLMTrace": ...
 
     def begin_tool(self, call: ToolCall, tool_calls_used: int) -> "ToolTrace": ...
 
@@ -52,6 +52,14 @@ class Tracer(Protocol):
     def start(
         self, run_id: int, provider: str, model: str, include_content: bool
     ) -> ExecutionTrace: ...
+
+
+class LLMTrace(Protocol):
+    def content_delta(self, delta: AssistantContentDelta) -> None: ...
+
+    def finish(self, response: LLMResponseCompleted) -> None: ...
+
+    def failure(self, error_code: str) -> None: ...
 
 
 class ToolTrace(Protocol):
@@ -135,10 +143,9 @@ class LangSmithTracer:
 
 
 class _NoopTrace:
-    def llm(
-        self, request: LLMRequest, response: LLMResponseCompleted, round_: int
-    ) -> None:
-        del request, response, round_
+    def begin_llm(self, request: LLMRequest, round_: int) -> LLMTrace:
+        del request, round_
+        return _NoopLLMTrace()
 
     def begin_tool(self, call: ToolCall, tool_calls_used: int) -> ToolTrace:
         del call, tool_calls_used
@@ -183,38 +190,8 @@ class _LangSmithTrace:
         self._metadata = metadata
         self._include_content = include_content
 
-    def llm(
-        self, request: LLMRequest, response: LLMResponseCompleted, round_: int
-    ) -> None:
-        inputs: dict[str, JSONValue] = {}
-        outputs: dict[str, JSONValue] = {}
-        if self._include_content:
-            inputs = {
-                "system_input": request.system_input,
-                "transcript": [_transcript_item(item) for item in request.transcript],
-                "personal_context": (
-                    None
-                    if request.personal_context is None
-                    else list(request.personal_context)
-                ),
-            }
-            outputs = {
-                "assistant_content": response.assistant_content,
-                "tool_calls": [_tool_call(call) for call in response.tool_calls],
-            }
-        self._create(
-            "learning_assistant_llm",
-            "llm",
-            inputs,
-            outputs,
-            {
-                "llm_round": round_,
-                "finish_reason": response.finish_reason.value,
-                "tool_call_count": len(response.tool_calls),
-            },
-            self._root_id,
-            True,
-        )
+    def begin_llm(self, request: LLMRequest, round_: int) -> LLMTrace:
+        return _LangSmithLLMTrace(self, request, round_)
 
     def begin_tool(self, call: ToolCall, tool_calls_used: int) -> ToolTrace:
         return _LangSmithToolTrace(self, call, tool_calls_used)
@@ -354,6 +331,122 @@ class _NoopToolTrace:
 class _NoopKnowledgeSearchTrace:
     def finish(self, hit_count: int | None, error_code: str | None = None) -> None:
         del hit_count, error_code
+
+
+class _NoopLLMTrace:
+    def content_delta(self, delta: AssistantContentDelta) -> None:
+        del delta
+
+    def finish(self, response: LLMResponseCompleted) -> None:
+        del response
+
+    def failure(self, error_code: str) -> None:
+        del error_code
+
+
+class _LangSmithLLMTrace:
+    def __init__(
+        self, trace: _LangSmithTrace, request: LLMRequest, round_: int
+    ) -> None:
+        self._trace = trace
+        self._id = uuid4()
+        self._round = round_
+        self._started_at = datetime.now(UTC)
+        self._started_monotonic = monotonic()
+        self._ttft_ms: float | None = None
+        self._finished = False
+        inputs: dict[str, JSONValue] = {}
+        if trace._include_content:
+            inputs = {
+                "system_input": request.system_input,
+                "transcript": [_transcript_item(item) for item in request.transcript],
+                "personal_context": (
+                    None
+                    if request.personal_context is None
+                    else list(request.personal_context)
+                ),
+            }
+        trace._create_with_id(
+            self._id,
+            "learning_assistant_llm",
+            "llm",
+            inputs,
+            {},
+            {"llm_round": round_},
+            trace._root_id,
+            False,
+            self._started_at,
+        )
+
+    def content_delta(self, delta: AssistantContentDelta) -> None:
+        if self._ttft_ms is None and delta.content:
+            self._ttft_ms = round(
+                (monotonic() - self._started_monotonic) * 1000,
+                3,
+            )
+
+    def finish(self, response: LLMResponseCompleted) -> None:
+        self._require_open()
+        self._finished = True
+        input_tokens = None if response.usage is None else response.usage.input_tokens
+        output_tokens = None if response.usage is None else response.usage.output_tokens
+        total_tokens = (
+            input_tokens + output_tokens
+            if input_tokens is not None and output_tokens is not None
+            else None
+        )
+        metadata: dict[str, JSONValue] = {
+            "llm_round": self._round,
+            "finish_reason": response.finish_reason.value,
+            "tool_call_count": len(response.tool_calls),
+            "llm_duration_ms": self._duration_ms(),
+            "ttft_ms": self._ttft_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "provider_model": response.provider_model,
+        }
+        outputs: dict[str, JSONValue] = {}
+        if self._trace._include_content:
+            outputs = {
+                "assistant_content": response.assistant_content,
+                "tool_calls": [_tool_call(call) for call in response.tool_calls],
+            }
+        self._trace._submit(
+            "update",
+            self._trace._client.update_run,
+            self._id,
+            outputs=outputs,
+            error=None,
+            end_time=datetime.now(UTC),
+            extra={"metadata": metadata},
+        )
+
+    def failure(self, error_code: str) -> None:
+        self._require_open()
+        self._finished = True
+        self._trace._submit(
+            "update",
+            self._trace._client.update_run,
+            self._id,
+            outputs={},
+            error=error_code,
+            end_time=datetime.now(UTC),
+            extra={
+                "metadata": {
+                    "llm_round": self._round,
+                    "llm_duration_ms": self._duration_ms(),
+                    "ttft_ms": self._ttft_ms,
+                }
+            },
+        )
+
+    def _duration_ms(self) -> float:
+        return round((monotonic() - self._started_monotonic) * 1000, 3)
+
+    def _require_open(self) -> None:
+        if self._finished:
+            raise RuntimeError("LLM trace is already closed")
 
 
 class _LangSmithToolTrace:

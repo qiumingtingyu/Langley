@@ -8,9 +8,11 @@ import pytest
 from langsmith import Client
 
 from langley.answering.contracts import (
+    AssistantContentDelta,
     LLMFinishReason,
     LLMRequest,
     LLMResponseCompleted,
+    LLMUsage,
     ToolCall,
     ToolResult,
     ToolResultKind,
@@ -34,15 +36,18 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
     class RecordingClient:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
+            self.updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
             self.ready = threading.Event()
 
         def create_run(self, **kwargs: object) -> None:
             self.calls.append(kwargs)
-            if len(self.calls) == 2:
+            if len(self.calls) == 2 and self.updates:
                 self.ready.set()
 
         def update_run(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
+            self.updates.append((args, kwargs))
+            if len(self.calls) == 2:
+                self.ready.set()
 
     client = RecordingClient()
     trace = LangSmithTracer(
@@ -50,7 +55,7 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
         project=None,
         client_factory=lambda: client,  # type: ignore[arg-type]
     ).start(1, "qwen", "test", False)
-    trace.llm(
+    llm = trace.begin_llm(
         LLMRequest(
             system_input="system",
             transcript=(UserRuntimeMessage(content="request"),),
@@ -58,18 +63,135 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
             personal_context=("private preference",),
             current_user_message_index=0,
         ),
+        1,
+    )
+    llm.finish(
         LLMResponseCompleted(
             assistant_content="answer",
             tool_calls=(),
             finish_reason=LLMFinishReason.STOP,
             usage=None,
         ),
-        1,
     )
     assert await asyncio.to_thread(client.ready.wait, 1)
 
     assert len(client.calls) == 2
     assert client.calls[1]["inputs"] == {}
+    assert client.updates[0][1]["outputs"] == {}
+
+
+@pytest.mark.anyio
+async def test_llm_span_records_real_monotonic_timing_ttft_and_provider_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.creates: list[dict[str, object]] = []
+            self.updates: list[tuple[tuple[object, ...], dict[str, object]]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            self.creates.append(kwargs)
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            self.updates.append((args, kwargs))
+            self.ready.set()
+
+    ticks = iter((10.0, 10.125, 10.5))
+    monkeypatch.setattr("langley.answering.tracing.monotonic", lambda: next(ticks))
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(2, "qwen", "requested-model", False)
+    llm = trace.begin_llm(
+        LLMRequest(
+            system_input="private system",
+            transcript=(UserRuntimeMessage(content="private request"),),
+            allowed_tools=(),
+        ),
+        1,
+    )
+    llm.content_delta(AssistantContentDelta("first"))
+    llm.finish(
+        LLMResponseCompleted(
+            assistant_content="private answer",
+            tool_calls=(),
+            finish_reason=LLMFinishReason.STOP,
+            usage=LLMUsage(input_tokens=10, output_tokens=2),
+            provider_model="provider-model",
+        )
+    )
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    llm_create = next(
+        item for item in client.creates if item["name"] == "learning_assistant_llm"
+    )
+    assert "end_time" not in llm_create
+    assert llm_create["inputs"] == {}
+    _, update = client.updates[0]
+    assert update["end_time"] is not None
+    assert update["outputs"] == {}
+    metadata = cast(dict[str, object], update["extra"])["metadata"]
+    assert metadata == {
+        "llm_round": 1,
+        "finish_reason": "STOP",
+        "tool_call_count": 0,
+        "llm_duration_ms": 500.0,
+        "ttft_ms": 125.0,
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "total_tokens": 12,
+        "provider_model": "provider-model",
+    }
+
+
+@pytest.mark.anyio
+async def test_tool_call_round_without_content_records_unavailable_ttft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.updates: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            del kwargs
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args
+            self.updates.append(kwargs)
+            self.ready.set()
+
+    ticks = iter((20.0, 20.25))
+    monkeypatch.setattr("langley.answering.tracing.monotonic", lambda: next(ticks))
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(3, "qwen", "test", False)
+    llm = trace.begin_llm(
+        LLMRequest(
+            system_input="system",
+            transcript=(UserRuntimeMessage(content="request"),),
+            allowed_tools=(),
+        ),
+        1,
+    )
+    llm.finish(
+        LLMResponseCompleted(
+            assistant_content="",
+            tool_calls=(ToolCall("call-1", "search_knowledge", "{}"),),
+            finish_reason=LLMFinishReason.TOOL_CALLS,
+            usage=None,
+        )
+    )
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    metadata = cast(dict[str, object], client.updates[0]["extra"])["metadata"]
+    assert cast(dict[str, object], metadata)["ttft_ms"] is None
 
 
 @pytest.mark.anyio
