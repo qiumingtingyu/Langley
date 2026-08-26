@@ -7,10 +7,11 @@ from datetime import datetime
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from langley.answer_execution import _commit_success, _start_running
+from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import CitationDraft
 from langley.bootstrap import bootstrap_local_user
 from langley.conversation_commands import (
@@ -58,6 +59,19 @@ def migrated_database(test_database_url: str, reset_database) -> str:
     return test_database_url
 
 
+def test_grounding_policy_empty_database_migration_round_trip(
+    test_database_url: str, reset_database
+) -> None:
+    del test_database_url
+    reset_database()
+    config = Config("alembic.ini")
+    config.cmd_opts = Namespace(x=["use_test_database=true"])
+
+    command.upgrade(config, "head")
+    command.downgrade(config, "0008_message_citations")
+    command.upgrade(config, "head")
+
+
 def _settings(database_url: str) -> Settings:
     return Settings(environment="test", database_url=database_url, local_user_id=1)
 
@@ -97,8 +111,10 @@ def test_knowledge_selector_persists_and_retry_regenerate_inherit(
                     content="question",
                     client_request_id="new",
                     knowledge_base_id=knowledge_base_id,
+                    grounding_policy=GroundingPolicy.REQUIRED,
                 )
             assert admitted.run.knowledge_base_id == knowledge_base_id
+            assert admitted.run.grounding_policy == "REQUIRED"
             await _start_running(
                 factory, conversation_id=conversation_id, run_id=admitted.run.id
             )
@@ -118,6 +134,7 @@ def test_knowledge_selector_persists_and_retry_regenerate_inherit(
                     client_request_id="retry",
                 )
             assert retried.run.knowledge_base_id == knowledge_base_id
+            assert retried.run.grounding_policy == "REQUIRED"
             await _start_running(
                 factory, conversation_id=conversation_id, run_id=retried.run.id
             )
@@ -135,10 +152,133 @@ def test_knowledge_selector_persists_and_retry_regenerate_inherit(
                     client_request_id="regenerate",
                 )
             assert regenerated.run.knowledge_base_id == knowledge_base_id
+            assert regenerated.run.grounding_policy == "REQUIRED"
         finally:
             await dispose_database_engine(engine)
 
     asyncio.run(verify())
+
+
+def test_required_policy_needs_kb_and_is_part_of_exact_replay_identity(
+    migrated_database: str,
+) -> None:
+    async def verify() -> None:
+        (
+            engine,
+            factory,
+            conversation_id,
+            knowledge_base_id,
+        ) = await _owned_conversation_and_kb(migrated_database)
+        try:
+            async with factory() as session:
+                with pytest.raises(ValueError, match="needs a knowledge base"):
+                    await admit_new_question(
+                        session,
+                        user_id=1,
+                        conversation_id=conversation_id,
+                        content="question",
+                        client_request_id="required-without-kb",
+                        grounding_policy=GroundingPolicy.REQUIRED,
+                    )
+            async with factory() as session:
+                first = await admit_new_question(
+                    session,
+                    user_id=1,
+                    conversation_id=conversation_id,
+                    content="question",
+                    client_request_id="policy-identity",
+                    knowledge_base_id=knowledge_base_id,
+                    grounding_policy=GroundingPolicy.AUTO,
+                )
+            async with factory() as session:
+                replay = await admit_new_question(
+                    session,
+                    user_id=1,
+                    conversation_id=conversation_id,
+                    content="question",
+                    client_request_id="policy-identity",
+                    knowledge_base_id=knowledge_base_id,
+                    grounding_policy=GroundingPolicy.AUTO,
+                )
+            assert replay.is_replay is True
+            assert replay.run.id == first.run.id
+            async with factory() as session:
+                with pytest.raises(ClientRequestIdReusedError):
+                    await admit_new_question(
+                        session,
+                        user_id=1,
+                        conversation_id=conversation_id,
+                        content="question",
+                        client_request_id="policy-identity",
+                        knowledge_base_id=knowledge_base_id,
+                        grounding_policy=GroundingPolicy.REQUIRED,
+                    )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(verify())
+
+
+def test_grounding_policy_schema_uses_binary_collation_and_auto_default(
+    migrated_database: str,
+) -> None:
+    async def verify() -> None:
+        engine = create_database_engine(migrated_database)
+        try:
+            async with engine.connect() as connection:
+                row = (
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT IS_NULLABLE, COLUMN_DEFAULT, COLLATION_NAME "
+                                "FROM information_schema.COLUMNS "
+                                "WHERE TABLE_SCHEMA = DATABASE() "
+                                "AND TABLE_NAME = 'runs' "
+                                "AND COLUMN_NAME = 'grounding_policy'"
+                            )
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            assert row["IS_NULLABLE"] == "NO"
+            assert row["COLUMN_DEFAULT"] == "AUTO"
+            assert row["COLLATION_NAME"] == "utf8mb4_0900_bin"
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(verify())
+
+
+def test_migration_downgrade_refuses_to_erase_required_policy(
+    migrated_database: str,
+) -> None:
+    async def admit_required() -> None:
+        (
+            engine,
+            factory,
+            conversation_id,
+            knowledge_base_id,
+        ) = await _owned_conversation_and_kb(migrated_database)
+        try:
+            async with factory() as session:
+                await admit_new_question(
+                    session,
+                    user_id=1,
+                    conversation_id=conversation_id,
+                    content="question",
+                    client_request_id="required-before-downgrade",
+                    knowledge_base_id=knowledge_base_id,
+                    grounding_policy=GroundingPolicy.REQUIRED,
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(admit_required())
+    config = Config("alembic.ini")
+    config.cmd_opts = Namespace(x=["use_test_database=true"])
+    with pytest.raises(RuntimeError, match="REQUIRED Runs exist"):
+        command.downgrade(config, "0008_message_citations")
 
 
 def test_unowned_knowledge_base_cannot_be_admitted(migrated_database: str) -> None:

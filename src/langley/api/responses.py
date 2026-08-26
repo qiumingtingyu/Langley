@@ -36,6 +36,8 @@ class RunResponse(BaseModel):
     id: int
     input_message_id: int
     attempt_no: int
+    knowledge_base_id: int | None
+    grounding_policy: str
     status: str
     started_at: str | None
     finished_at: str | None
@@ -90,6 +92,8 @@ def run_response(run: Run) -> RunResponse:
         id=run.id,
         input_message_id=run.input_message_id,
         attempt_no=run.attempt_no,
+        knowledge_base_id=run.knowledge_base_id,
+        grounding_policy=run.grounding_policy,
         status=run.status,
         started_at=as_optional_utc(run.started_at),
         finished_at=as_optional_utc(run.finished_at),

@@ -5,6 +5,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from enum import StrEnum
 from time import monotonic
 from typing import Protocol
 from uuid import UUID, uuid4
@@ -28,10 +29,30 @@ logger = structlog.get_logger(__name__)
 LangSmithClientFactory = Callable[[], Client]
 
 
+class KnowledgeSearchOrigin(StrEnum):
+    """Why one real knowledge retrieval attempt was performed."""
+
+    AGENT_TOOL = "AGENT_TOOL"
+    HARNESS_REQUIRED = "HARNESS_REQUIRED"
+
+
 class ExecutionTrace(Protocol):
     def begin_llm(self, request: LLMRequest, round_: int) -> "LLMTrace": ...
 
     def begin_tool(self, call: ToolCall, tool_calls_used: int) -> "ToolTrace": ...
+
+    def begin_knowledge_search(
+        self,
+        *,
+        origin: "KnowledgeSearchOrigin",
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> "KnowledgeSearchTrace": ...
+
+    def rejected_response(
+        self, response: LLMResponseCompleted, subtype: str | None
+    ) -> None: ...
 
     def citation_validate(
         self,
@@ -45,7 +66,9 @@ class ExecutionTrace(Protocol):
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None: ...
 
-    def failure(self, error_code: str) -> None: ...
+    def failure(
+        self, error_code: str, invalid_response_subtype: str | None = None
+    ) -> None: ...
 
 
 class Tracer(Protocol):
@@ -69,6 +92,7 @@ class ToolTrace(Protocol):
         knowledge_base_id: int,
         top_k: int,
         query: str,
+        origin: "KnowledgeSearchOrigin" = KnowledgeSearchOrigin.AGENT_TOOL,
     ) -> "KnowledgeSearchTrace": ...
 
     def finish(
@@ -80,8 +104,21 @@ class KnowledgeSearchTrace(Protocol):
     def finish(self, hit_count: int | None, error_code: str | None = None) -> None: ...
 
 
-_current_tool_trace: ContextVar[ToolTrace | None] = ContextVar(
-    "current_tool_trace", default=None
+class KnowledgeSearchTraceParent(Protocol):
+    """Narrow parent seam that contains no Agent trace topology."""
+
+    def begin_knowledge_search(
+        self,
+        *,
+        origin: KnowledgeSearchOrigin,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> KnowledgeSearchTrace: ...
+
+
+_current_retrieval_trace_parent: ContextVar[KnowledgeSearchTraceParent | None] = (
+    ContextVar("current_retrieval_trace_parent", default=None)
 )
 
 
@@ -92,15 +129,15 @@ def tool_trace_context(trace: ToolTrace | None):
     if trace is None:
         yield
         return
-    token = _current_tool_trace.set(trace)
+    token = _current_retrieval_trace_parent.set(trace)
     try:
         yield
     finally:
-        _current_tool_trace.reset(token)
+        _current_retrieval_trace_parent.reset(token)
 
 
-def current_tool_trace() -> ToolTrace | None:
-    return _current_tool_trace.get()
+def current_retrieval_trace_parent() -> KnowledgeSearchTraceParent | None:
+    return _current_retrieval_trace_parent.get()
 
 
 class LangSmithTracer:
@@ -151,6 +188,22 @@ class _NoopTrace:
         del call, tool_calls_used
         return _NoopToolTrace()
 
+    def begin_knowledge_search(
+        self,
+        *,
+        origin: KnowledgeSearchOrigin,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> KnowledgeSearchTrace:
+        del origin, knowledge_base_id, top_k, query
+        return _NoopKnowledgeSearchTrace()
+
+    def rejected_response(
+        self, response: LLMResponseCompleted, subtype: str | None
+    ) -> None:
+        del response, subtype
+
     def citation_validate(
         self,
         *,
@@ -171,8 +224,10 @@ class _NoopTrace:
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
         del answer, stop_reason
 
-    def failure(self, error_code: str) -> None:
-        del error_code
+    def failure(
+        self, error_code: str, invalid_response_subtype: str | None = None
+    ) -> None:
+        del error_code, invalid_response_subtype
 
 
 class _LangSmithTrace:
@@ -195,6 +250,46 @@ class _LangSmithTrace:
 
     def begin_tool(self, call: ToolCall, tool_calls_used: int) -> ToolTrace:
         return _LangSmithToolTrace(self, call, tool_calls_used)
+
+    def begin_knowledge_search(
+        self,
+        *,
+        origin: KnowledgeSearchOrigin,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> KnowledgeSearchTrace:
+        return _LangSmithKnowledgeSearchTrace(
+            self,
+            parent_id=self._root_id,
+            origin=origin,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+            query=query,
+        )
+
+    def rejected_response(
+        self, response: LLMResponseCompleted, subtype: str | None
+    ) -> None:
+        outputs: dict[str, JSONValue] = {}
+        if self._include_content:
+            outputs = {
+                "assistant_content": response.assistant_content,
+                "tool_calls": [_tool_call(call) for call in response.tool_calls],
+                "finish_reason": response.finish_reason.value,
+            }
+        metadata: dict[str, JSONValue] = {}
+        if subtype is not None:
+            metadata["invalid_response_subtype"] = subtype
+        self._create(
+            "llm.rejected_response",
+            "chain",
+            {},
+            outputs,
+            metadata,
+            self._root_id,
+            True,
+        )
 
     def citation_validate(
         self,
@@ -235,8 +330,13 @@ class _LangSmithTrace:
             None,
         )
 
-    def failure(self, error_code: str) -> None:
-        self._update({}, error_code)
+    def failure(
+        self, error_code: str, invalid_response_subtype: str | None = None
+    ) -> None:
+        metadata: dict[str, JSONValue] = {}
+        if invalid_response_subtype is not None:
+            metadata["invalid_response_subtype"] = invalid_response_subtype
+        self._update({}, error_code, metadata)
 
     def _create(
         self,
@@ -287,14 +387,24 @@ class _LangSmithTrace:
             kwargs["end_time"] = datetime.now(UTC)
         self._submit("create", self._client.create_run, **kwargs)
 
-    def _update(self, outputs: dict[str, JSONValue], error: str | None) -> None:
+    def _update(
+        self,
+        outputs: dict[str, JSONValue],
+        error: str | None,
+        metadata: dict[str, JSONValue] | None = None,
+    ) -> None:
+        kwargs: dict[str, object] = {
+            "outputs": outputs,
+            "error": error,
+            "end_time": datetime.now(UTC),
+        }
+        if metadata:
+            kwargs["extra"] = {"metadata": self._metadata | metadata}
         self._submit(
             "update",
             self._client.update_run,
             self._root_id,
-            outputs=outputs,
-            error=error,
-            end_time=datetime.now(UTC),
+            **kwargs,
         )
 
     def _submit(
@@ -320,8 +430,9 @@ class _NoopToolTrace:
         knowledge_base_id: int,
         top_k: int,
         query: str,
+        origin: KnowledgeSearchOrigin = KnowledgeSearchOrigin.AGENT_TOOL,
     ) -> KnowledgeSearchTrace:
-        del knowledge_base_id, top_k, query
+        del origin, knowledge_base_id, top_k, query
         return _NoopKnowledgeSearchTrace()
 
     def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
@@ -366,6 +477,8 @@ class _LangSmithLLMTrace:
                     else list(request.personal_context)
                 ),
             }
+            if request.evidence_context is not None:
+                inputs["evidence_context"] = request.evidence_context
         trace._create_with_id(
             self._id,
             "learning_assistant_llm",
@@ -482,9 +595,12 @@ class _LangSmithToolTrace:
         knowledge_base_id: int,
         top_k: int,
         query: str,
+        origin: KnowledgeSearchOrigin = KnowledgeSearchOrigin.AGENT_TOOL,
     ) -> KnowledgeSearchTrace:
         return _LangSmithKnowledgeSearchTrace(
-            self,
+            self._trace,
+            parent_id=self._id,
+            origin=origin,
             knowledge_base_id=knowledge_base_id,
             top_k=top_k,
             query=query,
@@ -519,27 +635,30 @@ class _LangSmithToolTrace:
 class _LangSmithKnowledgeSearchTrace:
     def __init__(
         self,
-        tool_trace: _LangSmithToolTrace,
+        trace: _LangSmithTrace,
         *,
+        parent_id: UUID,
+        origin: KnowledgeSearchOrigin,
         knowledge_base_id: int,
         top_k: int,
         query: str,
     ) -> None:
-        self._tool_trace = tool_trace
+        self._trace = trace
         self._id = uuid4()
         self._started_at = datetime.now(UTC)
         metadata: dict[str, JSONValue] = {
             "knowledge_base_id": knowledge_base_id,
             "top_k": top_k,
+            "origin": origin.value,
         }
-        self._tool_trace._trace._create_with_id(
+        self._trace._create_with_id(
             self._id,
             "knowledge.search",
             "retriever",
-            ({"query": query} if self._tool_trace._trace._include_content else {}),
+            ({"query": query} if self._trace._include_content else {}),
             {},
             metadata,
-            self._tool_trace._id,
+            parent_id,
             False,
             self._started_at,
         )
@@ -556,9 +675,9 @@ class _LangSmithKnowledgeSearchTrace:
             metadata["hit_count"] = hit_count
         if error_code is not None:
             metadata["error_code"] = error_code
-        self._tool_trace._trace._submit(
+        self._trace._submit(
             "update",
-            self._tool_trace._trace._client.update_run,
+            self._trace._client.update_run,
             self._id,
             outputs={},
             error=error_code,

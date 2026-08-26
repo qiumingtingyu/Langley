@@ -19,6 +19,7 @@ from langley.answering.contracts import (
     ToolCall,
     ToolResult,
 )
+from langley.answering.tracing import KnowledgeSearchOrigin
 
 FORMAL_B0_MAX_CHUNK_CHARS = 1200
 FORMAL_B0_CHUNK_OVERLAP = 0
@@ -290,10 +291,12 @@ class _CasebookExecutionTrace:
             "workflow_duration_ms": None,
             "final_status": "RUNNING",
             "error_code": None,
+            "invalid_response_subtype": None,
             "llm_rounds": [],
             "tool_calls": [],
             "knowledge_searches": [],
             "citation_validations": [],
+            "rejected_normalized_candidate": None,
         }
 
     def begin_llm(self, request: LLMRequest, round_: int) -> _CasebookLLMTrace:
@@ -347,6 +350,60 @@ class _CasebookExecutionTrace:
             include_content=self._include_content,
         )
 
+    def begin_knowledge_search(
+        self,
+        *,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+        origin: KnowledgeSearchOrigin = KnowledgeSearchOrigin.AGENT_TOOL,
+    ) -> _CasebookKnowledgeSearchTrace:
+        return self._begin_knowledge_search(
+            origin=origin,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+            query=query,
+        )
+
+    def _begin_knowledge_search(
+        self,
+        *,
+        origin: KnowledgeSearchOrigin,
+        knowledge_base_id: int,
+        top_k: int,
+        query: str,
+    ) -> _CasebookKnowledgeSearchTrace:
+        observation: dict[str, Any] = {
+            "origin": origin.value,
+            "knowledge_base_id": knowledge_base_id,
+            "top_k": top_k,
+            "query": query,
+            "started_at": _utc_now(),
+            "finished_at": None,
+            "duration_ms": None,
+            "hit_count": None,
+            "error_code": None,
+        }
+        self._value["knowledge_searches"].append(observation)
+        return _CasebookKnowledgeSearchTrace(observation)
+
+    def rejected_response(
+        self, response: LLMResponseCompleted, subtype: str | None
+    ) -> None:
+        self._value["rejected_normalized_candidate"] = {
+            "assistant_content": response.assistant_content,
+            "tool_calls": [
+                {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "raw_arguments": call.raw_arguments,
+                }
+                for call in response.tool_calls
+            ],
+            "finish_reason": response.finish_reason.value,
+            "invalid_response_subtype": subtype,
+        }
+
     def citation_validate(
         self,
         *,
@@ -372,8 +429,11 @@ class _CasebookExecutionTrace:
         if self._include_content:
             self._value["answer"] = answer
 
-    def failure(self, error_code: str) -> None:
+    def failure(
+        self, error_code: str, invalid_response_subtype: str | None = None
+    ) -> None:
         self._finish("FAILED", error_code)
+        self._value["invalid_response_subtype"] = invalid_response_subtype
 
     def snapshot(self) -> dict[str, Any]:
         return deepcopy(self._value)
@@ -463,19 +523,14 @@ class _CasebookToolTrace:
         knowledge_base_id: int,
         top_k: int,
         query: str,
+        origin: KnowledgeSearchOrigin = KnowledgeSearchOrigin.AGENT_TOOL,
     ) -> _CasebookKnowledgeSearchTrace:
-        observation: dict[str, Any] = {
-            "knowledge_base_id": knowledge_base_id,
-            "top_k": top_k,
-            "query": query,
-            "started_at": _utc_now(),
-            "finished_at": None,
-            "duration_ms": None,
-            "hit_count": None,
-            "error_code": None,
-        }
-        self._execution_trace._value["knowledge_searches"].append(observation)
-        return _CasebookKnowledgeSearchTrace(observation)
+        return self._execution_trace._begin_knowledge_search(
+            origin=origin,
+            knowledge_base_id=knowledge_base_id,
+            top_k=top_k,
+            query=query,
+        )
 
     def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
         if self._closed:

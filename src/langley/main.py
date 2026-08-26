@@ -195,6 +195,7 @@ def _workflow_factory_for(
             model=settings.llm_model,
             trace_content_enabled=settings.trace_content_enabled,
             tracer=resolved_tracer,
+            retrieval_service=retrieval_service,
         )
 
     return factory

@@ -1,6 +1,7 @@
 """Bounded LangGraph runtime for one Learning Assistant answer execution."""
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from typing import TypedDict, cast
 
@@ -22,19 +23,37 @@ from langley.answering.contracts import (
     ToolSpec,
     UserRuntimeMessage,
 )
-from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.errors import (
+    InvalidResponseSubtype,
+    RunErrorCode,
+    WorkflowFailure,
+)
+from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import (
+    INSUFFICIENT_EVIDENCE_ANSWER,
     AnswerCompletion,
+    evidence_context,
+    required_grounding_system_input,
     validated_answer_completion,
 )
 from langley.answering.tools import ToolContext, ToolExecutionOutput, ToolExecutor
-from langley.answering.tracing import ExecutionTrace, LLMTrace, Tracer
+from langley.answering.tracing import (
+    ExecutionTrace,
+    KnowledgeSearchOrigin,
+    LLMTrace,
+    Tracer,
+)
 from langley.knowledge.retrieval import RetrievalHit
+from langley.knowledge.retrieval_service import (
+    KnowledgeRetrievalService,
+    KnowledgeSearchError,
+)
 
 AssistantDeltaSink = Callable[[str], Awaitable[None]]
 logger = structlog.get_logger(__name__)
 
 LEARNING_ASSISTANT_SYSTEM_PROMPT_ID = "learning-assistant-v1"
+REQUIRED_GROUNDING_SYSTEM_PROMPT_ID = "required-grounding-v1"
 LEARNING_ASSISTANT_SYSTEM_INPUT = (
     "You are Langley, a helpful learning assistant. Give accurate, clear answers "
     "and use the available tools only when they are useful. Personal Context is "
@@ -51,6 +70,7 @@ LEARNING_ASSISTANT_SYSTEM_INPUT = (
     "once you can answer or know the evidence is insufficient."
 )
 _KNOWLEDGE_SEARCH_UNAVAILABLE_ANSWER = "知识库检索未成功，暂时无法基于资料可靠回答。"
+_HISTORICAL_CITATION = re.compile(r"\[K([0-9]+)\]")
 
 
 class _AgentState(TypedDict):
@@ -89,6 +109,7 @@ class LearningAssistantWorkflow:
         model: str,
         trace_content_enabled: bool = False,
         tracer: Tracer | None = None,
+        retrieval_service: KnowledgeRetrievalService | None = None,
     ) -> None:
         if max_llm_rounds < 1:
             raise ValueError("max_llm_rounds must be positive")
@@ -107,6 +128,7 @@ class LearningAssistantWorkflow:
         self._model = model
         self._trace_content_enabled = trace_content_enabled
         self._tracer = tracer
+        self._retrieval_service = retrieval_service
 
     async def execute(
         self,
@@ -117,6 +139,7 @@ class LearningAssistantWorkflow:
         conversation_id: int,
         input_message_id: int,
         knowledge_base_id: int | None,
+        grounding_policy: GroundingPolicy = GroundingPolicy.AUTO,
         on_assistant_delta: AssistantDeltaSink,
     ) -> AnswerCompletion:
         """Build detached context, run the graph, and validate its final candidate."""
@@ -129,17 +152,25 @@ class LearningAssistantWorkflow:
                     conversation_id=conversation_id,
                     current_user_message_id=input_message_id,
                 )
-                state = await self._run_graph(
-                    context,
-                    ToolContext(
-                        run_id=run_id,
-                        user_id=user_id,
-                        knowledge_base_id=knowledge_base_id,
-                    ),
-                    on_assistant_delta,
-                    trace,
+                tool_context = ToolContext(
+                    run_id=run_id,
+                    user_id=user_id,
+                    knowledge_base_id=knowledge_base_id,
                 )
-                success = self._validate_final_response(state, trace)
+                if grounding_policy is GroundingPolicy.REQUIRED:
+                    success = await self._run_required(
+                        context,
+                        tool_context,
+                        trace,
+                    )
+                else:
+                    state = await self._run_graph(
+                        context,
+                        tool_context,
+                        on_assistant_delta,
+                        trace,
+                    )
+                    success = self._validate_final_response(state, trace)
                 self._record_trace_success(trace, success)
                 return success
         except asyncio.CancelledError:
@@ -151,7 +182,11 @@ class LearningAssistantWorkflow:
             )
             raise WorkflowFailure(RunErrorCode.AGENT_EXECUTION_TIMEOUT) from error
         except WorkflowFailure as failure:
-            self._record_trace_failure(trace, failure.error_code.value)
+            self._record_trace_failure(
+                trace,
+                failure.error_code.value,
+                failure.invalid_response_subtype,
+            )
             raise
         except Exception as error:
             self._record_trace_failure(
@@ -167,7 +202,12 @@ class LearningAssistantWorkflow:
         trace: ExecutionTrace,
     ) -> _AgentState:
         graph = self._compile_graph(on_assistant_delta, trace)
-        transcript = self._initial_transcript(context)
+        transcript = self._initial_transcript(
+            context,
+            neutralize_historical_citations=(
+                tool_context.knowledge_base_id is not None
+            ),
+        )
         initial_state: _AgentState = {
             "transcript": transcript,
             "last_completion": None,
@@ -205,7 +245,9 @@ class LearningAssistantWorkflow:
             request = LLMRequest(
                 system_input=LEARNING_ASSISTANT_SYSTEM_INPUT,
                 transcript=state["transcript"],
-                allowed_tools=self._allowed_tools(state["tool_context"]),
+                allowed_tools=self._allowed_tools(
+                    state["tool_context"], state["successful_searches"]
+                ),
                 personal_context=state["personal_context"],
                 current_user_message_index=state["current_user_message_index"],
             )
@@ -368,15 +410,28 @@ class LearningAssistantWorkflow:
         )
 
     @staticmethod
-    def _record_trace_failure(trace: ExecutionTrace, error_code: str) -> None:
+    def _record_trace_failure(
+        trace: ExecutionTrace,
+        error_code: str,
+        invalid_response_subtype: InvalidResponseSubtype | None = None,
+    ) -> None:
         try:
-            trace.failure(error_code)
+            trace.failure(
+                error_code,
+                invalid_response_subtype=(
+                    None
+                    if invalid_response_subtype is None
+                    else invalid_response_subtype.value
+                ),
+            )
         except Exception:
             logger.warning("learning_assistant_trace_failed", operation="failure")
 
     @staticmethod
     def _initial_transcript(
         context: AnswerContext,
+        *,
+        neutralize_historical_citations: bool = False,
     ) -> tuple[RuntimeTranscriptItem, ...]:
         transcript: list[RuntimeTranscriptItem] = []
         for turn in context.completed_turns:
@@ -384,7 +439,12 @@ class LearningAssistantWorkflow:
                 (
                     UserRuntimeMessage(content=turn.user_content),
                     AssistantRuntimeMessage(
-                        content=turn.assistant_content, tool_calls=()
+                        content=(
+                            _neutralize_historical_citations(turn.assistant_content)
+                            if neutralize_historical_citations
+                            else turn.assistant_content
+                        ),
+                        tool_calls=(),
                     ),
                 )
             )
@@ -395,17 +455,13 @@ class LearningAssistantWorkflow:
         self, state: _AgentState, trace: ExecutionTrace
     ) -> AnswerCompletion:
         completion = state["last_completion"]
-        if (
-            completion is None
-            or completion.tool_calls
-            or completion.finish_reason is not LLMFinishReason.STOP
-            or not completion.assistant_content
-        ):
-            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-
+        if completion is None:
+            raise WorkflowFailure(
+                RunErrorCode.LLM_RESPONSE_INVALID,
+                invalid_response_subtype=InvalidResponseSubtype.FINAL_RESPONSE_EMPTY,
+            )
+        self._validate_completion_shape(completion, trace)
         assistant_content = completion.assistant_content
-        if not assistant_content:
-            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
         if state["knowledge_search_attempted"] and state["successful_searches"] == 0:
             result = AnswerCompletion(
                 content=_KNOWLEDGE_SEARCH_UNAVAILABLE_ANSWER,
@@ -429,7 +485,12 @@ class LearningAssistantWorkflow:
                 requires_citation=state["successful_searches"] > 0,
             )
         except WorkflowFailure as error:
-            error_code = error.error_code.value
+            subtype = error.invalid_response_subtype
+            if subtype is not None:
+                self._record_rejected_response(trace, completion, subtype)
+            error_code = (
+                subtype.value if subtype is not None else error.error_code.value
+            )
             self._trace(
                 lambda: trace.citation_validate(
                     available_evidence_count=len(state["retrieval_hits"]),
@@ -455,11 +516,198 @@ class LearningAssistantWorkflow:
         )
         return result
 
-    def _allowed_tools(self, context: ToolContext) -> tuple[ToolSpec, ...]:
+    async def _run_required(
+        self,
+        context: AnswerContext,
+        tool_context: ToolContext,
+        trace: ExecutionTrace,
+    ) -> AnswerCompletion:
+        if tool_context.knowledge_base_id is None or self._retrieval_service is None:
+            raise WorkflowFailure(RunErrorCode.ANSWER_EXECUTION_FAILED)
+        try:
+            result = await self._retrieval_service.search(
+                user_id=tool_context.user_id,
+                knowledge_base_id=tool_context.knowledge_base_id,
+                query=context.current_user_content,
+                top_k=5,
+                trace_parent=trace,
+                origin=KnowledgeSearchOrigin.HARNESS_REQUIRED,
+            )
+        except KnowledgeSearchError:
+            self._trace(
+                lambda: trace.citation_validate(
+                    available_evidence_count=0,
+                    cited_handles=(),
+                    cited_document_version_ids=(),
+                    abstained=False,
+                    error_code=None,
+                )
+            )
+            return AnswerCompletion(
+                content=_KNOWLEDGE_SEARCH_UNAVAILABLE_ANSWER,
+                citations=(),
+                abstained=False,
+            )
+        if not result.hits:
+            self._trace(
+                lambda: trace.citation_validate(
+                    available_evidence_count=0,
+                    cited_handles=(),
+                    cited_document_version_ids=(),
+                    abstained=True,
+                    error_code=None,
+                )
+            )
+            return AnswerCompletion(
+                content=INSUFFICIENT_EVIDENCE_ANSWER,
+                citations=(),
+                abstained=True,
+            )
+
+        request = LLMRequest(
+            system_input=required_grounding_system_input(),
+            transcript=self._initial_transcript(
+                context, neutralize_historical_citations=True
+            ),
+            allowed_tools=(),
+            personal_context=None,
+            current_user_message_index=len(context.completed_turns) * 2,
+            evidence_context=evidence_context(result.hits),
+        )
+        completion: LLMResponseCompleted | None = None
+        llm_trace = self._begin_llm_trace(trace, request, 1)
+        llm_trace_closed = False
+        try:
+            async for event in self._provider.stream(request):
+                if isinstance(event, AssistantContentDelta):
+                    if completion is not None:
+                        raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                    self._trace(lambda: llm_trace.content_delta(event))
+                elif isinstance(event, LLMResponseCompleted):
+                    if completion is not None:
+                        raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                    completion = event
+                    self._trace(lambda: llm_trace.finish(event))
+                    llm_trace_closed = True
+                else:
+                    raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+        except asyncio.CancelledError:
+            if not llm_trace_closed:
+                self._trace(lambda: llm_trace.failure("CANCELLED"))
+            raise
+        except WorkflowFailure as error:
+            if not llm_trace_closed:
+                error_code = error.error_code.value
+                self._trace(lambda: llm_trace.failure(error_code))
+            if (
+                completion is not None
+                and error.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+                and error.invalid_response_subtype is None
+            ):
+                self._record_rejected_response(trace, completion, None)
+            raise
+        except Exception:
+            if not llm_trace_closed:
+                self._trace(
+                    lambda: llm_trace.failure(
+                        RunErrorCode.ANSWER_EXECUTION_FAILED.value
+                    )
+                )
+            raise
+        if completion is None:
+            raise WorkflowFailure(
+                RunErrorCode.LLM_RESPONSE_INVALID,
+                invalid_response_subtype=InvalidResponseSubtype.FINAL_RESPONSE_EMPTY,
+            )
+        self._validate_completion_shape(completion, trace)
+        try:
+            answer = validated_answer_completion(
+                completion.assistant_content,
+                result.hits,
+                requires_citation=True,
+            )
+        except WorkflowFailure as error:
+            validation_subtype = error.invalid_response_subtype
+            if validation_subtype is not None:
+                self._record_rejected_response(trace, completion, validation_subtype)
+            validation_error_code = (
+                validation_subtype.value
+                if validation_subtype is not None
+                else error.error_code.value
+            )
+            self._trace(
+                lambda: trace.citation_validate(
+                    available_evidence_count=len(result.hits),
+                    cited_handles=(),
+                    cited_document_version_ids=(),
+                    abstained=False,
+                    error_code=validation_error_code,
+                )
+            )
+            raise
+        self._trace(
+            lambda: trace.citation_validate(
+                available_evidence_count=len(result.hits),
+                cited_handles=tuple(
+                    citation.evidence_handle for citation in answer.citations
+                ),
+                cited_document_version_ids=tuple(
+                    citation.document_version_id for citation in answer.citations
+                ),
+                abstained=answer.abstained,
+                error_code=None,
+            )
+        )
+        return answer
+
+    def _validate_completion_shape(
+        self, completion: LLMResponseCompleted, trace: ExecutionTrace
+    ) -> None:
+        subtype: InvalidResponseSubtype | None = None
+        if completion.tool_calls:
+            subtype = InvalidResponseSubtype.UNEXPECTED_FINAL_TOOL_CALL
+        elif completion.finish_reason is not LLMFinishReason.STOP:
+            subtype = InvalidResponseSubtype.INVALID_FINISH_REASON
+        elif not completion.assistant_content.strip():
+            subtype = InvalidResponseSubtype.FINAL_RESPONSE_EMPTY
+        if subtype is not None:
+            self._record_rejected_response(trace, completion, subtype)
+            raise WorkflowFailure(
+                RunErrorCode.LLM_RESPONSE_INVALID,
+                invalid_response_subtype=subtype,
+            )
+
+    def _record_rejected_response(
+        self,
+        trace: ExecutionTrace,
+        completion: LLMResponseCompleted,
+        subtype: InvalidResponseSubtype | None,
+    ) -> None:
+        self._trace(
+            lambda: trace.rejected_response(
+                completion, None if subtype is None else subtype.value
+            )
+        )
+
+    def _allowed_tools(
+        self, context: ToolContext, successful_searches: int = 0
+    ) -> tuple[ToolSpec, ...]:
         if context.knowledge_base_id is not None:
-            return self._tool_executor.allowed_tools
+            return tuple(
+                tool
+                for tool in self._tool_executor.allowed_tools
+                if not (successful_searches > 0 and tool.name == "search_knowledge")
+            )
         return tuple(
             tool
             for tool in self._tool_executor.allowed_tools
             if tool.name != "search_knowledge"
         )
+
+
+def _neutralize_historical_citations(content: str) -> str:
+    """Preserve historical ordinals without matching current citation syntax."""
+
+    return _HISTORICAL_CITATION.sub(
+        lambda match: f"<HISTORICAL_CITATION:K{match.group(1)}>", content
+    )

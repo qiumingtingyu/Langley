@@ -11,10 +11,12 @@ from langsmith import get_tracing_context
 from langley.answering.context_builder import (
     AnswerContext,
     AnswerContextBuilder,
+    CompletedTurn,
     PersonalContextItem,
 )
 from langley.answering.contracts import (
     AssistantContentDelta,
+    AssistantRuntimeMessage,
     LLMFinishReason,
     LLMProvider,
     LLMRequest,
@@ -24,8 +26,13 @@ from langley.answering.contracts import (
     ToolResultKind,
     UserRuntimeMessage,
 )
-from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.errors import (
+    InvalidResponseSubtype,
+    RunErrorCode,
+    WorkflowFailure,
+)
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
+from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import INSUFFICIENT_EVIDENCE_ANSWER
 from langley.answering.tools import (
     CurrentTimeTool,
@@ -34,8 +41,9 @@ from langley.answering.tools import (
     ToolExecutionOutput,
     ToolExecutor,
 )
-from langley.answering.tracing import Tracer
+from langley.answering.tracing import KnowledgeSearchOrigin, Tracer
 from langley.answering.workflow import LearningAssistantWorkflow
+from langley.knowledge.casebook_baseline import CasebookBaselineTracer
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 from langley.knowledge.retrieval_service import KnowledgeSearchError
 
@@ -97,6 +105,7 @@ def _workflow(
     max_tool_calls: int = 3,
     overall_deadline_seconds: float = 1.0,
     tracer: Tracer | None = None,
+    retrieval_service: object | None = None,
 ) -> LearningAssistantWorkflow:
     return LearningAssistantWorkflow(
         context_builder=context_builder
@@ -117,6 +126,7 @@ def _workflow(
         model="fake-script",
         trace_content_enabled=trace_content_enabled,
         tracer=tracer,
+        retrieval_service=cast(object, retrieval_service),
     )
 
 
@@ -128,6 +138,7 @@ async def _execute_workflow(
     workflow: LearningAssistantWorkflow,
     on_assistant_delta=_discard_delta,
     knowledge_base_id: int | None = None,
+    grounding_policy: GroundingPolicy = GroundingPolicy.AUTO,
 ):
     return await workflow.execute(
         cast(object, None),
@@ -136,6 +147,7 @@ async def _execute_workflow(
         conversation_id=11,
         input_message_id=22,
         knowledge_base_id=knowledge_base_id,
+        grounding_policy=grounding_policy,
         on_assistant_delta=on_assistant_delta,
     )
 
@@ -180,8 +192,13 @@ class _LifecycleExecutionTrace:
         del answer, stop_reason
         self._events.append("success")
 
-    def failure(self, error_code: str) -> None:
-        self._events.append(f"root_failure:{error_code}")
+    def failure(
+        self, error_code: str, invalid_response_subtype: str | None = None
+    ) -> None:
+        suffix = (
+            "" if invalid_response_subtype is None else f":{invalid_response_subtype}"
+        )
+        self._events.append(f"root_failure:{error_code}{suffix}")
 
 
 class _LifecycleTracer:
@@ -231,17 +248,35 @@ def _hit() -> RetrievalHit:
 class _FakeRetrievalService:
     calls: list[tuple[int, int, str, int]] = field(default_factory=list)
     error: KnowledgeSearchError | None = None
+    hits: tuple[RetrievalHit, ...] = field(default_factory=lambda: (_hit(),))
+    origins: list[object] = field(default_factory=list)
 
     async def search(
-        self, *, user_id: int, knowledge_base_id: int, query: str, top_k: int
+        self,
+        *,
+        user_id: int,
+        knowledge_base_id: int,
+        query: str,
+        top_k: int,
+        trace_parent: object | None = None,
+        origin: KnowledgeSearchOrigin = KnowledgeSearchOrigin.AGENT_TOOL,
     ) -> RetrievalResult:
         self.calls.append((user_id, knowledge_base_id, query, top_k))
+        self.origins.append(origin)
         if self.error is not None:
             raise self.error
+        if trace_parent is not None:
+            search_trace = trace_parent.begin_knowledge_search(  # type: ignore[attr-defined]
+                origin=origin,
+                knowledge_base_id=knowledge_base_id,
+                top_k=top_k,
+                query=query,
+            )
+            search_trace.finish(len(self.hits))
         return RetrievalResult(
             knowledge_base_id=knowledge_base_id,
             generation_id="generation",
-            hits=(_hit(),),
+            hits=self.hits,
         )
 
 
@@ -371,6 +406,9 @@ async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
         "search_knowledge",
     )
     assert service.calls == [(1, 44, "TCP", 5)]
+    assert tuple(tool.name for tool in grounded_provider.requests[1].allowed_tools) == (
+        "get_current_time",
+    )
     assert completion.content == "TCP uses [K1]."
     assert [
         (draft.evidence_handle, draft.document_version_id)
@@ -379,6 +417,113 @@ async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
     observation = cast(ToolResult, grounded_provider.requests[1].transcript[2])
     assert "knowledge_base_id" not in observation.content
     assert "evidence_handle" in observation.content
+
+
+@pytest.mark.anyio
+async def test_auto_with_knowledge_scope_neutralizes_historical_handles() -> None:
+    context = AnswerContext(
+        completed_turns=(
+            CompletedTurn(
+                user_content="previous",
+                assistant_content="Earlier [K1] and [K2].",
+                estimated_tokens=8,
+            ),
+        ),
+        current_user_content="current",
+    )
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
+    )
+
+    await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+        ),
+        knowledge_base_id=44,
+    )
+
+    historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
+    assert historical.content == (
+        "Earlier <HISTORICAL_CITATION:K1> and <HISTORICAL_CITATION:K2>."
+    )
+
+
+@pytest.mark.anyio
+async def test_auto_without_knowledge_scope_preserves_historical_content_exactly() -> (
+    None
+):
+    context = AnswerContext(
+        completed_turns=(
+            CompletedTurn(
+                user_content="previous",
+                assistant_content="Earlier [K1] and [K2].",
+                estimated_tokens=8,
+            ),
+        ),
+        current_user_content="current",
+    )
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
+    )
+
+    await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+        )
+    )
+
+    historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
+    assert historical.content == "Earlier [K1] and [K2]."
+
+
+@pytest.mark.anyio
+async def test_auto_search_current_handle_maps_only_to_current_retrieval_hit() -> None:
+    service = _FakeRetrievalService()
+    context = AnswerContext(
+        completed_turns=(
+            CompletedTurn(
+                user_content="previous",
+                assistant_content="Historical claim [K1].",
+                estimated_tokens=6,
+            ),
+        ),
+        current_user_content="current TCP question",
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"TCP"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="Current [K1]."),)),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            tool_executor=_rag_executor(service),
+        ),
+        knowledge_base_id=44,
+    )
+
+    historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
+    assert historical.content == "Historical claim <HISTORICAL_CITATION:K1>."
+    assert completion.content == "Current [K1]."
+    assert [
+        (citation.evidence_handle, citation.document_version_id)
+        for citation in completion.citations
+    ] == [(1, 13)]
 
 
 @pytest.mark.anyio
@@ -504,6 +649,198 @@ async def test_grounded_citation_validation_and_second_search_stop_before_servic
         )
     assert raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
     assert service.calls == [(1, 44, "TCP", 5)] * 3
+
+
+@pytest.mark.anyio
+async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles() -> (
+    None
+):
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    AssistantContentDelta("provisional"),
+                    _completion(content="Grounded [K1]."),
+                )
+            )
+        ]
+    )
+    context = AnswerContext(
+        completed_turns=(
+            CompletedTurn(
+                user_content="previous",
+                assistant_content="Earlier [K2] and [K1].",
+                estimated_tokens=10,
+            ),
+        ),
+        current_user_content="current question",
+        personal_context=(PersonalContextItem(9, "private preference"),),
+    )
+    deltas: list[str] = []
+
+    completion = await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            retrieval_service=service,
+        ),
+        deltas.append,
+        knowledge_base_id=44,
+        grounding_policy=GroundingPolicy.REQUIRED,
+    )
+
+    assert completion.content == "Grounded [K1]."
+    assert deltas == []
+    assert service.calls == [(1, 44, "current question", 5)]
+    assert service.origins == [KnowledgeSearchOrigin.HARNESS_REQUIRED]
+    request = provider.requests[0]
+    assert request.allowed_tools == ()
+    assert request.personal_context is None
+    assert "[K1]" in (request.evidence_context or "")
+    historical = cast(AssistantRuntimeMessage, request.transcript[1])
+    assert historical.content == (
+        "Earlier <HISTORICAL_CITATION:K2> and <HISTORICAL_CITATION:K1>."
+    )
+
+
+@pytest.mark.anyio
+async def test_required_zero_hits_abstains_without_calling_llm() -> None:
+    service = _FakeRetrievalService(hits=())
+    provider = FakeProvider([])
+
+    completion = await _execute_workflow(
+        _workflow(provider, retrieval_service=service),
+        knowledge_base_id=44,
+        grounding_policy=GroundingPolicy.REQUIRED,
+    )
+
+    assert completion.content == INSUFFICIENT_EVIDENCE_ANSWER
+    assert completion.abstained is True
+    assert provider.requests == []
+
+
+@pytest.mark.anyio
+async def test_required_sentinel_never_streams_raw_candidate() -> None:
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    AssistantContentDelta("[[INSUFFICIENT_"),
+                    AssistantContentDelta("EVIDENCE]]"),
+                    _completion(content="[[INSUFFICIENT_EVIDENCE]]"),
+                )
+            )
+        ]
+    )
+    deltas: list[str] = []
+
+    completion = await _execute_workflow(
+        _workflow(provider, retrieval_service=service),
+        deltas.append,
+        knowledge_base_id=44,
+        grounding_policy=GroundingPolicy.REQUIRED,
+    )
+
+    assert completion.content == INSUFFICIENT_EVIDENCE_ANSWER
+    assert deltas == []
+
+
+@pytest.mark.anyio
+async def test_required_invalid_candidate_captures_normalized_eval_diagnostic() -> None:
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="uncited"),))]
+    )
+    tracer = CasebookBaselineTracer()
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(provider, retrieval_service=service, tracer=tracer),
+            knowledge_base_id=44,
+            grounding_policy=GroundingPolicy.REQUIRED,
+        )
+
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert raised.value.invalid_response_subtype is not None
+    snapshot = tracer.snapshot(101)
+    assert snapshot is not None
+    assert snapshot["error_code"] == RunErrorCode.LLM_RESPONSE_INVALID.value
+    assert snapshot["invalid_response_subtype"] == (
+        InvalidResponseSubtype.MISSING_REQUIRED_CITATION.value
+    )
+    assert snapshot["rejected_normalized_candidate"] == {
+        "assistant_content": "uncited",
+        "tool_calls": [],
+        "finish_reason": "STOP",
+        "invalid_response_subtype": "MISSING_REQUIRED_CITATION",
+    }
+
+
+@pytest.mark.anyio
+async def test_required_duplicate_event_does_not_infer_finish_subtype() -> None:
+    service = _FakeRetrievalService()
+    canonical = _completion(content="Grounded [K1].")
+    provider = FakeProvider([ScriptedProviderRound(events=(canonical, canonical))])
+    tracer = CasebookBaselineTracer()
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(provider, retrieval_service=service, tracer=tracer),
+            knowledge_base_id=44,
+            grounding_policy=GroundingPolicy.REQUIRED,
+        )
+
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert raised.value.invalid_response_subtype is None
+    snapshot = tracer.snapshot(101)
+    assert snapshot is not None
+    assert snapshot["error_code"] == RunErrorCode.LLM_RESPONSE_INVALID.value
+    assert snapshot["invalid_response_subtype"] is None
+    assert snapshot["rejected_normalized_candidate"] == {
+        "assistant_content": "Grounded [K1].",
+        "tool_calls": [],
+        "finish_reason": "STOP",
+        "invalid_response_subtype": None,
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("completion", "expected_subtype"),
+    [
+        (_completion(content=""), "FINAL_RESPONSE_EMPTY"),
+        (
+            _completion(content="Grounded [K1].", finish_reason=LLMFinishReason.LENGTH),
+            "INVALID_FINISH_REASON",
+        ),
+        (
+            _completion(
+                content="",
+                tool_calls=(ToolCall("call-1", "search_knowledge", "{}"),),
+                finish_reason=LLMFinishReason.TOOL_CALLS,
+            ),
+            "UNEXPECTED_FINAL_TOOL_CALL",
+        ),
+    ],
+)
+async def test_required_final_shape_has_focused_invalid_subtype(
+    completion: LLMResponseCompleted, expected_subtype: str
+) -> None:
+    service = _FakeRetrievalService()
+    provider = FakeProvider([ScriptedProviderRound(events=(completion,))])
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(provider, retrieval_service=service),
+            knowledge_base_id=44,
+            grounding_policy=GroundingPolicy.REQUIRED,
+        )
+
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert raised.value.invalid_response_subtype is not None
+    assert raised.value.invalid_response_subtype.value == expected_subtype
 
 
 @pytest.mark.anyio

@@ -197,6 +197,29 @@ def test_required_search_decision_fails_without_search_tool_call() -> None:
     assert runner._search_expectation_met("REQUIRED", count) is False
 
 
+def test_b1_rejected_completed_candidate_is_a_formal_invariant() -> None:
+    with pytest.raises(runner.BaselineInputError, match="EVAL_DIAGNOSTIC_INCOMPLETE"):
+        runner._rejected_candidate_or_fail(
+            case_id="case-1",
+            grounding_policy="REQUIRED",
+            error_code="LLM_RESPONSE_INVALID",
+            rounds=[{"finish_reason": "STOP"}],
+            trace={"rejected_normalized_candidate": None},
+        )
+
+    candidate = {"assistant_content": "uncited", "finish_reason": "STOP"}
+    assert (
+        runner._rejected_candidate_or_fail(
+            case_id="case-1",
+            grounding_policy="REQUIRED",
+            error_code="LLM_RESPONSE_INVALID",
+            rounds=[{"finish_reason": "STOP"}],
+            trace={"rejected_normalized_candidate": candidate},
+        )
+        == candidate
+    )
+
+
 def test_verified_retrieval_hits_receive_document_key_annotation() -> None:
     hits = [
         {

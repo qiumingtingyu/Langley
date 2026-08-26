@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.answer_execution import AnswerExecutionManager
+from langley.answering.grounding import GroundingPolicy
 from langley.api.dependencies import (
     get_current_user_id,
     get_execution_manager,
@@ -58,6 +59,7 @@ class NewQuestionRequest(BaseModel):
     content: str
     client_request_id: str = Field(min_length=1, max_length=64)
     knowledge_base_id: int | None = None
+    grounding_policy: GroundingPolicy = GroundingPolicy.AUTO
 
 
 class RenameConversationRequest(BaseModel):
@@ -279,6 +281,7 @@ async def post_new_question(
             content=body.content,
             client_request_id=body.client_request_id,
             knowledge_base_id=body.knowledge_base_id,
+            grounding_policy=body.grounding_policy,
         )
         await execution_manager.schedule(command)
     except Exception as error:

@@ -14,6 +14,7 @@ from langley.answering.tools import (
     ToolContext,
     ToolExecutor,
 )
+from langley.answering.tracing import KnowledgeSearchOrigin
 from langley.knowledge import retrieval_service
 from langley.knowledge.retrieval import (
     IndexNotReadyError,
@@ -237,3 +238,48 @@ async def test_retrieval_service_maps_retrieval_error_to_stable_boundary(
 
     assert raised.value.code == "KNOWLEDGE_INDEX_NOT_READY"
     assert raised.value.retryable is False
+
+
+@pytest.mark.anyio
+async def test_retrieval_service_uses_narrow_explicit_required_trace_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = RetrievalResult(43, "generation", (_hit(),))
+
+    async def retrieve(*args: object, **kwargs: object) -> RetrievalResult:
+        del args, kwargs
+        return result
+
+    observations: list[dict[str, object]] = []
+
+    class SearchTrace:
+        def finish(self, hit_count: int | None, error_code: str | None = None) -> None:
+            observations.append({"hit_count": hit_count, "error_code": error_code})
+
+    class Parent:
+        def begin_knowledge_search(self, **kwargs: object) -> SearchTrace:
+            observations.append(dict(kwargs))
+            return SearchTrace()
+
+    monkeypatch.setattr(retrieval_service, "retrieve_dense", retrieve)
+    service = KnowledgeRetrievalService(None, None)  # type: ignore[arg-type]
+
+    returned = await service.search(
+        user_id=42,
+        knowledge_base_id=43,
+        query="TCP",
+        top_k=5,
+        trace_parent=Parent(),
+        origin=KnowledgeSearchOrigin.HARNESS_REQUIRED,
+    )
+
+    assert returned is result
+    assert observations == [
+        {
+            "origin": KnowledgeSearchOrigin.HARNESS_REQUIRED,
+            "knowledge_base_id": 43,
+            "top_k": 5,
+            "query": "TCP",
+        },
+        {"hit_count": 1, "error_code": None},
+    ]

@@ -6,6 +6,7 @@ from enum import StrEnum
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from langley.answering.grounding import GroundingPolicy
 from langley.business_time import utc_now
 from langley.infrastructure.models import (
     Conversation,
@@ -76,6 +77,7 @@ async def admit_new_question(
     content: str,
     client_request_id: str,
     knowledge_base_id: int | None = None,
+    grounding_policy: GroundingPolicy = GroundingPolicy.AUTO,
 ) -> AnswerCommandResult:
     """Atomically persist a new USER and PENDING Run or return a same-key replay."""
 
@@ -110,6 +112,7 @@ async def admit_new_question(
                 existing_message,
                 content,
                 knowledge_base_id,
+                grounding_policy,
             ):
                 raise ClientRequestIdReusedError
             return AnswerCommandResult(
@@ -134,6 +137,8 @@ async def admit_new_question(
 
         if not content.strip():
             raise ValueError("content must not be blank")
+        if grounding_policy is GroundingPolicy.REQUIRED and knowledge_base_id is None:
+            raise ValueError("REQUIRED grounding needs a knowledge base")
 
         if knowledge_base_id is not None:
             knowledge_base = await session.scalar(
@@ -175,6 +180,7 @@ async def admit_new_question(
             conversation_id=conversation_id,
             input_message_id=user_message.id,
             knowledge_base_id=knowledge_base_id,
+            grounding_policy=grounding_policy.value,
             client_request_id=client_request_id,
             attempt_no=1,
             status="PENDING",
@@ -203,6 +209,7 @@ def _is_new_question_replay(
     message: Message,
     content: str,
     knowledge_base_id: int | None,
+    grounding_policy: GroundingPolicy,
 ) -> bool:
     """Determine whether existing facts represent this endpoint's exact command."""
 
@@ -212,6 +219,7 @@ def _is_new_question_replay(
         and message.regenerated_from_message_id is None
         and message.content == content
         and run.knowledge_base_id == knowledge_base_id
+        and run.grounding_policy == grounding_policy.value
     )
 
 
@@ -300,6 +308,7 @@ async def admit_retry(
                 Run.input_message_id == latest_user.id,
                 Run.status.in_(("FAILED", "CANCELLED")),
             )
+            .order_by(Run.attempt_no.desc())
             .with_for_update()
             .limit(1)
         )
@@ -324,6 +333,7 @@ async def admit_retry(
             conversation_id=conversation_id,
             input_message_id=latest_user.id,
             knowledge_base_id=prior_failed_or_cancelled_run.knowledge_base_id,
+            grounding_policy=prior_failed_or_cancelled_run.grounding_policy,
             client_request_id=client_request_id,
             attempt_no=last_attempt_no + 1,
             status="PENDING",
@@ -424,6 +434,7 @@ async def admit_regenerate(
                 Run.input_message_id == latest_user.id,
                 Run.status == "SUCCEEDED",
             )
+            .order_by(Run.attempt_no.desc())
             .with_for_update()
             .limit(1)
         )
@@ -462,6 +473,7 @@ async def admit_regenerate(
             conversation_id=conversation_id,
             input_message_id=copied_user.id,
             knowledge_base_id=succeeded_run.knowledge_base_id,
+            grounding_policy=succeeded_run.grounding_policy,
             client_request_id=client_request_id,
             attempt_no=1,
             status="PENDING",

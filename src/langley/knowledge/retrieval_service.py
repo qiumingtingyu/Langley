@@ -5,9 +5,10 @@ import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answering.tracing import (
+    KnowledgeSearchOrigin,
     KnowledgeSearchTrace,
-    ToolTrace,
-    current_tool_trace,
+    KnowledgeSearchTraceParent,
+    current_retrieval_trace_parent,
 )
 from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
 from langley.knowledge.retrieval import (
@@ -47,11 +48,14 @@ class KnowledgeRetrievalService:
         knowledge_base_id: int,
         query: str,
         top_k: int,
+        trace_parent: KnowledgeSearchTraceParent | None = None,
+        origin: KnowledgeSearchOrigin = KnowledgeSearchOrigin.AGENT_TOOL,
     ) -> RetrievalResult:
         """Retrieve with the server-owned user and KB scope only."""
 
         search_trace = _start_search_trace(
-            current_tool_trace(),
+            trace_parent or current_retrieval_trace_parent(),
+            origin=origin,
             knowledge_base_id=knowledge_base_id,
             top_k=top_k,
             query=query,
@@ -92,8 +96,9 @@ def _knowledge_search_error(error: RetrievalError) -> KnowledgeSearchError:
 
 
 def _start_search_trace(
-    trace: ToolTrace | None,
+    trace: KnowledgeSearchTraceParent | None,
     *,
+    origin: KnowledgeSearchOrigin,
     knowledge_base_id: int,
     top_k: int,
     query: str,
@@ -102,6 +107,7 @@ def _start_search_trace(
         return None
     try:
         return trace.begin_knowledge_search(
+            origin=origin,
             knowledge_base_id=knowledge_base_id,
             top_k=top_k,
             query=query,

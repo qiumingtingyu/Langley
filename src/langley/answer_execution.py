@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answer_runtime import ActiveAnswer, StreamItem
 from langley.answering.errors import WorkflowFailure
+from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import CitationDraft
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.business_time import utc_now
@@ -157,6 +158,7 @@ class AnswerExecutionManager:
             )
             self._publish(answer, ("run.started", {"run_id": command.run.id}))
             await self._run_memory_catch_up(command)
+            grounding_policy = GroundingPolicy(command.run.grounding_policy)
             completion = await workflow.execute(
                 self._session_factory,
                 run_id=command.run.id,
@@ -164,6 +166,7 @@ class AnswerExecutionManager:
                 conversation_id=command.run.conversation_id,
                 input_message_id=command.user_message.id,
                 knowledge_base_id=command.run.knowledge_base_id,
+                grounding_policy=grounding_policy,
                 on_assistant_delta=lambda delta: self._publish_delta(
                     answer, command.run.id, delta
                 ),
@@ -175,6 +178,8 @@ class AnswerExecutionManager:
                 content=completion.content,
                 citation_drafts=completion.citations,
             )
+            if grounding_policy is GroundingPolicy.REQUIRED:
+                await self._publish_delta(answer, command.run.id, completion.content)
             self._close_after_terminal(
                 answer, ("run.succeeded", {"run_id": command.run.id})
             )

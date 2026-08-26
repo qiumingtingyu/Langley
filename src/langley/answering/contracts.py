@@ -89,6 +89,7 @@ class LLMRequest:
     allowed_tools: tuple[ToolSpec, ...]
     personal_context: tuple[str, ...] | None = ()
     current_user_message_index: int | None = None
+    evidence_context: str | None = None
 
 
 @dataclass(frozen=True)

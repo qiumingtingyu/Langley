@@ -62,6 +62,7 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
             allowed_tools=(),
             personal_context=("private preference",),
             current_user_message_index=0,
+            evidence_context="private evidence",
         ),
         1,
     )
@@ -78,6 +79,76 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
     assert len(client.calls) == 2
     assert client.calls[1]["inputs"] == {}
     assert client.updates[0][1]["outputs"] == {}
+
+
+@pytest.mark.anyio
+async def test_content_enabled_trace_may_record_evidence_context() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            self.calls.append(kwargs)
+            if len(self.calls) == 2:
+                self.ready.set()
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(1, "qwen", "test", True)
+    trace.begin_llm(
+        LLMRequest(
+            system_input="system",
+            transcript=(UserRuntimeMessage(content="request"),),
+            allowed_tools=(),
+            evidence_context="[K1] private evidence",
+        ),
+        1,
+    )
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    assert client.calls[1]["inputs"]["evidence_context"] == (  # type: ignore[index]
+        "[K1] private evidence"
+    )
+
+
+@pytest.mark.anyio
+async def test_root_failure_exports_invalid_response_subtype_metadata() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.updates: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            del kwargs
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args
+            self.updates.append(kwargs)
+            self.ready.set()
+
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(1, "qwen", "test", False)
+
+    trace.failure("LLM_RESPONSE_INVALID", "MISSING_REQUIRED_CITATION")
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    update = client.updates[0]
+    assert update["error"] == "LLM_RESPONSE_INVALID"
+    metadata = cast(dict[str, object], update["extra"])["metadata"]
+    assert cast(dict[str, object], metadata)["invalid_response_subtype"] == (
+        "MISSING_REQUIRED_CITATION"
+    )
 
 
 @pytest.mark.anyio
@@ -268,6 +339,7 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
             "model": "test",
             "knowledge_base_id": 44,
             "top_k": 5,
+            "origin": "AGENT_TOOL",
         }
     }
     assert tool_update["end_time"] is not None

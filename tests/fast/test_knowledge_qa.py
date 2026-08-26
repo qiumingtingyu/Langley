@@ -6,7 +6,11 @@ import pytest
 
 import langley.answering.knowledge_qa as knowledge_qa
 from langley.answering.contracts import LLMFinishReason, LLMResponseCompleted, ToolCall
-from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.errors import (
+    InvalidResponseSubtype,
+    RunErrorCode,
+    WorkflowFailure,
+)
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 
@@ -75,12 +79,21 @@ def test_validated_completion_preserves_handles_and_deduplicates() -> None:
     ]
 
 
-@pytest.mark.parametrize("content", ["Unknown [K3]", "An uncited answer"])
-def test_normal_completion_rejects_unknown_or_missing_handles(content: str) -> None:
+@pytest.mark.parametrize(
+    ("content", "subtype"),
+    [
+        ("Unknown [K3]", InvalidResponseSubtype.UNKNOWN_CITATION_HANDLE),
+        ("An uncited answer", InvalidResponseSubtype.MISSING_REQUIRED_CITATION),
+    ],
+)
+def test_normal_completion_rejects_unknown_or_missing_handles(
+    content: str, subtype: InvalidResponseSubtype
+) -> None:
     with pytest.raises(WorkflowFailure) as raised:
         knowledge_qa._validated_completion(content, (_hit(1), _hit(2)))
 
     assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert raised.value.invalid_response_subtype is subtype
 
 
 def test_exact_insufficient_evidence_sentinel_abstains_without_citations() -> None:

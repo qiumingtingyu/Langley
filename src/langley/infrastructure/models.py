@@ -443,6 +443,14 @@ class Run(Base):
             name="ck_runs_status_valid",
         ),
         CheckConstraint(
+            "grounding_policy IN ('AUTO', 'REQUIRED')",
+            name="ck_runs_grounding_policy_valid",
+        ),
+        CheckConstraint(
+            "grounding_policy != 'REQUIRED' OR knowledge_base_id IS NOT NULL",
+            name="ck_runs_required_grounding_has_knowledge_base",
+        ),
+        CheckConstraint(
             "(status = 'PENDING' AND started_at IS NULL AND finished_at IS NULL "
             "AND error_code IS NULL) OR "
             "(status = 'RUNNING' AND started_at IS NOT NULL AND finished_at IS NULL "
@@ -473,6 +481,12 @@ class Run(Base):
             "knowledge_bases.id", name="fk_runs_knowledge_base", ondelete="RESTRICT"
         ),
         nullable=True,
+    )
+    grounding_policy: Mapped[str] = mapped_column(
+        String(16, collation="utf8mb4_0900_bin"),
+        nullable=False,
+        default="AUTO",
+        server_default="AUTO",
     )
     client_request_id: Mapped[str] = mapped_column(
         String(64, collation="utf8mb4_0900_bin"), nullable=False

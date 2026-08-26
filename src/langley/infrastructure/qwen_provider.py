@@ -190,6 +190,11 @@ class QwenProvider:
                                 else list(request.personal_context)
                             ),
                             "current_user_request": item.content,
+                            **(
+                                {"evidence_context": request.evidence_context}
+                                if request.evidence_context is not None
+                                else {}
+                            ),
                         },
                         ensure_ascii=False,
                         separators=(",", ":"),

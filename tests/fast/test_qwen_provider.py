@@ -166,6 +166,27 @@ def test_qwen_provider_wraps_only_the_current_user_with_personal_context(
     }
 
 
+def test_qwen_serializes_evidence_in_langley_current_user_envelope() -> None:
+    request = LLMRequest(
+        system_input="strict grounding",
+        transcript=(UserRuntimeMessage(content="current user"),),
+        allowed_tools=(),
+        personal_context=None,
+        current_user_message_index=0,
+        evidence_context="[K1]\nEvidence body",
+    )
+
+    payload = _provider(lambda _: httpx.Response(200))._request_payload(request)
+
+    assert "evidence_context" not in payload
+    assert json.loads(payload["messages"][1]["content"]) == {
+        "personal_context_status": "unavailable",
+        "personal_context": None,
+        "current_user_request": "current user",
+        "evidence_context": "[K1]\nEvidence body",
+    }
+
+
 def test_qwen_provider_losslessly_aggregates_fragmented_malformed_tool_arguments() -> (
     None
 ):

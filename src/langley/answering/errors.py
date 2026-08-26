@@ -20,9 +20,25 @@ class RunErrorCode(StrEnum):
     PROCESS_INTERRUPTED = "PROCESS_INTERRUPTED"
 
 
+class InvalidResponseSubtype(StrEnum):
+    """Focused internal diagnostics under the stable external Run error."""
+
+    FINAL_RESPONSE_EMPTY = "FINAL_RESPONSE_EMPTY"
+    MISSING_REQUIRED_CITATION = "MISSING_REQUIRED_CITATION"
+    UNKNOWN_CITATION_HANDLE = "UNKNOWN_CITATION_HANDLE"
+    INVALID_FINISH_REASON = "INVALID_FINISH_REASON"
+    UNEXPECTED_FINAL_TOOL_CALL = "UNEXPECTED_FINAL_TOOL_CALL"
+
+
 class WorkflowFailure(Exception):
     """A typed, safe-to-persist failure from Learning Assistant execution."""
 
-    def __init__(self, error_code: RunErrorCode) -> None:
+    def __init__(
+        self,
+        error_code: RunErrorCode,
+        *,
+        invalid_response_subtype: InvalidResponseSubtype | None = None,
+    ) -> None:
         super().__init__(error_code.value)
         self.error_code = error_code
+        self.invalid_response_subtype = invalid_response_subtype
