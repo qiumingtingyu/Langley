@@ -178,15 +178,10 @@ def validated_answer_completion(
     if abstention_control_token is None:
         is_abstention = content == AUTO_INSUFFICIENT_EVIDENCE_SENTINEL
     else:
-        is_abstention = content.strip() == abstention_control_token
+        is_abstention = abstention_control_token in content
     if is_abstention:
         return AnswerCompletion(
             content=INSUFFICIENT_EVIDENCE_ANSWER, citations=(), abstained=True
-        )
-    if abstention_control_token is not None and abstention_control_token in content:
-        raise WorkflowFailure(
-            RunErrorCode.LLM_RESPONSE_INVALID,
-            invalid_response_subtype=(InvalidResponseSubtype.INVALID_ABSTENTION_FORMAT),
         )
     if not content.strip():
         raise WorkflowFailure(

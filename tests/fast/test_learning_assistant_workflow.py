@@ -817,13 +817,12 @@ async def test_required_current_token_maps_to_canonical_abstention_without_strea
 @pytest.mark.parametrize(
     "candidate",
     [
-        f"partial answer {_CURRENT_ABSTENTION_TOKEN}",
-        f"{_CURRENT_ABSTENTION_TOKEN} trailing answer",
         f"partial answer [K1] {_CURRENT_ABSTENTION_TOKEN}",
+        f"{_CURRENT_ABSTENTION_TOKEN} trailing answer",
     ],
 )
 @pytest.mark.anyio
-async def test_required_mixed_control_output_fails_closed_and_is_redacted_in_eval(
+async def test_required_mixed_control_output_becomes_canonical_abstention(
     monkeypatch: pytest.MonkeyPatch, candidate: str
 ) -> None:
     monkeypatch.setattr(
@@ -845,28 +844,24 @@ async def test_required_mixed_control_output_fails_closed_and_is_redacted_in_eva
     tracer = CasebookBaselineTracer()
     deltas: list[str] = []
 
-    with pytest.raises(WorkflowFailure) as raised:
-        await _execute_workflow(
-            _workflow(provider, retrieval_service=service, tracer=tracer),
-            deltas.append,
-            knowledge_base_id=44,
-            grounding_policy=GroundingPolicy.REQUIRED,
-        )
-
-    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
-    assert (
-        raised.value.invalid_response_subtype
-        is InvalidResponseSubtype.INVALID_ABSTENTION_FORMAT
+    completion = await _execute_workflow(
+        _workflow(provider, retrieval_service=service, tracer=tracer),
+        deltas.append,
+        knowledge_base_id=44,
+        grounding_policy=GroundingPolicy.REQUIRED,
     )
+
+    assert completion.content == INSUFFICIENT_EVIDENCE_ANSWER
+    assert completion.abstained is True
+    assert completion.citations == ()
+    assert candidate not in completion.content
+    assert _CURRENT_ABSTENTION_TOKEN not in completion.content
     assert deltas == []
     snapshot = tracer.snapshot(101)
     assert snapshot is not None
-    assert snapshot["invalid_response_subtype"] == "INVALID_ABSTENTION_FORMAT"
+    assert snapshot["invalid_response_subtype"] is None
     assert snapshot["abstention_control_token_leaked"] is False
-    rejected = snapshot["rejected_normalized_candidate"]
-    assert rejected["invalid_response_subtype"] == "INVALID_ABSTENTION_FORMAT"
-    assert _CURRENT_ABSTENTION_TOKEN not in rejected["assistant_content"]
-    assert "[[LANGLEY_ABSTAIN_<RUN_LOCAL_TOKEN>]]" in rejected["assistant_content"]
+    assert snapshot["rejected_normalized_candidate"] is None
 
 
 @pytest.mark.parametrize(

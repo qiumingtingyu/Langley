@@ -159,24 +159,22 @@ def test_exact_current_run_token_abstains_without_citations(content: str) -> Non
 @pytest.mark.parametrize(
     "content",
     [
-        f"解释文字 {_CURRENT_TOKEN}",
-        f"{_CURRENT_TOKEN} 补充文字",
         f"解释文字 [K1] {_CURRENT_TOKEN}",
+        f"{_CURRENT_TOKEN} 补充文字",
     ],
 )
-def test_current_run_token_mixed_with_text_is_invalid(content: str) -> None:
-    with pytest.raises(WorkflowFailure) as raised:
-        knowledge_qa._validated_completion(
-            content,
-            (_hit(1),),
-            abstention_control_token=_CURRENT_TOKEN,
-        )
-
-    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
-    assert (
-        raised.value.invalid_response_subtype
-        is InvalidResponseSubtype.INVALID_ABSTENTION_FORMAT
+def test_current_run_token_mixed_with_text_abstains_without_citations(
+    content: str,
+) -> None:
+    completion = knowledge_qa._validated_completion(
+        content,
+        (_hit(1),),
+        abstention_control_token=_CURRENT_TOKEN,
     )
+
+    assert completion.content == knowledge_qa.INSUFFICIENT_EVIDENCE_ANSWER
+    assert completion.abstained is True
+    assert completion.citations == ()
 
 
 @pytest.mark.parametrize(
