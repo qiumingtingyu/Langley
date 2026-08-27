@@ -700,6 +700,7 @@ eval = [
     { name = "sentence-transformers" },
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'win32'" },
+    { name = "transformers" },
 ]
 qdrant = [
     { name = "qdrant-client" },
@@ -709,6 +710,7 @@ retrieval = [
     { name = "sentence-transformers" },
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'win32'" },
+    { name = "transformers" },
 ]
 
 [package.metadata]
@@ -742,6 +744,7 @@ eval = [
     { name = "sentence-transformers", specifier = ">=5.0,<6" },
     { name = "torch", marker = "sys_platform != 'win32'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "sys_platform == 'win32'", specifier = ">=2.13,<3", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "transformers", specifier = ">=5.0,<6" },
 ]
 qdrant = [{ name = "qdrant-client", specifier = "==1.19.0" }]
 retrieval = [
@@ -749,6 +752,7 @@ retrieval = [
     { name = "sentence-transformers", specifier = ">=5.0,<6" },
     { name = "torch", marker = "sys_platform != 'win32'", specifier = ">=2.13,<3" },
     { name = "torch", marker = "sys_platform == 'win32'", specifier = ">=2.13,<3", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "transformers", specifier = ">=5.0,<6" },
 ]
 
 [[package]]

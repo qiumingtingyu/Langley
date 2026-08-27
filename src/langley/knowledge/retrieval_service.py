@@ -1,4 +1,4 @@
-"""Detached application service for one scoped production dense retrieval."""
+"""Detached application service for one scoped production retrieval."""
 
 import asyncio
 
@@ -11,6 +11,7 @@ from langley.answering.tracing import (
     current_retrieval_trace_parent,
 )
 from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
+from langley.knowledge.reranking import Reranker, RerankerError
 from langley.knowledge.retrieval import (
     IndexNotReadyError,
     KnowledgeBaseRetrievalNotFoundError,
@@ -18,6 +19,7 @@ from langley.knowledge.retrieval import (
     RetrievalGenerationChangedError,
     RetrievalResult,
     retrieve_dense,
+    retrieve_reranked,
 )
 
 
@@ -37,9 +39,16 @@ class KnowledgeRetrievalService:
         self,
         session_factory: async_sessionmaker[AsyncSession],
         runtime: KnowledgeIndexBuildRuntime,
+        *,
+        reranker: Reranker | None = None,
+        reranker_candidate_k: int = 20,
     ) -> None:
+        if reranker_candidate_k < 1:
+            raise ValueError("reranker_candidate_k must be positive")
         self._session_factory = session_factory
         self._runtime = runtime
+        self._reranker = reranker
+        self._reranker_candidate_k = reranker_candidate_k
 
     async def search(
         self,
@@ -61,19 +70,39 @@ class KnowledgeRetrievalService:
             query=query,
         )
         try:
-            result = await retrieve_dense(
-                self._session_factory,
-                self._runtime,
-                user_id=user_id,
-                knowledge_base_id=knowledge_base_id,
-                query=query,
-                top_k=top_k,
-            )
+            if self._reranker is None:
+                result = await retrieve_dense(
+                    self._session_factory,
+                    self._runtime,
+                    user_id=user_id,
+                    knowledge_base_id=knowledge_base_id,
+                    query=query,
+                    top_k=top_k,
+                )
+            else:
+                result = await retrieve_reranked(
+                    self._session_factory,
+                    self._runtime,
+                    self._reranker,
+                    user_id=user_id,
+                    knowledge_base_id=knowledge_base_id,
+                    query=query,
+                    candidate_k=max(self._reranker_candidate_k, top_k),
+                    top_k=top_k,
+                )
         except asyncio.CancelledError:
             _finish_search_trace(search_trace, hit_count=None, error_code="CANCELLED")
             raise
         except RetrievalError as error:
             stable_error = _knowledge_search_error(error)
+            _finish_search_trace(
+                search_trace, hit_count=None, error_code=stable_error.code
+            )
+            raise stable_error from error
+        except RerankerError as error:
+            stable_error = KnowledgeSearchError(
+                "KNOWLEDGE_SEARCH_UNAVAILABLE", retryable=False
+            )
             _finish_search_trace(
                 search_trace, hit_count=None, error_code=stable_error.code
             )

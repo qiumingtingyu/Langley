@@ -33,6 +33,7 @@ dev = [
 eval = [
     "sentence-transformers>=5.0,<6",
     "torch>=2.13,<3",
+    "transformers>=5.0,<6",
 ]
 qdrant = [
     "qdrant-client==1.19.0",

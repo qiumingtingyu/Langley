@@ -230,6 +230,11 @@ def test_retrieval_preserves_exact_query_active_config_and_qdrant_order(
         (2, 8),
         (3, 42),
     ]
+    assert [(hit.retrieval_rank, hit.rerank_score) for hit in result.hits] == [
+        (1, None),
+        (2, None),
+        (3, None),
+    ]
 
 
 def test_non_ready_rejects_before_embedding_or_qdrant(

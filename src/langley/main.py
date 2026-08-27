@@ -36,6 +36,7 @@ from langley.knowledge.index_build import (
     reconcile_interrupted_index_builds,
     reconcile_stale_ready_index_configurations,
 )
+from langley.knowledge.reranking import LocalBGEReranker, Reranker
 from langley.knowledge.retrieval_service import KnowledgeRetrievalService
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy
@@ -94,6 +95,22 @@ def _memory_provider_for(
         api_key=settings.qwen_api_key,
         base_url=settings.qwen_base_url,
         model=settings.memory_policy_model,
+    )
+
+
+def _reranker_for(settings: Settings) -> Reranker | None:
+    """Construct one unloaded local reranker only when explicitly enabled."""
+
+    if not settings.knowledge_reranking_enabled:
+        return None
+    if settings.knowledge_reranker_model_path is None:
+        raise ValueError(
+            "knowledge_reranker_model_path is required when reranking is enabled"
+        )
+    return LocalBGEReranker(
+        model_path=settings.knowledge_reranker_model_path,
+        device=settings.knowledge_reranker_device,
+        max_length=2048,
     )
 
 
@@ -174,6 +191,8 @@ def _workflow_factory_for(
     retrieval_service = KnowledgeRetrievalService(
         session_factory,
         knowledge_index_runtime,
+        reranker=_reranker_for(settings),
+        reranker_candidate_k=settings.knowledge_reranker_candidate_k,
     )
     tool_executor = ToolExecutor(
         tools=(CurrentTimeTool(), SearchKnowledgeTool(retrieval_service))

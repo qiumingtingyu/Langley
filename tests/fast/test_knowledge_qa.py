@@ -20,7 +20,9 @@ def _hit(identifier: int) -> RetrievalHit:
     return RetrievalHit(
         knowledge_chunk_id=identifier,
         rank=identifier,
+        retrieval_rank=identifier,
         score=1.0 / identifier,
+        rerank_score=None,
         chunk_ordinal=identifier,
         content=f"evidence {identifier}",
         heading_path=("Heading",),

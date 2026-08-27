@@ -236,7 +236,9 @@ def _hit() -> RetrievalHit:
     return RetrievalHit(
         knowledge_chunk_id=11,
         rank=1,
+        retrieval_rank=1,
         score=0.9,
+        rerank_score=None,
         chunk_ordinal=4,
         content="Authoritative TCP evidence.",
         heading_path=("TCP",),

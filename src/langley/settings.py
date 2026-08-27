@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         "content_only"
     )
     knowledge_index_build_concurrency: int = Field(default=1, ge=1, le=4)
+    knowledge_reranking_enabled: bool = False
+    knowledge_reranker_model_path: Path | None = None
+    knowledge_reranker_device: str = "cuda:0"
+    knowledge_reranker_candidate_k: int = Field(default=20, ge=1)
     local_user_id: int | None = None
     llm_provider: LLMProviderName = "qwen"
     qwen_api_key: SecretStr | None = None

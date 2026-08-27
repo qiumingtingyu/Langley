@@ -1,5 +1,6 @@
-"""Fail-closed production dense retrieval over one active Knowledge generation."""
+"""Fail-closed production retrieval over one active Knowledge generation."""
 
+import asyncio
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -18,6 +19,11 @@ from langley.knowledge.index_build import (
     IndexBuildFailure,
     KnowledgeIndexBuildRuntime,
     current_knowledge_chunks_statement,
+)
+from langley.knowledge.reranking import (
+    Reranker,
+    RerankerError,
+    validate_reranker_scores,
 )
 
 
@@ -82,7 +88,9 @@ class ActiveRetrievalContext:
 class RetrievalHit:
     knowledge_chunk_id: int
     rank: int
+    retrieval_rank: int
     score: float
+    rerank_score: float | None
     chunk_ordinal: int
     content: str
     heading_path: tuple[str, ...]
@@ -124,6 +132,98 @@ async def retrieve_dense(
 ) -> RetrievalResult:
     """Retrieve once without retaining DB resources across slow local/remote work."""
 
+    context, hits = await _retrieve_dense_candidates(
+        session_factory,
+        runtime,
+        user_id=user_id,
+        knowledge_base_id=knowledge_base_id,
+        query=query,
+        candidate_k=top_k,
+    )
+    return RetrievalResult(
+        knowledge_base_id=context.knowledge_base_id,
+        generation_id=context.generation_id,
+        hits=hits,
+    )
+
+
+async def retrieve_reranked(
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: KnowledgeIndexBuildRuntime,
+    reranker: Reranker,
+    *,
+    user_id: int,
+    knowledge_base_id: int,
+    query: str,
+    candidate_k: int,
+    top_k: int,
+) -> RetrievalResult:
+    """Over-retrieve, rerank detached candidates, then revalidate selected hits."""
+
+    if top_k < 1 or candidate_k < top_k:
+        raise ValueError("candidate_k must be greater than or equal to positive top_k")
+    context, candidates = await _retrieve_dense_candidates(
+        session_factory,
+        runtime,
+        user_id=user_id,
+        knowledge_base_id=knowledge_base_id,
+        query=query,
+        candidate_k=candidate_k,
+    )
+    try:
+        raw_scores = await reranker.score(
+            query=query,
+            passages=tuple(candidate.content for candidate in candidates),
+        )
+    except asyncio.CancelledError:
+        raise
+    except RerankerError:
+        raise
+    except Exception as error:
+        raise RerankerError("reranker execution failed") from error
+    rerank_scores = validate_reranker_scores(raw_scores, expected_count=len(candidates))
+    ordered = sorted(
+        zip(candidates, rerank_scores, strict=True),
+        key=lambda item: (-item[1], item[0].retrieval_rank),
+    )
+    selected = ordered[:top_k]
+
+    final_chunks = await _final_revalidate(
+        session_factory,
+        context=context,
+        returned_chunk_ids=tuple(
+            candidate.knowledge_chunk_id for candidate, _score in selected
+        ),
+    )
+    chunks_by_id = {chunk.knowledge_chunk_id: chunk for chunk in final_chunks}
+    hits = tuple(
+        _retrieval_hit(
+            chunk=chunks_by_id[candidate.knowledge_chunk_id],
+            rank=rank,
+            retrieval_rank=candidate.retrieval_rank,
+            score=candidate.score,
+            rerank_score=rerank_score,
+        )
+        for rank, (candidate, rerank_score) in enumerate(selected, start=1)
+    )
+    return RetrievalResult(
+        knowledge_base_id=context.knowledge_base_id,
+        generation_id=context.generation_id,
+        hits=hits,
+    )
+
+
+async def _retrieve_dense_candidates(
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: KnowledgeIndexBuildRuntime,
+    *,
+    user_id: int,
+    knowledge_base_id: int,
+    query: str,
+    candidate_k: int,
+) -> tuple[ActiveRetrievalContext, tuple[RetrievalHit, ...]]:
+    """Return detached authoritative Dense candidates with their original rank."""
+
     context = await _read_active_context(
         session_factory, user_id=user_id, knowledge_base_id=knowledge_base_id
     )
@@ -150,10 +250,10 @@ async def retrieve_dense(
             user_id=context.user_id,
             knowledge_base_id=context.knowledge_base_id,
             generation_id=context.generation_id,
-            top_k=top_k,
+            top_k=candidate_k,
             dimension=context.dimension,
         )
-        _validate_search_hits(search_hits, top_k=top_k)
+        _validate_search_hits(search_hits, top_k=candidate_k)
     except DenseSearchResultError:
         search_error = RetrievalIndexInconsistentError()
     except IndexBuildFailure:
@@ -173,29 +273,40 @@ async def retrieve_dense(
 
     chunks_by_id = {chunk.knowledge_chunk_id: chunk for chunk in chunks}
     hits = tuple(
-        RetrievalHit(
-            knowledge_chunk_id=search_hit.knowledge_chunk_id,
+        _retrieval_hit(
+            chunk=chunks_by_id[search_hit.knowledge_chunk_id],
             rank=rank,
+            retrieval_rank=rank,
             score=search_hit.score,
-            chunk_ordinal=chunks_by_id[search_hit.knowledge_chunk_id].chunk_ordinal,
-            content=chunks_by_id[search_hit.knowledge_chunk_id].content,
-            heading_path=chunks_by_id[search_hit.knowledge_chunk_id].heading_path,
-            source_regions=chunks_by_id[search_hit.knowledge_chunk_id].source_regions,
-            document_id=chunks_by_id[search_hit.knowledge_chunk_id].document_id,
-            document_version_id=chunks_by_id[
-                search_hit.knowledge_chunk_id
-            ].document_version_id,
-            source_display_name=chunks_by_id[
-                search_hit.knowledge_chunk_id
-            ].source_display_name,
-            source_sha256=chunks_by_id[search_hit.knowledge_chunk_id].source_sha256,
+            rerank_score=None,
         )
         for rank, search_hit in enumerate(search_hits, start=1)
     )
-    return RetrievalResult(
-        knowledge_base_id=context.knowledge_base_id,
-        generation_id=context.generation_id,
-        hits=hits,
+    return context, hits
+
+
+def _retrieval_hit(
+    *,
+    chunk: _AuthoritativeChunk,
+    rank: int,
+    retrieval_rank: int,
+    score: float,
+    rerank_score: float | None,
+) -> RetrievalHit:
+    return RetrievalHit(
+        knowledge_chunk_id=chunk.knowledge_chunk_id,
+        rank=rank,
+        retrieval_rank=retrieval_rank,
+        score=score,
+        rerank_score=rerank_score,
+        chunk_ordinal=chunk.chunk_ordinal,
+        content=chunk.content,
+        heading_path=chunk.heading_path,
+        source_regions=chunk.source_regions,
+        document_id=chunk.document_id,
+        document_version_id=chunk.document_version_id,
+        source_display_name=chunk.source_display_name,
+        source_sha256=chunk.source_sha256,
     )
 
 
