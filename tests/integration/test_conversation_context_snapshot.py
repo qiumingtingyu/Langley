@@ -55,6 +55,14 @@ def _completion(content: str) -> LLMResponseCompleted:
 def test_snapshot_is_created_then_incrementally_upserted_without_mutating_messages(
     test_database_url: str, reset_database
 ) -> None:
+    orion_content = (
+        "The current project codename is ORION; APOLLO is rejected."
+        + " Neutral project background for deterministic compaction pressure." * 4
+    )
+    canary_content = (
+        "CANARY is final; BLUE-GREEN was rejected."
+        " Neutral deployment fixture background."
+    )
     reset_database()
     config = Config("alembic.ini")
     config.cmd_opts = Namespace(x=["use_test_database=true"])
@@ -83,9 +91,7 @@ def test_snapshot_is_created_then_incrementally_upserted_without_mutating_messag
                     conversation_id=conversation.id,
                     sequence_no=1,
                     role="USER",
-                    content=(
-                        "The current project codename is ORION; APOLLO is rejected."
-                    ),
+                    content=orion_content,
                     run_id=None,
                     regenerated_from_message_id=None,
                     created_at=now,
@@ -121,7 +127,7 @@ def test_snapshot_is_created_then_incrementally_upserted_without_mutating_messag
                     conversation_id=conversation.id,
                     sequence_no=3,
                     role="USER",
-                    content="CANARY is final; BLUE-GREEN was rejected.",
+                    content=canary_content,
                     run_id=None,
                     regenerated_from_message_id=None,
                     created_at=now,
@@ -229,7 +235,7 @@ def test_snapshot_is_created_then_incrementally_upserted_without_mutating_messag
             )
             assert "ORION" in (first.conversation_compact_context or "")
             assert [turn.user_content for turn in first.completed_turns] == [
-                "CANARY is final; BLUE-GREEN was rejected."
+                canary_content
             ]
             async with session_factory() as session:
                 first_snapshot = await session.get(
@@ -306,8 +312,8 @@ def test_snapshot_is_created_then_incrementally_upserted_without_mutating_messag
                 )
                 assert len(messages) == 7
                 assert {message.content for message in messages} >= {
-                    "The current project codename is ORION; APOLLO is rejected.",
-                    "CANARY is final; BLUE-GREEN was rejected.",
+                    orion_content,
+                    canary_content,
                     "What decisions are current?",
                 }
         finally:
