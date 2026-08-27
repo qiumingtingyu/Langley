@@ -36,8 +36,6 @@ from langley.knowledge.retrieval_eval import (
 from langley.main import create_app
 
 _DEFAULT_DATASET_ROOT = Path("tests/fixtures/knowledge/retrieval")
-_DEFAULT_REFERENCE_PATH = Path("eval/slice6/runs/experiment-0-corrected/result.json")
-_DEFAULT_OUTPUT_DIR = Path("eval/slice6/runs/experiment-1-production-dense-parity")
 _MAX_CHUNK_CHARS = 1200
 _TOP_K = 5
 _INDEX_READY_DEADLINE_SECONDS = 30 * 60
@@ -1064,8 +1062,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run Experiment #1 production parity")
     parser.add_argument("command", choices=("run",))
     parser.add_argument("--dataset-root", type=Path, default=_DEFAULT_DATASET_ROOT)
-    parser.add_argument("--reference", type=Path, default=_DEFAULT_REFERENCE_PATH)
-    parser.add_argument("--output-dir", type=Path, default=_DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     corpus = load_golden_corpus(
         args.dataset_root, ChunkingConfig(max_chunk_chars=_MAX_CHUNK_CHARS)

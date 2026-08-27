@@ -32,12 +32,6 @@ _REPOSITORY_ROOT = Path(__file__).parents[3]
 _DEFAULT_DATASET_ROOT = (
     _REPOSITORY_ROOT / "tests" / "fixtures" / "knowledge" / "retrieval"
 )
-_DEFAULT_PREFLIGHT_OUTPUT = (
-    _REPOSITORY_ROOT / "eval" / "slice6" / "retrieval-corpus-preflight.json"
-)
-_DEFAULT_MODEL_PREFLIGHT_OUTPUT = (
-    _REPOSITORY_ROOT / "eval" / "slice6" / "retrieval-model-preflight.json"
-)
 _MODEL_ID = "BAAI/bge-m3"
 _IMMUTABLE_REVISION = re.compile(r"[0-9a-f]{40}")
 _TINY_QUERIES = (
@@ -229,11 +223,9 @@ def _parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     preflight = subcommands.add_parser("preflight")
     preflight.add_argument("--dataset-root", type=Path, default=_DEFAULT_DATASET_ROOT)
-    preflight.add_argument("--output", type=Path, default=_DEFAULT_PREFLIGHT_OUTPUT)
+    preflight.add_argument("--output", type=Path, required=True)
     model_preflight = subcommands.add_parser("model-preflight")
-    model_preflight.add_argument(
-        "--output", type=Path, default=_DEFAULT_MODEL_PREFLIGHT_OUTPUT
-    )
+    model_preflight.add_argument("--output", type=Path, required=True)
     model_preflight.add_argument("--device")
     model_preflight.add_argument(
         "--human-gate-approved",
