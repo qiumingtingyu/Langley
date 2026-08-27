@@ -44,7 +44,11 @@ class Settings(BaseSettings):
     qwen_api_key: SecretStr | None = None
     qwen_base_url: str | None = None
     llm_model: str = _DEFAULT_QWEN_MODEL
-    history_estimated_token_budget: int = Field(default=16_000, ge=1)
+    working_context_budget_estimate: int = Field(default=16_000, ge=1)
+    conversation_compaction_trigger_estimate: int = Field(default=12_000, ge=1)
+    recent_raw_target_estimate: int = Field(default=6_000, ge=1)
+    compact_state_target_estimate: int = Field(default=2_000, ge=1)
+    conversation_compactor_model: str = _DEFAULT_QWEN_MODEL
     memory_estimated_token_budget: int = Field(default=8_192, ge=1)
     memory_policy_estimated_token_budget: int | None = Field(default=None, ge=1)
     memory_policy_model: str | None = None

@@ -7,7 +7,7 @@ from datetime import timedelta
 from alembic import command
 from alembic.config import Config
 
-from langley.answering.context_builder import AnswerContextBuilder
+from langley.answering.conversation_context_builder import ConversationContextBuilder
 from langley.business_time import utc_now
 from langley.infrastructure.database import (
     create_database_engine,
@@ -101,8 +101,11 @@ def test_context_builder_loads_only_owned_current_memories(
                 conversation_id = conversation.id
                 current_message_id = current.id
 
-            context = await AnswerContextBuilder(
-                history_estimated_token_budget=100,
+            context = await ConversationContextBuilder(
+                working_context_budget_estimate=16_000,
+                conversation_compaction_trigger_estimate=12_000,
+                recent_raw_target_estimate=6_000,
+                compact_state_target_estimate=2_000,
                 memory_estimated_token_budget=8_192,
             ).build(
                 session_factory,

@@ -187,6 +187,31 @@ def test_qwen_serializes_evidence_in_langley_current_user_envelope() -> None:
     }
 
 
+def test_qwen_serializes_compact_context_without_fake_assistant_history() -> None:
+    request = LLMRequest(
+        system_input="system",
+        transcript=(
+            UserRuntimeMessage(content="recent user"),
+            AssistantRuntimeMessage(content="recent assistant", tool_calls=()),
+            UserRuntimeMessage(content="current user"),
+        ),
+        allowed_tools=(),
+        current_user_message_index=2,
+        conversation_compact_context="Active decisions:\n- Codename is ORION.",
+    )
+
+    payload = _provider(lambda _: httpx.Response(200))._request_payload(request)
+
+    assert payload["messages"][1:3] == [
+        {"role": "user", "content": "recent user"},
+        {"role": "assistant", "content": "recent assistant"},
+    ]
+    assert (
+        json.loads(payload["messages"][3]["content"])["conversation_compact_context"]
+        == "Active decisions:\n- Codename is ORION."
+    )
+
+
 def test_qwen_provider_losslessly_aggregates_fragmented_malformed_tool_arguments() -> (
     None
 ):

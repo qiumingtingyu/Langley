@@ -13,8 +13,9 @@ from fastapi.responses import JSONResponse
 
 from langley.answer_execution import AnswerExecutionManager
 from langley.answer_lifecycle import interrupt_active_runs
-from langley.answering.context_builder import AnswerContextBuilder
 from langley.answering.contracts import LLMProvider, LLMRequest, LLMStreamEvent
+from langley.answering.conversation_context import LLMConversationCompactor
+from langley.answering.conversation_context_builder import ConversationContextBuilder
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.tools import (
     AgentTool,
@@ -106,6 +107,22 @@ def _memory_provider_for(
     )
 
 
+def _conversation_compactor_provider_for(
+    settings: Settings, override: LLMProvider | None
+) -> LLMProvider:
+    """Construct the configured internal conversation compactor provider."""
+
+    if override is not None:
+        return override
+    if settings.qwen_api_key is None or settings.qwen_base_url is None:
+        return _UnavailableProvider()
+    return QwenProvider(
+        api_key=settings.qwen_api_key,
+        base_url=settings.qwen_base_url,
+        model=settings.conversation_compactor_model,
+    )
+
+
 def _reranker_for(settings: Settings) -> Reranker | None:
     """Construct one unloaded local reranker only when explicitly enabled."""
 
@@ -189,12 +206,29 @@ def _workflow_factory_for(
     tracer: Tracer | None,
     session_factory,
     knowledge_index_runtime: KnowledgeIndexBuildRuntime,
+    conversation_compactor_provider: LLMProvider | None = None,
 ):
     """Assemble one production Workflow factory without giving routes AI authority."""
 
-    context_builder = AnswerContextBuilder(
-        history_estimated_token_budget=settings.history_estimated_token_budget,
+    resolved_compactor_provider = (
+        conversation_compactor_provider
+        if conversation_compactor_provider is not None
+        else _conversation_compactor_provider_for(settings, None)
+    )
+    compactor = LLMConversationCompactor(
+        provider=resolved_compactor_provider,
+        model=settings.conversation_compactor_model,
+        compact_state_target_estimate=settings.compact_state_target_estimate,
+    )
+    context_builder = ConversationContextBuilder(
+        working_context_budget_estimate=settings.working_context_budget_estimate,
+        conversation_compaction_trigger_estimate=(
+            settings.conversation_compaction_trigger_estimate
+        ),
+        recent_raw_target_estimate=settings.recent_raw_target_estimate,
+        compact_state_target_estimate=settings.compact_state_target_estimate,
         memory_estimated_token_budget=settings.memory_estimated_token_budget,
+        compactor=compactor,
     )
     retrieval_service = KnowledgeRetrievalService(
         session_factory,
@@ -270,6 +304,7 @@ def create_app(
     *,
     provider: LLMProvider | None = None,
     memory_provider: LLMProvider | None = None,
+    conversation_compactor_provider: LLMProvider | None = None,
     tracer: Tracer | None = None,
     knowledge_index_runtime: KnowledgeIndexBuildRuntime | None = None,
 ) -> FastAPI:
@@ -302,6 +337,14 @@ def create_app(
         configured_memory_provider = _memory_provider_for(
             resolved_settings, memory_provider
         )
+        configured_compactor_provider = _conversation_compactor_provider_for(
+            resolved_settings,
+            (
+                conversation_compactor_provider
+                if conversation_compactor_provider is not None
+                else provider
+            ),
+        )
         memory_callbacks = None
         if configured_memory_provider is not None:
             memory_policy = MemoryPolicy(
@@ -333,6 +376,7 @@ def create_app(
                 tracer,
                 app.state.session_factory,
                 app.state.knowledge_index_runtime,
+                configured_compactor_provider,
             ),
             memory_catch_up=memory_callbacks[0]
             if memory_callbacks is not None

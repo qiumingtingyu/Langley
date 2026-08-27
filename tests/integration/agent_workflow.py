@@ -2,8 +2,8 @@
 
 from datetime import UTC, datetime
 
-from langley.answering.context_builder import AnswerContextBuilder
 from langley.answering.contracts import LLMProvider
+from langley.answering.conversation_context_builder import ConversationContextBuilder
 from langley.answering.tools import CurrentTimeTool, ToolExecutor
 from langley.answering.workflow import LearningAssistantWorkflow
 
@@ -21,7 +21,12 @@ def workflow_for(
         return datetime(2026, 8, 14, 9, 0, tzinfo=UTC)
 
     return LearningAssistantWorkflow(
-        context_builder=AnswerContextBuilder(history_estimated_token_budget=16_000),
+        context_builder=ConversationContextBuilder(
+            working_context_budget_estimate=16_000,
+            conversation_compaction_trigger_estimate=12_000,
+            recent_raw_target_estimate=6_000,
+            compact_state_target_estimate=2_000,
+        ),
         provider=provider,
         tool_executor=ToolExecutor(tools=(CurrentTimeTool(clock=fixed_clock),)),
         max_llm_rounds=max_llm_rounds,

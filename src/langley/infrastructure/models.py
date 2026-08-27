@@ -288,6 +288,47 @@ class Conversation(Base):
     deleted_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
 
 
+class ConversationContextSnapshot(Base):
+    """One rebuildable current compact-state projection per Conversation."""
+
+    __tablename__ = "conversation_context_snapshots"
+    __table_args__ = (
+        CheckConstraint(
+            "JSON_TYPE(structured_state) = 'OBJECT'",
+            name="ck_conversation_context_snapshots_state_object",
+        ),
+    )
+
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "conversations.id",
+            name="fk_conversation_context_snapshots_conversation",
+            ondelete="RESTRICT",
+        ),
+        primary_key=True,
+    )
+    through_message_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "messages.id",
+            name="fk_conversation_context_snapshots_through_message",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        nullable=False,
+    )
+    structured_state: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    compactor_model: Mapped[str] = mapped_column(
+        String(255, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    prompt_version: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
 class Message(Base):
     """An immutable user-visible message in a conversation."""
 

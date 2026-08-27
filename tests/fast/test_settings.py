@@ -25,7 +25,11 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
         "LANGLEY_QWEN_API_KEY",
         "LANGLEY_QWEN_BASE_URL",
         "LANGLEY_LLM_MODEL",
-        "LANGLEY_HISTORY_ESTIMATED_TOKEN_BUDGET",
+        "LANGLEY_WORKING_CONTEXT_BUDGET_ESTIMATE",
+        "LANGLEY_CONVERSATION_COMPACTION_TRIGGER_ESTIMATE",
+        "LANGLEY_RECENT_RAW_TARGET_ESTIMATE",
+        "LANGLEY_COMPACT_STATE_TARGET_ESTIMATE",
+        "LANGLEY_CONVERSATION_COMPACTOR_MODEL",
         "LANGLEY_MEMORY_ESTIMATED_TOKEN_BUDGET",
         "LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET",
         "LANGLEY_MEMORY_POLICY_MODEL",
@@ -67,7 +71,11 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
     assert settings.qwen_api_key is None
     assert settings.qwen_base_url is None
     assert settings.llm_model == "qwen3.7-plus-2026-05-26"
-    assert settings.history_estimated_token_budget == 16_000
+    assert settings.working_context_budget_estimate == 16_000
+    assert settings.conversation_compaction_trigger_estimate == 12_000
+    assert settings.recent_raw_target_estimate == 6_000
+    assert settings.compact_state_target_estimate == 2_000
+    assert settings.conversation_compactor_model == "qwen3.7-plus-2026-05-26"
     assert settings.memory_estimated_token_budget == 8_192
     assert settings.memory_policy_estimated_token_budget is None
     assert settings.memory_policy_model is None
@@ -98,7 +106,11 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     monkeypatch.setenv("LANGLEY_QWEN_API_KEY", "test-qwen-key")
     monkeypatch.setenv("LANGLEY_QWEN_BASE_URL", "https://qwen.example.test/v1")
     monkeypatch.setenv("LANGLEY_LLM_MODEL", "qwen-test-model")
-    monkeypatch.setenv("LANGLEY_HISTORY_ESTIMATED_TOKEN_BUDGET", "20000")
+    monkeypatch.setenv("LANGLEY_WORKING_CONTEXT_BUDGET_ESTIMATE", "20000")
+    monkeypatch.setenv("LANGLEY_CONVERSATION_COMPACTION_TRIGGER_ESTIMATE", "14000")
+    monkeypatch.setenv("LANGLEY_RECENT_RAW_TARGET_ESTIMATE", "7000")
+    monkeypatch.setenv("LANGLEY_COMPACT_STATE_TARGET_ESTIMATE", "2500")
+    monkeypatch.setenv("LANGLEY_CONVERSATION_COMPACTOR_MODEL", "compact-test-model")
     monkeypatch.setenv("LANGLEY_MEMORY_ESTIMATED_TOKEN_BUDGET", "8192")
     monkeypatch.setenv("LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET", "12000")
     monkeypatch.setenv("LANGLEY_MEMORY_POLICY_MODEL", "memory-policy-test-model")
@@ -130,7 +142,11 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.qwen_api_key.get_secret_value() == "test-qwen-key"
     assert settings.qwen_base_url == "https://qwen.example.test/v1"
     assert settings.llm_model == "qwen-test-model"
-    assert settings.history_estimated_token_budget == 20_000
+    assert settings.working_context_budget_estimate == 20_000
+    assert settings.conversation_compaction_trigger_estimate == 14_000
+    assert settings.recent_raw_target_estimate == 7_000
+    assert settings.compact_state_target_estimate == 2_500
+    assert settings.conversation_compactor_model == "compact-test-model"
     assert settings.memory_estimated_token_budget == 8_192
     assert settings.memory_policy_estimated_token_budget == 12_000
     assert settings.memory_policy_model == "memory-policy-test-model"

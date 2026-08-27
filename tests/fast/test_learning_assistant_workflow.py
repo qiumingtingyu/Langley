@@ -119,8 +119,7 @@ def _workflow(
     retrieval_service: object | None = None,
 ) -> LearningAssistantWorkflow:
     return LearningAssistantWorkflow(
-        context_builder=context_builder
-        or cast(AnswerContextBuilder, _StaticContextBuilder(_context())),
+        context_builder=context_builder or _StaticContextBuilder(_context()),
         provider=provider,
         tool_executor=tool_executor
         or ToolExecutor(
@@ -523,7 +522,7 @@ async def test_auto_with_knowledge_scope_neutralizes_historical_handles() -> Non
     await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
         ),
         knowledge_base_id=44,
     )
@@ -555,7 +554,7 @@ async def test_auto_without_knowledge_scope_preserves_historical_content_exactly
     await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
         )
     )
 
@@ -596,7 +595,7 @@ async def test_auto_search_current_handle_maps_only_to_current_retrieval_hit() -
     completion = await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
             tool_executor=_rag_executor(service),
         ),
         knowledge_base_id=44,
@@ -803,13 +802,16 @@ async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles(
         ),
         current_user_content="current question",
         personal_context=(PersonalContextItem(9, "private preference"),),
+        conversation_compact_context=(
+            "Active constraints:\n- Historical answer used [K1]."
+        ),
     )
     deltas: list[str] = []
 
     completion = await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
             retrieval_service=service,
         ),
         deltas.append,
@@ -824,6 +826,9 @@ async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles(
     request = provider.requests[0]
     assert request.allowed_tools == ()
     assert request.personal_context is None
+    assert request.conversation_compact_context == (
+        "Active constraints:\n- Historical answer used <HISTORICAL_CITATION:K1>."
+    )
     assert "[K1]" in (request.evidence_context or "")
     token_match = re.search(
         r"\[\[LANGLEY_ABSTAIN_[0-9a-f]{32}\]\]", request.system_input
@@ -975,7 +980,7 @@ async def test_required_legacy_or_other_run_token_like_text_is_ordinary_content(
     completion = await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
             retrieval_service=_FakeRetrievalService(),
         ),
         knowledge_base_id=44,
@@ -1177,19 +1182,32 @@ async def test_personal_context_is_not_transcript_and_stays_stable_across_rounds
         personal_context=(
             PersonalContextItem(memory_id=99, content="prefers short examples"),
         ),
+        conversation_compact_context="Active decisions:\n- Codename is ORION.",
     )
 
     await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
         )
     )
 
     assert provider.requests[0].personal_context == ("prefers short examples",)
     assert provider.requests[1].personal_context == ("prefers short examples",)
+    assert provider.requests[0].conversation_compact_context == (
+        "Active decisions:\n- Codename is ORION."
+    )
+    assert provider.requests[1].conversation_compact_context == (
+        "Active decisions:\n- Codename is ORION."
+    )
     assert all(
         "prefers short examples" not in item.content
+        for request in provider.requests
+        for item in request.transcript
+        if isinstance(item, UserRuntimeMessage)
+    )
+    assert all(
+        "Codename is ORION" not in item.content
         for request in provider.requests
         for item in request.transcript
         if isinstance(item, UserRuntimeMessage)
@@ -1372,7 +1390,7 @@ async def test_round_limit_and_deadline_are_typed_workflow_failures() -> None:
         _execute_workflow(
             _workflow(
                 FakeProvider([]),
-                context_builder=cast(AnswerContextBuilder, context_deadline_limited),
+                context_builder=context_deadline_limited,
                 overall_deadline_seconds=0.01,
             )
         )
@@ -1612,21 +1630,26 @@ async def test_web_enabled_run_neutralizes_historical_web_handles() -> None:
             ),
         ),
         current_user_content="current",
+        conversation_compact_context="Earlier compact evidence [W1:E1].",
     )
-    provider = FakeProvider(
-        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
-    )
+    provider = FakeProvider(_web_rounds("Current evidence [W1:E1]."))
 
-    await _execute_workflow(
+    completion = await _execute_workflow(
         _workflow(
             provider,
-            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            context_builder=_StaticContextBuilder(context),
             tool_executor=_web_executor(_WorkflowWebProvider()),
         )
     )
 
     historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
     assert historical.content == ("Earlier evidence <HISTORICAL_WEB_CITATION:W1:E2>.")
+    assert all(
+        request.conversation_compact_context
+        == "Earlier compact evidence <HISTORICAL_WEB_CITATION:W1:E1>."
+        for request in provider.requests
+    )
+    assert "Current evidence [W1:E1]." in completion.content
 
 
 @pytest.mark.anyio

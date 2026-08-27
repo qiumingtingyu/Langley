@@ -62,6 +62,7 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
             allowed_tools=(),
             personal_context=("private preference",),
             current_user_message_index=0,
+            conversation_compact_context="private compact conversation",
             evidence_context="private evidence",
         ),
         1,
@@ -79,6 +80,41 @@ async def test_content_disabled_trace_does_not_export_personal_context() -> None
     assert len(client.calls) == 2
     assert client.calls[1]["inputs"] == {}
     assert client.updates[0][1]["outputs"] == {}
+
+
+@pytest.mark.anyio
+async def test_content_enabled_trace_does_not_expand_to_compact_conversation() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            self.calls.append(kwargs)
+            if len(self.calls) == 2:
+                self.ready.set()
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(1, "qwen", "test", True)
+    trace.begin_llm(
+        LLMRequest(
+            system_input="system",
+            transcript=(UserRuntimeMessage(content="request"),),
+            allowed_tools=(),
+            conversation_compact_context="private compact conversation",
+        ),
+        1,
+    )
+    assert await asyncio.to_thread(client.ready.wait, 1)
+
+    assert "conversation_compact_context" not in client.calls[1]["inputs"]
 
 
 @pytest.mark.anyio

@@ -189,6 +189,15 @@ class QwenProvider:
                                 if request.personal_context is None
                                 else list(request.personal_context)
                             ),
+                            **(
+                                {
+                                    "conversation_compact_context": (
+                                        request.conversation_compact_context
+                                    )
+                                }
+                                if request.conversation_compact_context is not None
+                                else {}
+                            ),
                             "current_user_request": item.content,
                             **(
                                 {"evidence_context": request.evidence_context}

@@ -100,6 +100,7 @@ class _AgentState(TypedDict):
     llm_rounds: int
     tool_calls_used: int
     personal_context: tuple[str, ...] | None
+    conversation_compact_context: str | None
     current_user_message_index: int
     tool_context: ToolContext
     retrieval_hits: tuple[RetrievalHit, ...]
@@ -236,13 +237,19 @@ class LearningAssistantWorkflow:
         trace: ExecutionTrace,
     ) -> _AgentState:
         graph = self._compile_graph(on_assistant_delta, trace)
+        neutralize_historical_citations = (
+            tool_context.knowledge_base_id is not None
+            or tool_context.web_session is not None
+        )
         transcript = self._initial_transcript(
             context,
-            neutralize_historical_citations=(
-                tool_context.knowledge_base_id is not None
-                or tool_context.web_session is not None
-            ),
+            neutralize_historical_citations=neutralize_historical_citations,
         )
+        conversation_compact_context = context.conversation_compact_context
+        if neutralize_historical_citations and conversation_compact_context is not None:
+            conversation_compact_context = _neutralize_historical_citations(
+                conversation_compact_context
+            )
         initial_state: _AgentState = {
             "transcript": transcript,
             "last_completion": None,
@@ -253,6 +260,7 @@ class LearningAssistantWorkflow:
                 if context.personal_context is None
                 else tuple(item.content for item in context.personal_context)
             ),
+            "conversation_compact_context": conversation_compact_context,
             "current_user_message_index": len(transcript) - 1,
             "tool_context": tool_context,
             "retrieval_hits": (),
@@ -289,6 +297,7 @@ class LearningAssistantWorkflow:
                 ),
                 personal_context=state["personal_context"],
                 current_user_message_index=state["current_user_message_index"],
+                conversation_compact_context=state["conversation_compact_context"],
             )
             completion: LLMResponseCompleted | None = None
             llm_trace = self._begin_llm_trace(trace, request, state["llm_rounds"] + 1)
@@ -677,6 +686,13 @@ class LearningAssistantWorkflow:
             allowed_tools=(),
             personal_context=None,
             current_user_message_index=len(context.completed_turns) * 2,
+            conversation_compact_context=(
+                None
+                if context.conversation_compact_context is None
+                else _neutralize_historical_citations(
+                    context.conversation_compact_context
+                )
+            ),
             evidence_context=evidence_context(result.hits),
         )
         completion: LLMResponseCompleted | None = None
