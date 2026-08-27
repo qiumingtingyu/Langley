@@ -16,8 +16,16 @@ from langley.answer_lifecycle import interrupt_active_runs
 from langley.answering.context_builder import AnswerContextBuilder
 from langley.answering.contracts import LLMProvider, LLMRequest, LLMStreamEvent
 from langley.answering.errors import RunErrorCode, WorkflowFailure
-from langley.answering.tools import CurrentTimeTool, SearchKnowledgeTool, ToolExecutor
+from langley.answering.tools import (
+    AgentTool,
+    CurrentTimeTool,
+    ReadWebpageTool,
+    SearchKnowledgeTool,
+    SearchWebTool,
+    ToolExecutor,
+)
 from langley.answering.tracing import LangSmithTracer, Tracer
+from langley.answering.web import TavilyWebProvider
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.api.conversations import router as conversations_router
 from langley.api.health import router as health_router
@@ -194,9 +202,15 @@ def _workflow_factory_for(
         reranker=_reranker_for(settings),
         reranker_candidate_k=settings.knowledge_reranker_candidate_k,
     )
-    tool_executor = ToolExecutor(
-        tools=(CurrentTimeTool(), SearchKnowledgeTool(retrieval_service))
-    )
+    tools: list[AgentTool] = [
+        CurrentTimeTool(),
+        SearchKnowledgeTool(retrieval_service),
+    ]
+    if settings.web_search_enabled:
+        assert settings.tavily_api_key is not None
+        web_provider = TavilyWebProvider(settings.tavily_api_key.get_secret_value())
+        tools.extend((SearchWebTool(web_provider), ReadWebpageTool(web_provider)))
+    tool_executor = ToolExecutor(tools=tools)
     resolved_tracer = tracer or LangSmithTracer(
         enabled=settings.tracing_enabled,
         project=settings.langsmith_project,

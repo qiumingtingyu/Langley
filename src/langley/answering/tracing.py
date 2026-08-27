@@ -97,7 +97,10 @@ class ToolTrace(Protocol):
     ) -> "KnowledgeSearchTrace": ...
 
     def finish(
-        self, result: ToolResult | None, error_code: str | None = None
+        self,
+        result: ToolResult | None,
+        error_code: str | None = None,
+        metadata: dict[str, JSONValue] | None = None,
     ) -> None: ...
 
 
@@ -441,8 +444,13 @@ class _NoopToolTrace:
         del origin, knowledge_base_id, top_k, query
         return _NoopKnowledgeSearchTrace()
 
-    def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
-        del result, error_code
+    def finish(
+        self,
+        result: ToolResult | None,
+        error_code: str | None = None,
+        metadata: dict[str, JSONValue] | None = None,
+    ) -> None:
+        del result, error_code, metadata
 
 
 class _NoopKnowledgeSearchTrace:
@@ -612,17 +620,24 @@ class _LangSmithToolTrace:
             query=query,
         )
 
-    def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
-        metadata: dict[str, JSONValue] = {
+    def finish(
+        self,
+        result: ToolResult | None,
+        error_code: str | None = None,
+        metadata: dict[str, JSONValue] | None = None,
+    ) -> None:
+        trace_metadata: dict[str, JSONValue] = {
             "tool_duration_ms": round(
                 (datetime.now(UTC) - self._started_at).total_seconds() * 1000,
                 3,
             )
         }
+        if metadata is not None:
+            trace_metadata.update(metadata)
         if result is not None:
-            metadata["tool_result_kind"] = result.kind.value
+            trace_metadata["tool_result_kind"] = result.kind.value
         if error_code is not None:
-            metadata["error_code"] = error_code
+            trace_metadata["error_code"] = error_code
         self._trace._submit(
             "update",
             self._trace._client.update_run,
@@ -634,7 +649,7 @@ class _LangSmithToolTrace:
             ),
             error=error_code,
             end_time=datetime.now(UTC),
-            extra={"metadata": metadata},
+            extra={"metadata": trace_metadata},
         )
 
 

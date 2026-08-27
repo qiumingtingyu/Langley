@@ -18,6 +18,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "semantic-text-splitter>=0.32,<0.33",
     "structlog>=25.0",
+    "tavily-python==0.8.0",
     "tzdata>=2025.2",
     "uvicorn[standard]>=0.30",
 ]

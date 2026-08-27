@@ -36,6 +36,9 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
         "LANGLEY_TRACING_ENABLED",
         "LANGLEY_TRACE_CONTENT_ENABLED",
         "LANGLEY_LANGSMITH_PROJECT",
+        "LANGLEY_WEB_SEARCH_ENABLED",
+        "LANGLEY_TAVILY_API_KEY",
+        "TAVILY_API_KEY",
     ):
         monkeypatch.delenv(variable, raising=False)
 
@@ -75,6 +78,8 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
     assert settings.tracing_enabled is False
     assert settings.trace_content_enabled is False
     assert settings.langsmith_project is None
+    assert settings.web_search_enabled is False
+    assert settings.tavily_api_key is None
 
 
 def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> None:
@@ -104,6 +109,8 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     monkeypatch.setenv("LANGLEY_TRACING_ENABLED", "true")
     monkeypatch.setenv("LANGLEY_TRACE_CONTENT_ENABLED", "true")
     monkeypatch.setenv("LANGLEY_LANGSMITH_PROJECT", "langley-test")
+    monkeypatch.setenv("LANGLEY_WEB_SEARCH_ENABLED", "true")
+    monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
 
     settings = Settings()
 
@@ -134,10 +141,23 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.tracing_enabled is True
     assert settings.trace_content_enabled is True
     assert settings.langsmith_project == "langley-test"
+    assert settings.web_search_enabled is True
+    assert settings.tavily_api_key is not None
+    assert settings.tavily_api_key.get_secret_value() == "test-tavily-key"
     assert "test-qwen-key" not in repr(settings)
     assert "test-qwen-key" not in str(settings)
+    assert "test-tavily-key" not in repr(settings)
+    assert "test-tavily-key" not in str(settings)
 
 
 def test_settings_reject_an_invalid_local_timezone() -> None:
     with pytest.raises(ValueError, match="IANA timezone"):
         Settings(local_timezone="not-a-timezone")
+
+
+def test_settings_reject_enabled_web_search_without_tavily_key(monkeypatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("LANGLEY_TAVILY_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="TAVILY_API_KEY"):
+        Settings(web_search_enabled=True)

@@ -539,7 +539,12 @@ class _CasebookToolTrace:
             query=query,
         )
 
-    def finish(self, result: ToolResult | None, error_code: str | None = None) -> None:
+    def finish(
+        self,
+        result: ToolResult | None,
+        error_code: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
         if self._closed:
             raise RuntimeError("Tool observation is already closed")
         self._closed = True
@@ -553,6 +558,8 @@ class _CasebookToolTrace:
         )
         if self._include_content and result is not None:
             self._observation["result"] = result.content
+        if metadata:
+            self._observation["metadata"] = metadata
 
 
 class _CasebookKnowledgeSearchTrace:

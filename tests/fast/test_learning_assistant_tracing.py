@@ -369,3 +369,59 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
             "success": True,
         }
     }
+
+
+@pytest.mark.anyio
+async def test_web_tool_trace_exports_metadata_without_query_or_evidence_content() -> (
+    None
+):
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.creates: list[dict[str, object]] = []
+            self.updates: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            self.creates.append(kwargs)
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args
+            self.updates.append(kwargs)
+            self.ready.set()
+
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(8, "qwen", "test", False)
+    tool = trace.begin_tool(
+        ToolCall("web-1", "search_web", '{"query":"private query"}'), 1
+    )
+    tool.finish(
+        ToolResult(
+            "web-1",
+            "search_web",
+            ToolResultKind.SUCCESS,
+            "private snippets",
+        ),
+        metadata={
+            "hit_count": 5,
+            "provider_response_time_ms": 200.0,
+            "tavily_provider_reported_credits": 1.0,
+            "provider_request_id": "request-1",
+        },
+    )
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    tool_create = next(
+        item for item in client.creates if item["name"] == "tool.search_web"
+    )
+    update = client.updates[0]
+    assert tool_create["inputs"] == {}
+    assert update["outputs"] == {}
+    metadata = cast(dict[str, object], update["extra"])["metadata"]
+    assert cast(dict[str, object], metadata)["hit_count"] == 5
+    assert cast(dict[str, object], metadata)["tavily_provider_reported_credits"] == 1.0
+    assert "private query" not in repr((client.creates, client.updates))
+    assert "private snippets" not in repr((client.creates, client.updates))

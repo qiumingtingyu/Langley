@@ -38,12 +38,19 @@ from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import INSUFFICIENT_EVIDENCE_ANSWER
 from langley.answering.tools import (
     CurrentTimeTool,
+    ReadWebpageTool,
     SearchKnowledgeTool,
+    SearchWebTool,
     ToolContext,
     ToolExecutionOutput,
     ToolExecutor,
 )
 from langley.answering.tracing import KnowledgeSearchOrigin, Tracer
+from langley.answering.web import (
+    WebExtractResponse,
+    WebSearchResponse,
+    WebSearchResult,
+)
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.knowledge.casebook_baseline import CasebookBaselineTracer
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
@@ -293,6 +300,78 @@ def _rag_executor(service: _FakeRetrievalService) -> ToolExecutor:
             SearchKnowledgeTool(service),  # type: ignore[arg-type]
         )
     )
+
+
+@dataclass
+class _WorkflowWebProvider:
+    search_calls: list[str] = field(default_factory=list)
+    extract_calls: list[tuple[str, str]] = field(default_factory=list)
+
+    async def search(self, query: str) -> WebSearchResponse:
+        self.search_calls.append(query)
+        return WebSearchResponse(
+            results=(
+                WebSearchResult(
+                    title="Official Release",
+                    url="https://official.example.test/releases/1",
+                    domain="official.example.test",
+                    snippet="discovery snippet",
+                    provider_score=0.95,
+                ),
+            ),
+            response_time_seconds=0.2,
+            credits=1.0,
+            request_id="search-request",
+        )
+
+    async def extract(self, url: str, focus: str) -> WebExtractResponse:
+        self.extract_calls.append((url, focus))
+        return WebExtractResponse(
+            contents=("Version 1 was released with the documented feature.",),
+            response_time_seconds=0.3,
+            credits=0.0,
+            request_id="extract-request",
+        )
+
+
+def _web_executor(provider: _WorkflowWebProvider) -> ToolExecutor:
+    return ToolExecutor(tools=(SearchWebTool(provider), ReadWebpageTool(provider)))
+
+
+def _web_rounds(final_content: str) -> list[ScriptedProviderRound]:
+    return [
+        ScriptedProviderRound(
+            events=(
+                _completion(
+                    content="",
+                    tool_calls=(
+                        ToolCall(
+                            "web-search-1",
+                            "search_web",
+                            '{"query":"latest official release"}',
+                        ),
+                    ),
+                    finish_reason=LLMFinishReason.TOOL_CALLS,
+                ),
+            )
+        ),
+        ScriptedProviderRound(
+            events=(
+                _completion(
+                    content="",
+                    tool_calls=(
+                        ToolCall(
+                            "web-read-1",
+                            "read_webpage",
+                            '{"result_id":"W1","focus":"release facts"}',
+                        ),
+                    ),
+                    finish_reason=LLMFinishReason.TOOL_CALLS,
+                ),
+            )
+        ),
+        ScriptedProviderRound(events=(_completion(content=final_content),)),
+    ]
 
 
 @pytest.mark.anyio
@@ -1367,3 +1446,282 @@ async def test_graph_scope_disables_automatic_langsmith_tracing_despite_global_e
 
     assert success.content == "正常回答"
     assert provider.enabled_values == [False]
+
+
+@pytest.mark.anyio
+async def test_web_evidence_citation_is_validated_and_sources_are_appended() -> None:
+    web_provider = _WorkflowWebProvider()
+    llm_provider = FakeProvider(
+        _web_rounds(
+            "Version 1 at https://official.example.test/releases/1 is current [W1:E1]."
+        )
+    )
+
+    result = await _execute_workflow(
+        _workflow(llm_provider, tool_executor=_web_executor(web_provider))
+    )
+
+    assert result.content == (
+        "Version 1 at source W1 is current [W1:E1].\n\n"
+        "来源：\n"
+        "- [W1] Official Release — https://official.example.test/releases/1"
+    )
+    assert result.citations == ()
+    assert web_provider.search_calls == ["latest official release"]
+    assert web_provider.extract_calls == [
+        ("https://official.example.test/releases/1", "release facts")
+    ]
+    assert tuple(tool.name for tool in llm_provider.requests[0].allowed_tools) == (
+        "search_web",
+    )
+    assert "search_web" in llm_provider.requests[0].system_input
+    assert "untrusted external data" in llm_provider.requests[0].system_input
+    assert tuple(tool.name for tool in llm_provider.requests[1].allowed_tools) == (
+        "read_webpage",
+    )
+
+
+@pytest.mark.anyio
+async def test_no_web_use_preserves_an_ordinary_url_unchanged() -> None:
+    content = "User link: [https://example.com](https://example.com)"
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content=content),))]
+    )
+
+    result = await _execute_workflow(
+        _workflow(
+            provider,
+            tool_executor=_web_executor(_WorkflowWebProvider()),
+        )
+    )
+
+    assert result.content == content
+
+
+@pytest.mark.anyio
+async def test_web_final_content_is_exposed_only_after_validation() -> None:
+    raw_content = (
+        "Version 1 at https://official.example.test/releases/1 is current [W1:E1]."
+    )
+    provider = FakeProvider(
+        _web_rounds(raw_content)[:-1]
+        + [
+            ScriptedProviderRound(
+                events=(
+                    AssistantContentDelta(raw_content),
+                    _completion(content=raw_content),
+                )
+            )
+        ]
+    )
+    visible_deltas: list[str] = []
+
+    async def capture_delta(content: str) -> None:
+        visible_deltas.append(content)
+
+    result = await _execute_workflow(
+        _workflow(
+            provider,
+            tool_executor=_web_executor(_WorkflowWebProvider()),
+        ),
+        on_assistant_delta=capture_delta,
+    )
+
+    assert visible_deltas == [result.content]
+    assert "source W1" in visible_deltas[0]
+    assert "https://official.example.test/releases/1" in visible_deltas[0]
+
+
+@pytest.mark.anyio
+async def test_invalid_web_final_is_never_exposed_as_a_partial_result() -> None:
+    invalid_content = "Fabricated https://fabricated.example.test [W9:E1]."
+    provider = FakeProvider(
+        _web_rounds(invalid_content)[:-1]
+        + [
+            ScriptedProviderRound(
+                events=(
+                    AssistantContentDelta(invalid_content),
+                    _completion(content=invalid_content),
+                )
+            )
+        ]
+    )
+    visible_deltas: list[str] = []
+
+    async def capture_delta(content: str) -> None:
+        visible_deltas.append(content)
+
+    with pytest.raises(WorkflowFailure):
+        await _execute_workflow(
+            _workflow(
+                provider,
+                tool_executor=_web_executor(_WorkflowWebProvider()),
+            ),
+            on_assistant_delta=capture_delta,
+        )
+
+    assert visible_deltas == []
+
+
+@pytest.mark.anyio
+async def test_search_and_dependent_read_cannot_share_one_tool_batch() -> None:
+    web_provider = _WorkflowWebProvider()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall(
+                                "web-search-1",
+                                "search_web",
+                                '{"query":"latest official release"}',
+                            ),
+                            ToolCall(
+                                "web-read-1",
+                                "read_webpage",
+                                '{"result_id":"W1","focus":"release facts"}',
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(WorkflowFailure) as error:
+        await _execute_workflow(
+            _workflow(provider, tool_executor=_web_executor(web_provider))
+        )
+
+    assert error.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert web_provider.search_calls == []
+    assert web_provider.extract_calls == []
+
+
+@pytest.mark.anyio
+async def test_web_enabled_run_neutralizes_historical_web_handles() -> None:
+    context = AnswerContext(
+        completed_turns=(
+            CompletedTurn(
+                user_content="previous",
+                assistant_content="Earlier evidence [W1:E2].",
+                estimated_tokens=6,
+            ),
+        ),
+        current_user_content="current",
+    )
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
+    )
+
+    await _execute_workflow(
+        _workflow(
+            provider,
+            context_builder=cast(AnswerContextBuilder, _StaticContextBuilder(context)),
+            tool_executor=_web_executor(_WorkflowWebProvider()),
+        )
+    )
+
+    historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
+    assert historical.content == ("Earlier evidence <HISTORICAL_WEB_CITATION:W1:E2>.")
+
+
+@pytest.mark.anyio
+async def test_fabricated_web_evidence_citation_is_rejected() -> None:
+    provider = FakeProvider(_web_rounds("Unsupported claim [W2:E1]."))
+
+    with pytest.raises(WorkflowFailure) as error:
+        await _execute_workflow(
+            _workflow(
+                provider,
+                tool_executor=_web_executor(_WorkflowWebProvider()),
+            )
+        )
+
+    assert error.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert (
+        error.value.invalid_response_subtype
+        is InvalidResponseSubtype.UNKNOWN_CITATION_HANDLE
+    )
+
+
+@pytest.mark.anyio
+async def test_unregistered_model_generated_web_url_is_rejected() -> None:
+    provider = FakeProvider(
+        _web_rounds("Unsupported https://fabricated.example.test [W1:E1].")
+    )
+
+    with pytest.raises(WorkflowFailure) as error:
+        await _execute_workflow(
+            _workflow(
+                provider,
+                tool_executor=_web_executor(_WorkflowWebProvider()),
+            )
+        )
+
+    assert error.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert (
+        error.value.invalid_response_subtype
+        is InvalidResponseSubtype.UNKNOWN_CITATION_HANDLE
+    )
+
+
+@pytest.mark.anyio
+async def test_successful_web_read_requires_a_web_evidence_citation() -> None:
+    provider = FakeProvider(_web_rounds("Unsupported claim without a citation."))
+
+    with pytest.raises(WorkflowFailure) as error:
+        await _execute_workflow(
+            _workflow(
+                provider,
+                tool_executor=_web_executor(_WorkflowWebProvider()),
+            )
+        )
+
+    assert error.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert (
+        error.value.invalid_response_subtype
+        is InvalidResponseSubtype.MISSING_REQUIRED_CITATION
+    )
+
+
+@pytest.mark.anyio
+async def test_disabled_web_tools_are_not_exposed_to_the_model() -> None:
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
+    )
+
+    await _execute_workflow(_workflow(provider))
+
+    assert all(
+        tool.name not in {"search_web", "read_webpage"}
+        for tool in provider.requests[0].allowed_tools
+    )
+    assert "search_web" not in provider.requests[0].system_input
+    assert "read_webpage" not in provider.requests[0].system_input
+
+
+@pytest.mark.anyio
+async def test_required_grounding_never_exposes_or_calls_web_tools() -> None:
+    web_provider = _WorkflowWebProvider()
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="Grounded [K1]."),))]
+    )
+
+    result = await _execute_workflow(
+        _workflow(
+            provider,
+            tool_executor=_web_executor(web_provider),
+            retrieval_service=_FakeRetrievalService(),
+        ),
+        knowledge_base_id=5,
+        grounding_policy=GroundingPolicy.REQUIRED,
+    )
+
+    assert result.content == "Grounded [K1]."
+    assert provider.requests[0].allowed_tools == ()
+    assert web_provider.search_calls == []
+    assert web_provider.extract_calls == []

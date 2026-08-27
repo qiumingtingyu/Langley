@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogFormat = Literal["console", "json"]
@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     tracing_enabled: bool = False
     trace_content_enabled: bool = False
     langsmith_project: str | None = None
+    web_search_enabled: bool = False
+    tavily_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "TAVILY_API_KEY", "LANGLEY_TAVILY_API_KEY", "tavily_api_key"
+        ),
+    )
 
     @field_validator("local_timezone")
     @classmethod
@@ -65,3 +72,10 @@ class Settings(BaseSettings):
         except ZoneInfoNotFoundError as error:
             raise ValueError("local_timezone must be a valid IANA timezone") from error
         return value
+
+    @model_validator(mode="after")
+    def enabled_web_search_requires_tavily_key(self) -> "Settings":
+        """Fail at startup instead of exposing a misconfigured capability."""
+        if self.web_search_enabled and self.tavily_api_key is None:
+            raise ValueError("TAVILY_API_KEY is required when Web search is enabled")
+        return self
