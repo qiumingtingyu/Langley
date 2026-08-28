@@ -13,7 +13,7 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.models import Memory, Message, User
 from langley.main import create_app
-from langley.memory.policy import MemoryPolicy
+from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
 from langley.settings import Settings
 
 
@@ -78,6 +78,7 @@ def test_create_app_constructs_no_memory_policy_without_model() -> None:
     )
 
     assert not hasattr(app.state, "memory_policy")
+    assert app.state.memory_policy_status is MemoryPolicyStatus.NOT_CONFIGURED
 
 
 def test_create_app_constructs_configured_memory_policy() -> None:
@@ -91,6 +92,25 @@ def test_create_app_constructs_configured_memory_policy() -> None:
     )
 
     assert isinstance(app.state.memory_policy, MemoryPolicy)
+    assert app.state.memory_policy_status is MemoryPolicyStatus.READY
+
+
+def test_create_app_reports_unavailable_memory_provider_configuration() -> None:
+    app = create_app(
+        Settings(
+            database_url="mysql+asyncmy://root:password@127.0.0.1:3306/langley",
+            memory_policy_model="qwen3.7-plus-2026-05-26",
+            memory_policy_estimated_token_budget=24_576,
+            qwen_api_key=None,
+            qwen_base_url=None,
+        )
+    )
+
+    assert isinstance(app.state.memory_policy, MemoryPolicy)
+    assert (
+        app.state.memory_policy_status
+        is MemoryPolicyStatus.PROVIDER_CONFIGURATION_UNAVAILABLE
+    )
 
 
 def test_memory_orm_metadata_matches_the_persistence_contract() -> None:

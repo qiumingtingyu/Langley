@@ -48,7 +48,7 @@ from langley.knowledge.index_build import (
 from langley.knowledge.reranking import LocalBGEReranker, Reranker
 from langley.knowledge.retrieval_service import KnowledgeRetrievalService
 from langley.memory.events import MemoryEventSubscribers
-from langley.memory.policy import MemoryPolicy
+from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
 from langley.memory.processing import (
     BACKGROUND_BATCH_LIMIT,
     PRE_ANSWER_CATCHUP_LIMIT,
@@ -105,6 +105,18 @@ def _memory_provider_for(
         base_url=settings.qwen_base_url,
         model=settings.memory_policy_model,
     )
+
+
+def _memory_policy_status_for(
+    settings: Settings, provider: LLMProvider | None
+) -> MemoryPolicyStatus:
+    """Describe static readiness from the provider built by composition."""
+
+    if settings.memory_policy_model is None:
+        return MemoryPolicyStatus.NOT_CONFIGURED
+    if provider is None or isinstance(provider, _UnavailableProvider):
+        return MemoryPolicyStatus.PROVIDER_CONFIGURATION_UNAVAILABLE
+    return MemoryPolicyStatus.READY
 
 
 def _conversation_compactor_provider_for(
@@ -336,6 +348,9 @@ def create_app(
         configured_provider = _provider_for(resolved_settings, provider)
         configured_memory_provider = _memory_provider_for(
             resolved_settings, memory_provider
+        )
+        app.state.memory_policy_status = _memory_policy_status_for(
+            resolved_settings, configured_memory_provider
         )
         configured_compactor_provider = _conversation_compactor_provider_for(
             resolved_settings,

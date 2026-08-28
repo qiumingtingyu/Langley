@@ -12,7 +12,9 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 
 from langley.answering.contracts import LLMFinishReason, LLMResponseCompleted
-from langley.answering.fake_provider import FakeProvider
+from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
+from langley.api.responses import as_utc
 from langley.bootstrap import bootstrap_local_user
 from langley.business_time import utc_now
 from langley.infrastructure.database import (
@@ -24,6 +26,8 @@ from langley.infrastructure.models import Conversation, Memory, Message, User
 from langley.main import create_app
 from langley.memory.policy import estimate_load_all_memory_contribution
 from langley.settings import Settings
+
+from ._support import _completion, _insert_memory, _scalar
 
 
 @pytest.fixture
@@ -45,6 +49,8 @@ def _settings(
         environment="test",
         database_url=database_url,
         local_user_id=1,
+        qwen_api_key=None,
+        qwen_base_url=None,
         memory_policy_model="test-memory-policy" if configured else None,
         memory_policy_estimated_token_budget=(
             estimated_token_budget if configured else None
@@ -52,12 +58,249 @@ def _settings(
     )
 
 
-def _bootstrap(database_url: str, *, estimated_token_budget: int = 10_000) -> None:
+def _bootstrap(
+    database_url: str,
+    *,
+    configured: bool = True,
+    estimated_token_budget: int = 10_000,
+) -> None:
     assert asyncio.run(
         bootstrap_local_user(
-            _settings(database_url, estimated_token_budget=estimated_token_budget)
+            _settings(
+                database_url,
+                configured=configured,
+                estimated_token_budget=estimated_token_budget,
+            )
         )
     )
+
+
+def _seed_pending_evidence(
+    database_url: str,
+    conversations: list[tuple[list[str], bool]],
+) -> list[tuple[int, datetime]]:
+    async def seed() -> list[tuple[int, datetime]]:
+        engine = create_database_engine(database_url)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session, session.begin():
+                base = utc_now().replace(microsecond=0)
+                facts: list[tuple[int, datetime]] = []
+                offset = 0
+                for contents, deleted in conversations:
+                    conversation = Conversation(
+                        user_id=1,
+                        title=None,
+                        created_at=base,
+                        updated_at=base,
+                        last_message_at=base,
+                        deleted_at=base if deleted else None,
+                    )
+                    session.add(conversation)
+                    await session.flush()
+                    for sequence_no, content in enumerate(contents, start=1):
+                        created_at = base + timedelta(seconds=offset)
+                        offset += 1
+                        message = Message(
+                            conversation_id=conversation.id,
+                            sequence_no=sequence_no,
+                            role="USER",
+                            content=content,
+                            run_id=None,
+                            regenerated_from_message_id=None,
+                            created_at=created_at,
+                        )
+                        session.add(message)
+                        await session.flush()
+                        facts.append((message.id, created_at))
+                return facts
+        finally:
+            await dispose_database_engine(engine)
+
+    return asyncio.run(seed())
+
+
+def test_memory_status_and_empty_sync_do_not_require_policy(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database, configured=False)
+    app = create_app(_settings(migrated_database, configured=False))
+
+    with TestClient(app) as client:
+        assert client.get("/api/memory-status").json() == {
+            "auto_memory_enabled": True,
+            "policy_status": "NOT_CONFIGURED",
+            "pending_evidence_count": 0,
+            "oldest_pending_message_id": None,
+            "oldest_pending_created_at": None,
+        }
+        response = client.post("/api/memory-sync")
+        assert response.status_code == 200
+        assert response.json() == {
+            "processed_count": 0,
+            "remaining_count": 0,
+            "complete": True,
+            "stop_reason": "COMPLETE",
+            "oldest_pending_message_id": None,
+            "oldest_pending_created_at": None,
+        }
+
+
+def test_memory_status_and_explicit_sync_progress_are_user_global(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    facts = _seed_pending_evidence(
+        migrated_database,
+        [(["one", "two"], True), (["three", "four", "five"], False)],
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            )
+            for _ in range(5)
+        ]
+    )
+    app = create_app(_settings(migrated_database), memory_provider=provider)
+
+    with TestClient(app) as client:
+        assert client.get("/api/memory-status").json() == {
+            "auto_memory_enabled": True,
+            "policy_status": "READY",
+            "pending_evidence_count": 5,
+            "oldest_pending_message_id": facts[0][0],
+            "oldest_pending_created_at": as_utc(facts[0][1]),
+        }
+
+        first = client.post("/api/memory-sync")
+        assert first.status_code == 200
+        assert first.json() == {
+            "processed_count": 4,
+            "remaining_count": 1,
+            "complete": False,
+            "stop_reason": "LIMIT_REACHED",
+            "oldest_pending_message_id": facts[4][0],
+            "oldest_pending_created_at": as_utc(facts[4][1]),
+        }
+        assert (
+            _scalar(
+                migrated_database,
+                "SELECT COUNT(*) FROM messages WHERE memory_processed_at IS NOT NULL",
+            )
+            == 4
+        )
+
+        second = client.post("/api/memory-sync")
+        assert second.status_code == 200
+        assert second.json() == {
+            "processed_count": 1,
+            "remaining_count": 0,
+            "complete": True,
+            "stop_reason": "COMPLETE",
+            "oldest_pending_message_id": None,
+            "oldest_pending_created_at": None,
+        }
+        assert (
+            _scalar(
+                migrated_database,
+                "SELECT COUNT(*) FROM messages WHERE memory_processed_at IS NOT NULL",
+            )
+            == 5
+        )
+
+        no_backlog = client.post("/api/memory-sync")
+        assert no_backlog.status_code == 200
+        assert no_backlog.json()["processed_count"] == 0
+        assert no_backlog.json()["stop_reason"] == "COMPLETE"
+        assert len(provider.requests) == 5
+
+
+def test_memory_sync_unavailable_provider_configuration_preserves_pending(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    facts = _seed_pending_evidence(migrated_database, [(["pending"], False)])
+    app = create_app(_settings(migrated_database))
+
+    with TestClient(app) as client:
+        assert (
+            client.get("/api/memory-status").json()["policy_status"]
+            == "PROVIDER_CONFIGURATION_UNAVAILABLE"
+        )
+        response = client.post("/api/memory-sync")
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_UNAVAILABLE",
+                "stop_reason": "POLICY_UNAVAILABLE",
+                "processed_count": 0,
+                "remaining_count": 1,
+            }
+        }
+        status_response = client.get("/api/memory-status").json()
+        assert status_response["pending_evidence_count"] == 1
+        assert status_response["oldest_pending_message_id"] == facts[0][0]
+
+
+def test_memory_sync_provider_failure_preserves_pending(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    _seed_pending_evidence(migrated_database, [(["pending"], False)])
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(), failure=WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED)
+            )
+        ]
+    )
+    app = create_app(_settings(migrated_database), memory_provider=provider)
+
+    with TestClient(app) as client:
+        response = client.post("/api/memory-sync")
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_UNAVAILABLE",
+                "stop_reason": "PROVIDER_FAILURE",
+                "processed_count": 0,
+                "remaining_count": 1,
+            }
+        }
+        assert client.get("/api/memory-status").json()["pending_evidence_count"] == 1
+
+
+def test_memory_sync_context_infeasible_is_distinct_and_preserves_pending(
+    migrated_database: str,
+) -> None:
+    budget = estimate_load_all_memory_contribution(["existing"]) - 1
+    _bootstrap(migrated_database, estimated_token_budget=budget)
+    _seed_pending_evidence(migrated_database, [(["pending"], False)])
+    _insert_memory(migrated_database, content="existing")
+    provider = FakeProvider([])
+    app = create_app(
+        _settings(migrated_database, estimated_token_budget=budget),
+        memory_provider=provider,
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/api/memory-sync")
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_BLOCKED",
+                "stop_reason": "CONTEXT_INFEASIBLE",
+                "processed_count": 0,
+                "remaining_count": 1,
+            }
+        }
+        assert client.get("/api/memory-status").json()["pending_evidence_count"] == 1
+        assert provider.requests == []
 
 
 def test_memory_api_crud_validation_and_settings(migrated_database: str) -> None:

@@ -8,6 +8,7 @@ response before a later task decides whether and how to persist it.
 import json
 from collections.abc import Iterable
 from datetime import datetime
+from enum import StrEnum
 from typing import Literal, Self
 
 from pydantic import (
@@ -106,6 +107,14 @@ class MemoryPolicyContextInfeasibleError(RuntimeError):
 
 class MemoryPolicyInvalidOutputError(RuntimeError):
     """A normally completed provider response failed whole-result validation."""
+
+
+class MemoryPolicyStatus(StrEnum):
+    """Static composition readiness for semantic Memory processing."""
+
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    READY = "READY"
+    PROVIDER_CONFIGURATION_UNAVAILABLE = "PROVIDER_CONFIGURATION_UNAVAILABLE"
 
 
 class _FrozenPolicyModel(BaseModel):

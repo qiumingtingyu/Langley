@@ -4,11 +4,13 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import Literal, cast
 
 import structlog
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
 from langley.answering.errors import WorkflowFailure
 from langley.business_time import utc_naive_to_local_reference, utc_now
@@ -44,13 +46,42 @@ class MemoryCapacityReachedError(RuntimeError):
     """A direct write would exceed the configured Load-All capacity."""
 
 
+class MemoryProcessingStopReason(StrEnum):
+    """Content-free reason one bounded processing invocation stopped."""
+
+    COMPLETE = "COMPLETE"
+    LIMIT_REACHED = "LIMIT_REACHED"
+    POLICY_UNAVAILABLE = "POLICY_UNAVAILABLE"
+    PROVIDER_FAILURE = "PROVIDER_FAILURE"
+    CONTEXT_INFEASIBLE = "CONTEXT_INFEASIBLE"
+    TIMEOUT = "TIMEOUT"
+
+
 @dataclass(frozen=True)
 class MemoryProcessingResult:
     """The finite result of processing a canonical USER prefix."""
 
     processed_count: int
     complete: bool
+    stop_reason: MemoryProcessingStopReason
     outcomes: tuple[MemoryOutcome, ...] = ()
+
+
+@dataclass(frozen=True)
+class PendingMemoryEvidenceStatus:
+    """Durable/rebuildable pending canonical USER evidence facts."""
+
+    pending_evidence_count: int
+    oldest_pending_message_id: int | None
+    oldest_pending_created_at: datetime | None
+
+
+@dataclass(frozen=True)
+class MemorySyncResult:
+    """One bounded explicit sync result plus its captured-prefix remainder."""
+
+    processing: MemoryProcessingResult
+    pending: PendingMemoryEvidenceStatus
 
 
 @dataclass(frozen=True)
@@ -79,7 +110,11 @@ async def process_memory_through(
     """Process the oldest-first finite canonical USER prefix under one local lane."""
 
     if through_message_id is None:
-        return MemoryProcessingResult(processed_count=0, complete=True)
+        return MemoryProcessingResult(
+            processed_count=0,
+            complete=True,
+            stop_reason=MemoryProcessingStopReason.COMPLETE,
+        )
     if limit < 1:
         raise ValueError("limit must be positive")
     async with lane:
@@ -91,21 +126,7 @@ async def process_memory_through(
             local_timezone=local_timezone,
             limit=limit,
         )
-    if outcome_callback is None:
-        return MemoryProcessingResult(
-            processed_count=result.processed_count, complete=result.complete
-        )
-    for outcome in result.outcomes:
-        try:
-            outcome_callback(outcome)
-        except Exception:
-            logger.exception(
-                "memory.outcome_publish_failed",
-                outcome_kind=outcome.kind,
-                conversation_id=outcome.conversation_id,
-                source_message_id=outcome.source_message_id,
-            )
-    return result
+    return _publish_processing_outcomes(result, outcome_callback)
 
 
 async def capture_memory_high_water(
@@ -114,6 +135,113 @@ async def capture_memory_high_water(
     """Capture one User-serialized finite canonical USER boundary."""
 
     return await _capture_canonical_boundary(session_factory, user_id)
+
+
+async def get_pending_memory_evidence_status(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    through_message_id: int | None = None,
+) -> PendingMemoryEvidenceStatus:
+    """Read count and oldest identity from the production canonical predicate."""
+
+    conditions = list(_pending_evidence_conditions(user_id))
+    if through_message_id is not None:
+        conditions.append(Message.id <= through_message_id)
+    row = (
+        await session.execute(
+            select(
+                Message.id.label("oldest_pending_message_id"),
+                Message.created_at.label("oldest_pending_created_at"),
+                func.count(Message.id).over().label("pending_evidence_count"),
+            )
+            .join(Conversation, Message.conversation_id == Conversation.id)
+            .where(*conditions)
+            .order_by(Message.id.asc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if row is None:
+        return PendingMemoryEvidenceStatus(
+            pending_evidence_count=0,
+            oldest_pending_message_id=None,
+            oldest_pending_created_at=None,
+        )
+    return PendingMemoryEvidenceStatus(
+        pending_evidence_count=row.pending_evidence_count,
+        oldest_pending_message_id=row.oldest_pending_message_id,
+        oldest_pending_created_at=row.oldest_pending_created_at,
+    )
+
+
+async def synchronize_memory(
+    session_factory: SessionFactory,
+    *,
+    user_id: int,
+    policy: MemoryPolicy | None,
+    local_timezone: str,
+    lane: asyncio.Lock,
+    outcome_callback: Callable[[MemoryOutcome], None] | None = None,
+) -> MemorySyncResult:
+    """Process one captured batch without adding durable operational state."""
+
+    async with lane:
+        boundary = await _capture_canonical_boundary(session_factory, user_id)
+        before = await _pending_status_from_factory(
+            session_factory,
+            user_id=user_id,
+            through_message_id=boundary,
+        )
+        if before.pending_evidence_count == 0:
+            processing = MemoryProcessingResult(
+                processed_count=0,
+                complete=True,
+                stop_reason=MemoryProcessingStopReason.COMPLETE,
+            )
+            remaining = before
+        elif policy is None:
+            processing = MemoryProcessingResult(
+                processed_count=0,
+                complete=False,
+                stop_reason=MemoryProcessingStopReason.POLICY_UNAVAILABLE,
+            )
+            remaining = before
+        else:
+            try:
+                async with asyncio.timeout(MANUAL_SYNC_TIMEOUT_SECONDS):
+                    processing = await _process_memory_through_locked(
+                        session_factory,
+                        user_id=user_id,
+                        through_message_id=boundary,
+                        policy=policy,
+                        local_timezone=local_timezone,
+                        limit=MANUAL_SYNC_LIMIT,
+                    )
+            except TimeoutError:
+                remaining = await _pending_status_from_factory(
+                    session_factory,
+                    user_id=user_id,
+                    through_message_id=boundary,
+                )
+                processing = MemoryProcessingResult(
+                    processed_count=max(
+                        0,
+                        before.pending_evidence_count
+                        - remaining.pending_evidence_count,
+                    ),
+                    complete=False,
+                    stop_reason=MemoryProcessingStopReason.TIMEOUT,
+                )
+            else:
+                remaining = await _pending_status_from_factory(
+                    session_factory,
+                    user_id=user_id,
+                    through_message_id=boundary,
+                )
+    return MemorySyncResult(
+        processing=_publish_processing_outcomes(processing, outcome_callback),
+        pending=remaining,
+    )
 
 
 async def add_memory_direct(
@@ -311,7 +439,11 @@ async def _process_memory_through_locked(
     limit: int,
 ) -> MemoryProcessingResult:
     if through_message_id is None:
-        return MemoryProcessingResult(processed_count=0, complete=True)
+        return MemoryProcessingResult(
+            processed_count=0,
+            complete=True,
+            stop_reason=MemoryProcessingStopReason.COMPLETE,
+        )
     processed_count = 0
     outcomes: list[MemoryOutcome] = []
     while processed_count < limit:
@@ -323,7 +455,10 @@ async def _process_memory_through_locked(
         )
         if evidence is None:
             return MemoryProcessingResult(
-                processed_count=processed_count, complete=True, outcomes=tuple(outcomes)
+                processed_count=processed_count,
+                complete=True,
+                stop_reason=MemoryProcessingStopReason.COMPLETE,
+                outcomes=tuple(outcomes),
             )
         try:
             result = await policy.decide(evidence.policy_input)
@@ -347,23 +482,29 @@ async def _process_memory_through_locked(
                     )
                 )
             continue
-        except (
-            WorkflowFailure,
-            MemoryPolicyUnavailableError,
-            MemoryPolicyContextInfeasibleError,
-        ):
-            outcomes.append(
-                MemoryOutcome(
-                    user_id=user_id,
-                    conversation_id=evidence.conversation_id,
-                    source_message_id=evidence.policy_input.evidence_message_id,
-                    kind="retry_pending",
-                )
-            )
-            return MemoryProcessingResult(
+        except WorkflowFailure:
+            return _failed_processing_result(
+                user_id=user_id,
+                evidence=evidence,
                 processed_count=processed_count,
-                complete=False,
-                outcomes=tuple(outcomes),
+                outcomes=outcomes,
+                stop_reason=MemoryProcessingStopReason.PROVIDER_FAILURE,
+            )
+        except MemoryPolicyUnavailableError:
+            return _failed_processing_result(
+                user_id=user_id,
+                evidence=evidence,
+                processed_count=processed_count,
+                outcomes=outcomes,
+                stop_reason=MemoryProcessingStopReason.POLICY_UNAVAILABLE,
+            )
+        except MemoryPolicyContextInfeasibleError:
+            return _failed_processing_result(
+                user_id=user_id,
+                evidence=evidence,
+                processed_count=processed_count,
+                outcomes=outcomes,
+                stop_reason=MemoryProcessingStopReason.CONTEXT_INFEASIBLE,
             )
 
         outcome = await _apply_policy_result(
@@ -426,6 +567,11 @@ async def _process_memory_through_locked(
     return MemoryProcessingResult(
         processed_count=processed_count,
         complete=not remaining,
+        stop_reason=(
+            MemoryProcessingStopReason.LIMIT_REACHED
+            if remaining
+            else MemoryProcessingStopReason.COMPLETE
+        ),
         outcomes=tuple(outcomes),
     )
 
@@ -444,11 +590,8 @@ async def _load_oldest_evidence(
             select(Message)
             .join(Conversation, Message.conversation_id == Conversation.id)
             .where(
-                Conversation.user_id == user_id,
+                *_pending_evidence_conditions(user_id),
                 Message.id <= through_message_id,
-                Message.role == "USER",
-                Message.regenerated_from_message_id.is_(None),
-                Message.memory_processed_at.is_(None),
             )
             .order_by(Message.id.asc())
             .limit(1)
@@ -678,16 +821,83 @@ async def _has_unprocessed_evidence(
                 select(Message.id)
                 .join(Conversation, Message.conversation_id == Conversation.id)
                 .where(
-                    Conversation.user_id == user_id,
+                    *_pending_evidence_conditions(user_id),
                     Message.id <= through_message_id,
-                    Message.role == "USER",
-                    Message.regenerated_from_message_id.is_(None),
-                    Message.memory_processed_at.is_(None),
                 )
                 .order_by(Message.id.asc())
                 .limit(1)
             )
         )
+
+
+async def _pending_status_from_factory(
+    session_factory: SessionFactory,
+    *,
+    user_id: int,
+    through_message_id: int | None,
+) -> PendingMemoryEvidenceStatus:
+    async with session_factory() as session:
+        return await get_pending_memory_evidence_status(
+            session,
+            user_id=user_id,
+            through_message_id=through_message_id,
+        )
+
+
+def _pending_evidence_conditions(user_id: int) -> tuple[ColumnElement[bool], ...]:
+    return (
+        Conversation.user_id == user_id,
+        Message.role == "USER",
+        Message.regenerated_from_message_id.is_(None),
+        Message.memory_processed_at.is_(None),
+    )
+
+
+def _failed_processing_result(
+    *,
+    user_id: int,
+    evidence: _DetachedEvidence,
+    processed_count: int,
+    outcomes: list[MemoryOutcome],
+    stop_reason: MemoryProcessingStopReason,
+) -> MemoryProcessingResult:
+    outcomes.append(
+        MemoryOutcome(
+            user_id=user_id,
+            conversation_id=evidence.conversation_id,
+            source_message_id=evidence.policy_input.evidence_message_id,
+            kind="retry_pending",
+        )
+    )
+    return MemoryProcessingResult(
+        processed_count=processed_count,
+        complete=False,
+        stop_reason=stop_reason,
+        outcomes=tuple(outcomes),
+    )
+
+
+def _publish_processing_outcomes(
+    result: MemoryProcessingResult,
+    outcome_callback: Callable[[MemoryOutcome], None] | None,
+) -> MemoryProcessingResult:
+    if outcome_callback is None:
+        return MemoryProcessingResult(
+            processed_count=result.processed_count,
+            complete=result.complete,
+            stop_reason=result.stop_reason,
+        )
+    for outcome in result.outcomes:
+        try:
+            outcome_callback(outcome)
+        except Exception:
+            logger.exception(
+                "memory.outcome_publish_failed",
+                outcome_kind=outcome.kind,
+                conversation_id=outcome.conversation_id,
+                source_message_id=outcome.source_message_id,
+            )
+    return result
 
 
 async def _capture_canonical_boundary(

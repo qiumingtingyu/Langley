@@ -15,6 +15,7 @@ from langley.api.dependencies import (
     get_current_user_id,
     get_memory_lane,
     get_memory_policy,
+    get_memory_policy_status,
     get_memory_subscribers,
     get_session,
     get_session_factory,
@@ -24,14 +25,17 @@ from langley.api.responses import as_optional_utc, as_utc, message_response
 from langley.business_time import normalize_aware_datetime_to_utc_naive, utc_now
 from langley.infrastructure.models import Memory, User
 from langley.memory.events import MemoryEventSubscribers, MemoryOutcome
-from langley.memory.policy import MemoryPolicy
+from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
 from langley.memory.processing import (
     MemoryCapacityReachedError,
+    MemoryProcessingStopReason,
     MemorySynchronizationUnavailableError,
     add_memory_direct,
     correct_memory_direct,
     forget_memory_direct,
+    get_pending_memory_evidence_status,
     set_auto_memory_enabled,
+    synchronize_memory,
 )
 from langley.memory.reads import (
     get_memory_source_context,
@@ -67,6 +71,23 @@ class MemoryResponse(BaseModel):
 
 class MemorySettingsResponse(BaseModel):
     auto_memory_enabled: bool
+
+
+class MemoryOperationalStatusResponse(BaseModel):
+    auto_memory_enabled: bool
+    policy_status: MemoryPolicyStatus
+    pending_evidence_count: int
+    oldest_pending_message_id: int | None
+    oldest_pending_created_at: str | None
+
+
+class MemorySyncResponse(BaseModel):
+    processed_count: int
+    remaining_count: int
+    complete: bool
+    stop_reason: MemoryProcessingStopReason
+    oldest_pending_message_id: int | None
+    oldest_pending_created_at: str | None
 
 
 class DirectMemorySourceResponse(BaseModel):
@@ -264,6 +285,73 @@ async def get_memory_settings(
     user = await session.get(User, current_user_id)
     assert user is not None
     return MemorySettingsResponse(auto_memory_enabled=user.auto_memory_enabled)
+
+
+@router.get("/api/memory-status", response_model=MemoryOperationalStatusResponse)
+async def get_memory_status(
+    session: AsyncSession = Depends(get_session),
+    policy_status: MemoryPolicyStatus = Depends(get_memory_policy_status),
+    current_user_id: int = Depends(get_current_user_id),
+) -> MemoryOperationalStatusResponse:
+    user = await session.get(User, current_user_id)
+    assert user is not None
+    pending = await get_pending_memory_evidence_status(session, user_id=current_user_id)
+    return MemoryOperationalStatusResponse(
+        auto_memory_enabled=user.auto_memory_enabled,
+        policy_status=policy_status,
+        pending_evidence_count=pending.pending_evidence_count,
+        oldest_pending_message_id=pending.oldest_pending_message_id,
+        oldest_pending_created_at=as_optional_utc(pending.oldest_pending_created_at),
+    )
+
+
+@router.post("/api/memory-sync", response_model=MemorySyncResponse)
+async def post_memory_sync(
+    settings: Settings = Depends(get_settings),
+    session_factory=Depends(get_session_factory),
+    policy: MemoryPolicy | None = Depends(get_memory_policy),
+    policy_status: MemoryPolicyStatus = Depends(get_memory_policy_status),
+    lane: asyncio.Lock = Depends(get_memory_lane),
+    subscribers: MemoryEventSubscribers = Depends(get_memory_subscribers),
+    current_user_id: int = Depends(get_current_user_id),
+) -> MemorySyncResponse:
+    sync = await synchronize_memory(
+        session_factory,
+        user_id=current_user_id,
+        policy=policy if policy_status is MemoryPolicyStatus.READY else None,
+        local_timezone=settings.local_timezone,
+        lane=lane,
+        outcome_callback=subscribers.publish,
+    )
+    response = MemorySyncResponse(
+        processed_count=sync.processing.processed_count,
+        remaining_count=sync.pending.pending_evidence_count,
+        complete=sync.processing.complete,
+        stop_reason=sync.processing.stop_reason,
+        oldest_pending_message_id=sync.pending.oldest_pending_message_id,
+        oldest_pending_created_at=as_optional_utc(
+            sync.pending.oldest_pending_created_at
+        ),
+    )
+    if response.stop_reason in {
+        MemoryProcessingStopReason.COMPLETE,
+        MemoryProcessingStopReason.LIMIT_REACHED,
+    }:
+        return response
+    detail = {
+        "stop_reason": response.stop_reason.value,
+        "processed_count": response.processed_count,
+        "remaining_count": response.remaining_count,
+    }
+    if response.stop_reason is MemoryProcessingStopReason.CONTEXT_INFEASIBLE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "MEMORY_SYNC_BLOCKED", **detail},
+        )
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={"code": "MEMORY_SYNC_UNAVAILABLE", **detail},
+    )
 
 
 @router.patch("/api/memory-settings", response_model=MemorySettingsResponse)

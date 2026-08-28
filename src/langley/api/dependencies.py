@@ -10,7 +10,7 @@ from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.models import User
 from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
 from langley.memory.events import MemoryEventSubscribers
-from langley.memory.policy import MemoryPolicy
+from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
 
 
 def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
@@ -61,6 +61,10 @@ def get_local_file_storage(request: Request) -> LocalFileStorage:
 
 def get_memory_policy(request: Request) -> MemoryPolicy | None:
     return getattr(request.app.state, "memory_policy", None)
+
+
+def get_memory_policy_status(request: Request) -> MemoryPolicyStatus:
+    return request.app.state.memory_policy_status
 
 
 def get_memory_lane(request: Request):
