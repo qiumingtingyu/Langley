@@ -49,6 +49,10 @@ class _GatePolicy(MemoryPolicy):
         self.release = asyncio.Event()
         self.inputs: list[MemoryPolicyInput] = []
 
+    @property
+    def estimated_token_budget(self) -> int:
+        return 10_000
+
     async def decide(self, policy_input: MemoryPolicyInput) -> MemoryPolicyResult:
         self.inputs.append(policy_input)
         if len(self.inputs) == 1:

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import event
 from sqlalchemy.orm import Session
 
-from langley.answering.fake_provider import ScriptedProviderRound
+from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
 from langley.business_time import utc_now
 from langley.infrastructure.database import (
     create_database_engine,
@@ -15,10 +15,12 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.models import Memory
+from langley.memory.events import MemoryOutcome
 from langley.memory.policy import (
     MemoryPolicy,
     MemoryPolicyInput,
     MemoryPolicyResult,
+    estimate_load_all_memory_contribution,
 )
 from langley.memory.processing import (
     process_memory_through,
@@ -48,6 +50,10 @@ class _GatePolicy(MemoryPolicy):
         self.release = asyncio.Event()
         self.inputs: list[MemoryPolicyInput] = []
 
+    @property
+    def estimated_token_budget(self) -> int:
+        return 10_000
+
     async def decide(self, policy_input: MemoryPolicyInput) -> MemoryPolicyResult:
         self.inputs.append(policy_input)
         if len(self.inputs) == 1:
@@ -57,6 +63,242 @@ class _GatePolicy(MemoryPolicy):
                 raise self._first
             return self._first
         return self._later
+
+
+def test_capacity_rejected_new_closes_source_and_later_evidence_progresses(
+    migrated_database: str,
+) -> None:
+    conversation_id, message_ids = _seed_evidence(
+        migrated_database, ["remember another fact", "nothing else to save"]
+    )
+    _insert_memory(migrated_database, content="a")
+    outcomes: list[MemoryOutcome] = []
+    policy = _policy(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {
+                            "mutations": [{"operation": "NEW", "content": "b"}],
+                            "user_requested_memory_action": True,
+                        }
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": True}
+                    ),
+                )
+            ),
+        ],
+        estimated_token_budget=estimate_load_all_memory_contribution(["a"]),
+    )
+
+    result = _process(
+        migrated_database,
+        through_message_id=message_ids[-1],
+        policy=policy,
+        limit=2,
+        outcome_callback=outcomes.append,
+    )
+
+    assert result.processed_count == 2
+    assert result.complete is True
+    assert outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[0],
+            kind="not_saved",
+        ),
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[1],
+            kind="no_change",
+            user_requested_memory_action=True,
+        ),
+    ]
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 1
+    assert _scalar(migrated_database, "SELECT content FROM memories") == "a"
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT COUNT(*) FROM messages WHERE memory_processed_at IS NOT NULL",
+        )
+        == 2
+    )
+
+
+def test_capacity_rejected_whole_result_applies_no_partial_mutation(
+    migrated_database: str,
+) -> None:
+    conversation_id, message_ids = _seed_evidence(
+        migrated_database, ["replace, forget, and add"]
+    )
+    first_id = _insert_memory(migrated_database, content="a")
+    second_id = _insert_memory(migrated_database, content="b")
+    outcomes: list[MemoryOutcome] = []
+    policy = _policy(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {
+                            "mutations": [
+                                {
+                                    "operation": "CHANGE",
+                                    "target_memory_id": first_id,
+                                    "content": "aa",
+                                },
+                                {
+                                    "operation": "FORGET",
+                                    "target_memory_id": second_id,
+                                },
+                                {"operation": "NEW", "content": "x" * 40},
+                            ],
+                            "user_requested_memory_action": True,
+                        }
+                    ),
+                )
+            )
+        ],
+        estimated_token_budget=(estimate_load_all_memory_contribution(["a", "b"]) + 4),
+    )
+
+    result = _process(
+        migrated_database,
+        through_message_id=message_ids[0],
+        policy=policy,
+        limit=1,
+        outcome_callback=outcomes.append,
+    )
+
+    assert result.processed_count == 1
+    assert result.complete is True
+    assert outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[0],
+            kind="not_saved",
+        )
+    ]
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 2
+    assert (
+        _scalar(
+            migrated_database,
+            f"SELECT content FROM memories WHERE id = {first_id}",
+        )
+        == "a"
+    )
+    assert (
+        _scalar(
+            migrated_database,
+            f"SELECT content FROM memories WHERE id = {second_id}",
+        )
+        == "b"
+    )
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT memory_processed_at IS NOT NULL FROM messages "
+            f"WHERE id = {message_ids[0]}",
+        )
+        == 1
+    )
+
+
+def test_exact_fit_automatic_post_state_succeeds(migrated_database: str) -> None:
+    _, message_ids = _seed_evidence(migrated_database, ["remember exact fit"])
+    policy = _policy(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {
+                            "mutations": [{"operation": "NEW", "content": "abc"}],
+                            "user_requested_memory_action": True,
+                        }
+                    ),
+                )
+            )
+        ],
+        estimated_token_budget=estimate_load_all_memory_contribution(["abc"]),
+    )
+
+    result = _process(
+        migrated_database, through_message_id=message_ids[0], policy=policy, limit=1
+    )
+
+    assert result.processed_count == 1
+    assert result.complete is True
+    assert _scalar(migrated_database, "SELECT content FROM memories") == "abc"
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT memory_processed_at IS NOT NULL FROM messages "
+            f"WHERE id = {message_ids[0]}",
+        )
+        == 1
+    )
+
+
+def test_preexisting_overflow_remains_pending_before_provider_invocation(
+    migrated_database: str,
+) -> None:
+    conversation_id, message_ids = _seed_evidence(
+        migrated_database, ["pending behind legacy overflow"]
+    )
+    _insert_memory(migrated_database, content="ab")
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            )
+        ]
+    )
+    policy = MemoryPolicy(
+        provider=provider,
+        memory_policy_estimated_token_budget=(
+            estimate_load_all_memory_contribution(["ab"]) - 1
+        ),
+    )
+    outcomes: list[MemoryOutcome] = []
+
+    result = _process(
+        migrated_database,
+        through_message_id=message_ids[0],
+        policy=policy,
+        limit=1,
+        outcome_callback=outcomes.append,
+    )
+
+    assert result.processed_count == 0
+    assert result.complete is False
+    assert provider.requests == []
+    assert outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[0],
+            kind="retry_pending",
+        )
+    ]
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT memory_processed_at IS NULL FROM messages "
+            f"WHERE id = {message_ids[0]}",
+        )
+        == 1
+    )
 
 
 def test_policy_mutation_and_marker_commit_atomically(migrated_database: str) -> None:

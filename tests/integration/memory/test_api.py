@@ -22,6 +22,7 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.models import Conversation, Memory, Message, User
 from langley.main import create_app
+from langley.memory.policy import estimate_load_all_memory_contribution
 from langley.settings import Settings
 
 
@@ -34,18 +35,29 @@ def migrated_database(test_database_url: str, reset_database) -> str:
     return test_database_url
 
 
-def _settings(database_url: str, *, configured: bool = True) -> Settings:
+def _settings(
+    database_url: str,
+    *,
+    configured: bool = True,
+    estimated_token_budget: int = 10_000,
+) -> Settings:
     return Settings(
         environment="test",
         database_url=database_url,
         local_user_id=1,
         memory_policy_model="test-memory-policy" if configured else None,
-        memory_policy_estimated_token_budget=10_000 if configured else None,
+        memory_policy_estimated_token_budget=(
+            estimated_token_budget if configured else None
+        ),
     )
 
 
-def _bootstrap(database_url: str) -> None:
-    assert asyncio.run(bootstrap_local_user(_settings(database_url)))
+def _bootstrap(database_url: str, *, estimated_token_budget: int = 10_000) -> None:
+    assert asyncio.run(
+        bootstrap_local_user(
+            _settings(database_url, estimated_token_budget=estimated_token_budget)
+        )
+    )
 
 
 def test_memory_api_crud_validation_and_settings(migrated_database: str) -> None:
@@ -96,6 +108,44 @@ def test_memory_api_crud_validation_and_settings(migrated_database: str) -> None
         assert client.patch(
             "/api/memory-settings", json={"auto_memory_enabled": True}
         ).json() == {"auto_memory_enabled": True}
+
+
+def test_memory_api_enforces_direct_write_capacity(migrated_database: str) -> None:
+    estimated_token_budget = estimate_load_all_memory_contribution(["abc"])
+    _bootstrap(migrated_database, estimated_token_budget=estimated_token_budget)
+    app = create_app(
+        _settings(migrated_database, estimated_token_budget=estimated_token_budget),
+        memory_provider=FakeProvider([]),
+    )
+
+    with TestClient(app) as client:
+        exact_fit = client.post("/api/memories", json={"content": "abc"})
+        assert exact_fit.status_code == 201
+        memory_id = exact_fit.json()["id"]
+
+        over_capacity_add = client.post("/api/memories", json={"content": "x"})
+        assert over_capacity_add.status_code == 409
+        assert over_capacity_add.json() == {
+            "detail": {"code": "MEMORY_CAPACITY_REACHED"}
+        }
+
+        within_capacity_correction = client.put(
+            f"/api/memories/{memory_id}", json={"content": "a"}
+        )
+        assert within_capacity_correction.status_code == 200
+        assert within_capacity_correction.json()["content"] == "a"
+
+        over_capacity_correction = client.put(
+            f"/api/memories/{memory_id}", json={"content": "xxxx"}
+        )
+        assert over_capacity_correction.status_code == 409
+        assert over_capacity_correction.json() == {
+            "detail": {"code": "MEMORY_CAPACITY_REACHED"}
+        }
+        assert client.get("/api/memories").json()[0]["content"] == "a"
+
+        assert client.delete(f"/api/memories/{memory_id}").status_code == 204
+        assert client.get("/api/memories").json() == []
 
 
 def test_memory_api_source_ownership_and_unavailable_barrier(

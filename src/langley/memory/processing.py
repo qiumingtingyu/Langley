@@ -24,6 +24,7 @@ from langley.memory.policy import (
     MemoryPolicyItem,
     MemoryPolicyResult,
     MemoryPolicyUnavailableError,
+    estimate_load_all_memory_contribution,
 )
 
 BACKGROUND_BATCH_LIMIT = 4
@@ -37,6 +38,10 @@ logger = structlog.get_logger(__name__)
 
 class MemorySynchronizationUnavailableError(RuntimeError):
     """The mandatory ordered Memory barrier could not complete safely."""
+
+
+class MemoryCapacityReachedError(RuntimeError):
+    """A direct write would exceed the configured Load-All capacity."""
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,14 @@ async def add_memory_direct(
         _validate_direct_valid_until(valid_until, now)
         async with session_factory() as session, session.begin():
             await _lock_user(session, user_id)
+            current_memories = await _lock_current_memories(session, user_id, now)
+            if (
+                estimate_load_all_memory_contribution(
+                    [memory.content for memory in current_memories] + [content]
+                )
+                > policy.estimated_token_budget
+            ):
+                raise MemoryCapacityReachedError
             memory = Memory(
                 user_id=user_id,
                 content=content,
@@ -175,9 +188,21 @@ async def correct_memory_direct(
         _validate_direct_valid_until(valid_until, now)
         async with session_factory() as session, session.begin():
             await _lock_user(session, user_id)
-            memory = await _lock_current_memory(session, user_id, memory_id, now)
+            current_memories = await _lock_current_memories(session, user_id, now)
+            memory = next(
+                (memory for memory in current_memories if memory.id == memory_id), None
+            )
             if memory is None:
                 raise KeyError("current memory not found")
+            post_state_contents = [
+                content if current.id == memory_id else current.content
+                for current in current_memories
+            ]
+            if (
+                estimate_load_all_memory_contribution(post_state_contents)
+                > policy.estimated_token_budget
+            ):
+                raise MemoryCapacityReachedError
             memory.content = content
             memory.valid_until = valid_until
             memory.source_message_id = None
@@ -346,6 +371,7 @@ async def _process_memory_through_locked(
             user_id=user_id,
             evidence=evidence,
             result=result,
+            estimated_token_budget=policy.estimated_token_budget,
         )
         if outcome == "applied":
             processed_count += 1
@@ -374,6 +400,23 @@ async def _process_memory_through_locked(
                         forgotten_count=mutation_counts[2],
                     )
                 )
+        elif outcome == "capacity_rejected":
+            processed_count += 1
+            outcomes.append(
+                MemoryOutcome(
+                    user_id=user_id,
+                    conversation_id=evidence.conversation_id,
+                    source_message_id=evidence.policy_input.evidence_message_id,
+                    kind="not_saved",
+                )
+            )
+            logger.info(
+                "memory.policy_result.capacity_rejected",
+                user_id=user_id,
+                conversation_id=evidence.conversation_id,
+                source_message_id=evidence.policy_input.evidence_message_id,
+                mutation_count=len(result.mutations),
+            )
         # A concurrent apply/marker/toggle made the detached snapshot stale.
         # Reload the same oldest evidence under current facts rather than closing it.
 
@@ -477,7 +520,8 @@ async def _apply_policy_result(
     user_id: int,
     evidence: _DetachedEvidence,
     result: MemoryPolicyResult,
-) -> str:
+    estimated_token_budget: int,
+) -> Literal["applied", "capacity_rejected", "stale"]:
     """Atomically apply a still-current semantic decision and close its evidence."""
 
     async with session_factory() as session, session.begin():
@@ -498,12 +542,20 @@ async def _apply_policy_result(
         )
         if source is None:
             return "stale"
-        targets = await _lock_result_targets(
-            session, user_id=user_id, result=result, now=utc_now()
-        )
+        now = utc_now()
+        current_memories = await _lock_current_memories(session, user_id, now)
+        targets = _result_targets(current_memories, result)
         if targets is None:
             return "stale"
-        now = utc_now()
+        post_state_contents = _policy_post_state_contents(
+            current_memories, result=result, now=now
+        )
+        if (
+            estimate_load_all_memory_contribution(post_state_contents)
+            > estimated_token_budget
+        ):
+            source.memory_processed_at = now
+            return "capacity_rejected"
         for mutation in result.mutations:
             if mutation.operation == "NEW":
                 session.add(
@@ -559,26 +611,30 @@ async def _conservatively_close_invalid(
         return "closed"
 
 
-async def _lock_result_targets(
-    session: AsyncSession,
-    *,
-    user_id: int,
-    result: MemoryPolicyResult,
-    now: datetime,
+def _result_targets(
+    current_memories: list[Memory], result: MemoryPolicyResult
 ) -> dict[int, Memory] | None:
-    target_ids = sorted(
+    target_ids = {
         mutation.target_memory_id
         for mutation in result.mutations
         if mutation.target_memory_id is not None
-    )
-    if not target_ids:
-        return {}
-    targets = list(
+    }
+    current_by_id = {memory.id: memory for memory in current_memories}
+    if not target_ids.issubset(current_by_id):
+        return None
+    return {target_id: current_by_id[target_id] for target_id in target_ids}
+
+
+async def _lock_current_memories(
+    session: AsyncSession,
+    user_id: int,
+    now: datetime,
+) -> list[Memory]:
+    return list(
         (
             await session.scalars(
                 select(Memory)
                 .where(
-                    Memory.id.in_(target_ids),
                     Memory.user_id == user_id,
                     or_(Memory.valid_until.is_(None), Memory.valid_until > now),
                 )
@@ -587,9 +643,30 @@ async def _lock_result_targets(
             )
         ).all()
     )
-    if len(targets) != len(target_ids):
-        return None
-    return {target.id: target for target in targets}
+
+
+def _policy_post_state_contents(
+    current_memories: list[Memory],
+    *,
+    result: MemoryPolicyResult,
+    now: datetime,
+) -> tuple[str, ...]:
+    contents_by_id = {memory.id: memory.content for memory in current_memories}
+    new_contents: list[str] = []
+    for mutation in result.mutations:
+        if mutation.operation == "NEW":
+            if mutation.valid_until is None or mutation.valid_until > now:
+                new_contents.append(_required_content(mutation))
+            continue
+        target_id = _required_target_id(mutation)
+        if mutation.operation == "CHANGE":
+            if mutation.valid_until is None or mutation.valid_until > now:
+                contents_by_id[target_id] = _required_content(mutation)
+            else:
+                contents_by_id.pop(target_id)
+        else:
+            contents_by_id.pop(target_id)
+    return (*contents_by_id.values(), *new_contents)
 
 
 async def _has_unprocessed_evidence(

@@ -6,6 +6,7 @@ response before a later task decides whether and how to persist it.
 """
 
 import json
+from collections.abc import Iterable
 from datetime import datetime
 from typing import Literal, Self
 
@@ -34,6 +35,13 @@ MEMORY_POLICY_PROMPT_VERSION = "slice5-t3-v1"
 _MAX_STRUCTURED_OUTPUT_ATTEMPTS = 2
 # Structural context estimate only; calibration still supplies the actual budget.
 _MEMORY_ITEM_FRAMING_ALLOWANCE = 32
+
+
+def estimate_load_all_memory_contribution(contents: Iterable[str]) -> int:
+    """Estimate complete Memory contribution without claiming tokenizer parity."""
+
+    return sum(len(content) + _MEMORY_ITEM_FRAMING_ALLOWANCE for content in contents)
+
 
 _MEMORY_POLICY_SYSTEM_INPUT = """You are Langley's Personal Context Memory Policy.
 
@@ -296,6 +304,15 @@ class MemoryPolicy:
             memory_policy_estimated_token_budget
         )
 
+    @property
+    def estimated_token_budget(self) -> int:
+        """Expose the configured write-capacity contract to persistence guards."""
+
+        self._ensure_budget_configured()
+        budget = self._memory_policy_estimated_token_budget
+        assert budget is not None
+        return budget
+
     async def decide(self, policy_input: MemoryPolicyInput) -> MemoryPolicyResult:
         """Return one validated decision or expose the bounded failure category."""
 
@@ -327,16 +344,10 @@ class MemoryPolicy:
     def _ensure_current_memories_fit(self, policy_input: MemoryPolicyInput) -> None:
         """Use the existing deterministic character estimator without truncation."""
 
-        budget = self._memory_policy_estimated_token_budget
-        if budget is None:
-            raise MemoryPolicyUnavailableError(
-                "memory policy estimated token budget is not calibrated"
-            )
-        estimated_tokens = sum(
-            len(memory.content) + _MEMORY_ITEM_FRAMING_ALLOWANCE
-            for memory in policy_input.current_memories
+        estimated_tokens = estimate_load_all_memory_contribution(
+            memory.content for memory in policy_input.current_memories
         )
-        if estimated_tokens > budget:
+        if estimated_tokens > self.estimated_token_budget:
             raise MemoryPolicyContextInfeasibleError(
                 "all current memories exceed the memory policy token budget"
             )

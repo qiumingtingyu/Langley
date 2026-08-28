@@ -38,9 +38,12 @@ def _completion(payload: dict[str, object] | str) -> LLMResponseCompleted:
     )
 
 
-def _policy(rounds: list[ScriptedProviderRound]) -> MemoryPolicy:
+def _policy(
+    rounds: list[ScriptedProviderRound], *, estimated_token_budget: int = 10_000
+) -> MemoryPolicy:
     return MemoryPolicy(
-        provider=FakeProvider(rounds), memory_policy_estimated_token_budget=10_000
+        provider=FakeProvider(rounds),
+        memory_policy_estimated_token_budget=estimated_token_budget,
     )
 
 

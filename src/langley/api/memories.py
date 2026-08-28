@@ -26,6 +26,7 @@ from langley.infrastructure.models import Memory, User
 from langley.memory.events import MemoryEventSubscribers, MemoryOutcome
 from langley.memory.policy import MemoryPolicy
 from langley.memory.processing import (
+    MemoryCapacityReachedError,
     MemorySynchronizationUnavailableError,
     add_memory_direct,
     correct_memory_direct,
@@ -108,6 +109,11 @@ def _validation_error() -> HTTPException:
 
 
 def _raise_memory_error(error: Exception) -> None:
+    if isinstance(error, MemoryCapacityReachedError):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "MEMORY_CAPACITY_REACHED"},
+        ) from error
     if isinstance(error, MemorySynchronizationUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

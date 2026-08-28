@@ -40,6 +40,10 @@ class _RecordingPolicy(MemoryPolicy):
         self._decisions = decisions
         self.inputs: list[MemoryPolicyInput] = []
 
+    @property
+    def estimated_token_budget(self) -> int:
+        return 10_000
+
     async def decide(self, policy_input: MemoryPolicyInput) -> MemoryPolicyResult:
         self.inputs.append(policy_input)
         decision = self._decisions.pop(0)

@@ -23,6 +23,7 @@ from langley.memory.policy import (
     MemoryPolicyInvalidOutputError,
     MemoryPolicyItem,
     MemoryPolicyUnavailableError,
+    estimate_load_all_memory_contribution,
 )
 
 _EVIDENCE_CREATED_AT = datetime(2026, 8, 20, 2, 0)
@@ -280,6 +281,34 @@ def test_policy_requires_calibrated_budget_before_invocation() -> None:
     assert provider.requests == []
 
 
+def test_policy_accepts_load_all_context_at_the_exact_shared_estimate() -> None:
+    memory = _memory(content="abcdefgh")
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        '{"mutations":[],"user_requested_memory_action":false}'
+                    ),
+                )
+            )
+        ]
+    )
+
+    result = _decide(
+        _policy(
+            provider,
+            memory_policy_estimated_token_budget=(
+                estimate_load_all_memory_contribution([memory.content])
+            ),
+        ),
+        _input(current_memories=(memory,)),
+    )
+
+    assert result.is_no_change is True
+    assert len(provider.requests) == 1
+
+
 def test_policy_rejects_load_all_context_that_exceeds_the_configured_budget() -> None:
     memory = _memory(content="abcdefgh")
     provider = FakeProvider([])
@@ -288,7 +317,12 @@ def test_policy_rejects_load_all_context_that_exceeds_the_configured_budget() ->
         MemoryPolicyContextInfeasibleError, match="all current memories"
     ):
         _decide(
-            _policy(provider, memory_policy_estimated_token_budget=len(memory.content)),
+            _policy(
+                provider,
+                memory_policy_estimated_token_budget=(
+                    estimate_load_all_memory_contribution([memory.content]) - 1
+                ),
+            ),
             _input(current_memories=(memory,)),
         )
 
