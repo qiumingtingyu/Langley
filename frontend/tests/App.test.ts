@@ -135,6 +135,16 @@ describe("App user behavior", () => {
     wrapper.unmount();
   });
 
+  it("retains an unavailable recovered Run knowledge-base scope instead of showing no scope", async () => {
+    const wrapper = await mountInitial(run(201, "RUNNING", 9, "REQUIRED"), [message(1, "问题 A")], []);
+    const knowledgeBaseSelect = wrapper.get('select[aria-label="资料范围"]');
+
+    expect((knowledgeBaseSelect.element as HTMLSelectElement).value).toBe("9");
+    expect(knowledgeBaseSelect.text()).toContain("当前资料（名称暂不可用）");
+    expect(knowledgeBaseSelect.attributes("disabled")).toBeDefined();
+    wrapper.unmount();
+  });
+
   it("retries the authoritative Run scope without sending the modified Composer draft", async () => {
     const wrapper = await mountInitial(run(201, "FAILED", 9, "REQUIRED"), [message(1, "问题 A")], [
       { id: 9, name: "网络基础", created_at: "x" },

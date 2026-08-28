@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ArrowUp, Pencil, RefreshCw, RotateCcw, Trash2 } from "lucide-vue-next";
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 
 import EvidenceSheet from "@/components/EvidenceSheet.vue";
 import MessageContent from "@/components/MessageContent.vue";
@@ -28,6 +28,11 @@ const props = defineProps<{
 
 const composerContent = defineModel<string>("composerContent", { required: true });
 const selectedCitation = ref<MessageCitation | null>(null);
+const hasUnavailableKnowledgeBaseName = computed(() =>
+  props.isKnowledgeScopeLocked &&
+  props.knowledgeBaseId !== null &&
+  !props.knowledgeBases.some((knowledgeBase) => knowledgeBase.id === props.knowledgeBaseId),
+);
 
 const emit = defineEmits<{
   refresh: [];
@@ -126,7 +131,7 @@ watch(
         <p
           v-if="requestError"
           role="alert"
-          class="mb-6 rounded-md border border-amber-300/70 bg-amber-50 px-3 py-2 text-sm text-amber-950"
+          class="mb-6 rounded-md border border-warning-border bg-warning-surface px-3 py-2 text-sm text-warning-foreground"
         >
           {{ requestError }}
           <Button
@@ -240,13 +245,13 @@ watch(
 
           <div
             v-else-if="latestRun?.status === 'FAILED'"
-            class="flex items-center justify-between gap-4 rounded-md border border-rose-300/70 bg-rose-50 px-4 py-3"
+            class="flex items-center justify-between gap-4 rounded-md border border-danger-border bg-danger-surface px-4 py-3"
           >
             <div>
-              <p class="text-sm font-medium text-rose-950">
+              <p class="text-sm font-medium text-danger-foreground">
                 回答失败
               </p>
-              <p class="mt-0.5 text-xs text-rose-800">
+              <p class="mt-0.5 text-xs text-danger-foreground">
                 {{ runFailureMessage }}
               </p>
             </div>
@@ -342,6 +347,12 @@ watch(
                   :disabled="isKnowledgeScopeLocked || isLoadingKnowledgeBases || knowledgeBaseLoadError !== null"
                   @change="selectKnowledgeBase"
                 >
+                  <option
+                    v-if="hasUnavailableKnowledgeBaseName"
+                    :value="knowledgeBaseId"
+                  >
+                    当前资料（名称暂不可用）
+                  </option>
                   <option value="">
                     不使用资料
                   </option>
@@ -385,7 +396,7 @@ watch(
                   {{ knowledgeBaseLoadError }}
                   <button
                     type="button"
-                    class="text-primary-deep underline underline-offset-2"
+                    class="text-primary-deep underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
                     @click="emit('retryKnowledgeBases')"
                   >重新读取</button>
                 </span>

@@ -571,20 +571,20 @@ onBeforeUnmount(stopIndexPolling);
             </p>
             <p
               v-else-if="!chunksLoading"
-              class="mt-2 text-amber-800"
+              class="mt-2 text-warning-foreground"
             >
               当前切片配置未知，请重新处理文档。
             </p>
             <p
               v-if="processingBlockedByIndex"
-              class="mt-2 text-amber-800"
+              class="mt-2 text-warning-foreground"
             >
               正在建立索引，请等待完成后再重新处理文档。
             </p>
             <p
               v-if="processingError"
               role="alert"
-              class="mt-2 text-red-700"
+              class="mt-2 text-danger-foreground"
             >
               {{ processingError }}
             </p>
@@ -625,7 +625,7 @@ onBeforeUnmount(stopIndexPolling);
             <p
               v-if="chunkLoadError"
               role="alert"
-              class="mt-3 text-red-700"
+              class="mt-3 text-danger-foreground"
             >
               {{ chunkLoadError }}
             </p>

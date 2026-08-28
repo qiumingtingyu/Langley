@@ -115,7 +115,7 @@ describe("MemoryPage", () => {
     await wrapper.findAll("button").find((item) => item.text() === "立即整理")!.trigger("click");
     await settle();
 
-    expect(wrapper.text()).toContain("本次整理了 4 条，还有 3 条待整理。");
+    expect(wrapper.text()).toContain("本次整理了 4 条，完成时还有 3 条待整理。");
     expect(wrapper.text()).not.toContain("已整理完成。");
     expect(wrapper.text()).toContain("待整理内容：3 条");
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/memory-status")).toHaveLength(2);

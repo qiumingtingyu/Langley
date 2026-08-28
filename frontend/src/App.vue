@@ -127,9 +127,14 @@ function openKnowledgeView(): void {
   activeView.value = "knowledge";
 }
 
-function openChatView(): void {
+function enterChatView(): void {
+  const shouldRefreshKnowledgeBases = activeView.value !== "chat";
   activeView.value = "chat";
-  void loadKnowledgeBases();
+  if (shouldRefreshKnowledgeBases) void loadKnowledgeBases();
+}
+
+function openChatView(): void {
+  enterChatView();
 }
 
 function updatedNotice(payload: {
@@ -268,7 +273,7 @@ function updateGroundingPolicy(policy: GroundingPolicy): void {
 }
 
 async function selectConversation(conversationId: number): Promise<void> {
-  activeView.value = "chat";
+  enterChatView();
   const revision = beginView(conversationId);
   isLoading.value = true;
   try {
@@ -547,7 +552,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="relative flex h-screen min-h-0 min-w-0 overflow-hidden bg-canvas text-foreground">
+  <main class="relative flex h-screen min-h-0 min-w-0 flex-col overflow-hidden bg-canvas text-foreground md:flex-row">
     <AppSidebar
       :conversations="conversations"
       :selected-conversation-id="selectedConversationId"
@@ -565,7 +570,7 @@ onBeforeUnmount(() => {
     <p
       v-if="memoryNotice"
       role="status"
-      class="absolute right-5 top-5 z-10 max-w-sm rounded-md border border-strong-border bg-surface px-3 py-2 text-sm text-body shadow-[0_8px_24px_rgba(30,44,49,0.08)]"
+      class="absolute right-5 top-5 z-10 max-w-sm rounded-md border border-strong-border bg-surface px-3 py-2 text-sm text-body shadow-lg"
     >
       {{ memoryNotice }}
     </p>

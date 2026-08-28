@@ -151,7 +151,7 @@ async function sync(): Promise<void> {
     const result = await (await request("/api/memory-sync", { method: "POST" })).json() as MemorySyncResult;
     syncResult.value = result.complete && result.remaining_count === 0
       ? "已整理完成。"
-      : `本次整理了 ${result.processed_count} 条，还有 ${result.remaining_count} 条待整理。`;
+      : `本次整理了 ${result.processed_count} 条，完成时还有 ${result.remaining_count} 条待整理。`;
     await load();
   } catch (error) {
     await load();

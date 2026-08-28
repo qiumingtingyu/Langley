@@ -40,19 +40,19 @@ function handleOpenChange(open: boolean): void {
   >
     <SheetContent
       side="right"
-      class="w-full gap-0 border-strong-border bg-surface p-0 text-foreground shadow-[0_16px_48px_rgba(30,44,49,0.12)] sm:max-w-[28rem]"
+      class="w-full min-w-0 gap-0 border-strong-border bg-surface p-0 text-foreground shadow-lg sm:max-w-[28rem]"
     >
       <template v-if="citation">
         <SheetHeader class="border-b border-border px-6 py-6 pr-14 text-left sm:px-8 sm:py-7 sm:pr-16">
           <p class="font-mono text-[10px] font-medium tracking-[0.16em] text-primary">
             EVIDENCE {{ ordinal }}
           </p>
-          <SheetTitle class="mt-3 text-base font-semibold tracking-[-0.01em] text-foreground">
+          <SheetTitle class="mt-3 break-words text-base font-semibold tracking-[-0.01em] text-foreground [overflow-wrap:anywhere]">
             {{ citation.source_display_name }}
           </SheetTitle>
           <p
             v-if="headingSegments.length > 0"
-            class="mt-1 text-xs leading-5 text-muted-foreground"
+            class="mt-1 break-words text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]"
           >
             {{ headingSegments.join(" › ") }}
           </p>
@@ -71,7 +71,7 @@ function handleOpenChange(open: boolean): void {
               aria-hidden="true"
             />
           </div>
-          <div class="mt-5 whitespace-pre-wrap text-[15px] leading-7 text-body">
+          <div class="mt-5 break-words whitespace-pre-wrap text-[15px] leading-7 text-body [overflow-wrap:anywhere]">
             {{ citation.evidence_text }}
           </div>
           <p class="mt-auto border-t border-border pt-5 text-xs leading-5 text-muted-foreground">

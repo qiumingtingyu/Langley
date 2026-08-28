@@ -53,10 +53,11 @@ const forwarded = useForwardPropsEmits(delegatedProps, emit);
 
       <DialogClose
         data-slot="sheet-close"
+        aria-label="关闭面板"
         class="absolute right-4 top-4 inline-flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 [&>svg]:size-4"
       >
         <X aria-hidden="true" />
-        <span class="sr-only">关闭证据面板</span>
+        <span class="sr-only">关闭面板</span>
       </DialogClose>
     </DialogContent>
   </DialogPortal>
