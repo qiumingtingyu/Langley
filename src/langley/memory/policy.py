@@ -395,6 +395,7 @@ class MemoryPolicy:
             )
         return self._parse_and_validate_result(
             completion.assistant_content,
+            auto_memory_enabled=policy_input.auto_memory_enabled,
             supplied_memory_ids={
                 memory.memory_id for memory in policy_input.current_memories
             },
@@ -407,6 +408,7 @@ class MemoryPolicy:
     def _parse_and_validate_result(
         assistant_content: str,
         *,
+        auto_memory_enabled: bool,
         supplied_memory_ids: set[int],
         supplied_memory_contents: set[str],
     ) -> MemoryPolicyResult:
@@ -428,6 +430,15 @@ class MemoryPolicy:
             raise MemoryPolicyInvalidOutputError(
                 "memory policy returned an invalid structured result"
             ) from error
+
+        if (
+            not auto_memory_enabled
+            and result.mutations
+            and not result.user_requested_memory_action
+        ):
+            raise MemoryPolicyInvalidOutputError(
+                "memory policy result contradicts disabled auto-memory mode"
+            )
 
         for mutation in result.mutations:
             target_memory_id = mutation.target_memory_id

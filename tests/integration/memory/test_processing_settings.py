@@ -14,6 +14,7 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.infrastructure.models import Message
+from langley.memory.events import MemoryOutcome
 from langley.memory.policy import (
     MemoryPolicy,
     MemoryPolicyInput,
@@ -95,6 +96,77 @@ def test_disabling_auto_memory_does_not_invoke_or_wait_for_policy(
             "SELECT COUNT(*) FROM messages WHERE memory_processed_at IS NULL",
         )
         == 1
+    )
+
+
+def test_repeated_off_contradiction_closes_one_source_then_continues(
+    migrated_database: str,
+) -> None:
+    conversation_id, message_ids = _seed_evidence(
+        migrated_database, ["implicit preference", "nothing else to save"]
+    )
+
+    async def disable() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            await set_auto_memory_enabled(
+                session_factory,
+                user_id=1,
+                enabled=False,
+                policy=None,
+                local_timezone="Asia/Shanghai",
+                lane=asyncio.Lock(),
+            )
+        finally:
+            await dispose_database_engine(engine)
+
+    _run(disable())
+    contradictory_result = {
+        "mutations": [{"operation": "NEW", "content": "implicit fact"}],
+        "user_requested_memory_action": False,
+    }
+    policy = _policy(
+        [
+            ScriptedProviderRound(events=(_completion(contradictory_result),)),
+            ScriptedProviderRound(events=(_completion(contradictory_result),)),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            ),
+        ]
+    )
+    outcomes: list[MemoryOutcome] = []
+
+    result = _process(
+        migrated_database,
+        through_message_id=message_ids[-1],
+        policy=policy,
+        outcome_callback=outcomes.append,
+    )
+
+    assert result.processed_count == 2
+    assert result.complete is True
+    assert outcomes == [
+        MemoryOutcome(
+            user_id=1,
+            conversation_id=conversation_id,
+            source_message_id=message_ids[0],
+            kind="not_saved",
+        )
+    ]
+    assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 0
+    assert (
+        _scalar(
+            migrated_database,
+            "SELECT COUNT(*) FROM messages WHERE id IN "
+            f"({message_ids[0]}, {message_ids[1]}) "
+            "AND memory_processed_at IS NOT NULL",
+        )
+        == 2
     )
 
 

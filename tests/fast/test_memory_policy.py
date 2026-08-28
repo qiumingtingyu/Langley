@@ -266,6 +266,96 @@ def test_policy_allows_off_implicit_no_change() -> None:
     assert result.user_requested_memory_action is False
 
 
+def test_policy_rejects_implicit_mutation_while_auto_memory_is_off() -> None:
+    contradictory_result = json.dumps(
+        {
+            "mutations": [{"operation": "NEW", "content": "Morning preference."}],
+            "user_requested_memory_action": False,
+        }
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(events=(_completion(contradictory_result),)),
+            ScriptedProviderRound(events=(_completion(contradictory_result),)),
+        ]
+    )
+
+    with pytest.raises(
+        MemoryPolicyInvalidOutputError,
+        match="contradicts disabled auto-memory mode",
+    ):
+        _decide(_policy(provider), _input(auto_memory_enabled=False))
+
+    assert len(provider.requests) == 2
+
+
+def test_policy_retries_off_contradiction_then_accepts_coherent_result() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        json.dumps(
+                            {
+                                "mutations": [
+                                    {
+                                        "operation": "NEW",
+                                        "content": "Morning preference.",
+                                    }
+                                ],
+                                "user_requested_memory_action": False,
+                            }
+                        )
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        '{"mutations":[],"user_requested_memory_action":false}'
+                    ),
+                )
+            ),
+        ]
+    )
+
+    result = _decide(_policy(provider), _input(auto_memory_enabled=False))
+
+    assert result.is_no_change is True
+    assert result.user_requested_memory_action is False
+    assert len(provider.requests) == 2
+
+
+def test_policy_allows_implicit_mutation_while_auto_memory_is_on() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        json.dumps(
+                            {
+                                "mutations": [
+                                    {
+                                        "operation": "NEW",
+                                        "content": "Morning preference.",
+                                    }
+                                ],
+                                "user_requested_memory_action": False,
+                            }
+                        )
+                    ),
+                )
+            )
+        ]
+    )
+
+    result = _decide(_policy(provider), _input(auto_memory_enabled=True))
+
+    assert tuple(mutation.operation for mutation in result.mutations) == ("NEW",)
+    assert result.user_requested_memory_action is False
+    assert len(provider.requests) == 1
+
+
 def test_policy_requires_calibrated_budget_before_invocation() -> None:
     provider = FakeProvider([])
 
