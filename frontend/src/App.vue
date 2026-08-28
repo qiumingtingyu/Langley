@@ -1,64 +1,16 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import {
-  ArrowUp,
-  ChevronRight,
-  MessageCircleMore,
-  Pencil,
-  Plus,
-  RefreshCw,
-  RotateCcw,
-  Sparkles,
-  Trash2,
-} from "lucide-vue-next";
-
-import { Button } from "@/components/ui/button";
-import MessageContent from "@/components/MessageContent.vue";
+import AppSidebar from "@/components/AppSidebar.vue";
+import ChatWorkspace from "@/components/ChatWorkspace.vue";
 import KnowledgePage from "@/KnowledgePage.vue";
 import MemoryPage from "@/MemoryPage.vue";
-
-type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
-
-interface Conversation {
-  id: number;
-  title: string | null;
-  created_at: string;
-  updated_at: string;
-  last_message_at: string | null;
-}
-
-interface Message {
-  id: number;
-  sequence_no: number;
-  role: "USER" | "ASSISTANT";
-  content: string;
-  run_id: number | null;
-  regenerated_from_message_id: number | null;
-  created_at: string;
-}
-
-interface Run {
-  id: number;
-  input_message_id: number;
-  attempt_no: number;
-  status: RunStatus;
-  started_at: string | null;
-  finished_at: string | null;
-  error_code: string | null;
-}
+import type { ActiveView, Conversation, Message, Run, StreamState } from "@/types";
 
 interface PendingCommand {
   conversationId: number;
   label: string;
   path: string;
   payload: Record<string, string>;
-}
-
-interface StreamState {
-  conversationId: number;
-  runId: number;
-  viewRevision: number;
-  content: string;
 }
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -82,7 +34,7 @@ const isLoading = ref(true);
 const requestError = ref<string | null>(null);
 const pendingNetworkCommand = ref<PendingCommand | null>(null);
 const streamState = ref<StreamState | null>(null);
-const activeView = ref<"chat" | "memory" | "knowledge">("chat");
+const activeView = ref<ActiveView>("chat");
 const memoryNotice = ref<string | null>(null);
 const memoryPage = ref<{ load(): Promise<void> } | null>(null);
 const memoryUpdated = ref(false);
@@ -520,381 +472,53 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="relative flex min-h-screen bg-stone-50 text-slate-800">
-    <aside class="flex w-72 shrink-0 flex-col border-r border-stone-200 bg-stone-100/70 p-4">
-      <div class="mb-7 flex items-center gap-2 px-1 text-sm font-semibold tracking-tight text-slate-900">
-        <span class="flex size-7 items-center justify-center rounded-md bg-slate-900 text-white">
-          <Sparkles
-            :size="15"
-            aria-hidden="true"
-          />
-        </span>
-        Langley
-      </div>
-
-      <Button
-        class="mb-5 w-full justify-start"
-        :disabled="busyAction !== null"
-        @click="createConversation"
-      >
-        <Plus
-          :size="16"
-          aria-hidden="true"
-        />
-        新建会话
-      </Button>
-
-      <div class="mb-4 flex gap-1 rounded-md bg-stone-200/60 p-1 text-sm">
-        <button
-          class="flex-1 rounded px-2 py-1.5"
-          :class="activeView === 'chat' ? 'bg-white shadow-sm' : ''"
-          @click="activeView = 'chat'"
-        >
-          聊天
-        </button>
-        <button
-          class="flex-1 rounded px-2 py-1.5"
-          :class="activeView === 'knowledge' ? 'bg-white shadow-sm' : ''"
-          @click="openKnowledgeView"
-        >
-          知识库
-        </button>
-        <button
-          class="flex-1 rounded px-2 py-1.5"
-          :class="activeView === 'memory' ? 'bg-white shadow-sm' : ''"
-          @click="openMemoryView"
-        >
-          记忆
-          <span
-            v-if="memoryUpdated"
-            aria-label="记忆有更新"
-            class="ml-1 inline-block size-1.5 rounded-full bg-sky-600"
-          />
-        </button>
-      </div>
-
-      <div class="mb-2 px-2 text-[11px] font-semibold uppercase tracking-[0.13em] text-slate-500">
-        会话列表
-      </div>
-      <nav
-        class="min-h-0 flex-1 space-y-1 overflow-y-auto"
-        aria-label="会话列表"
-      >
-        <button
-          v-for="conversation in conversations"
-          :key="conversation.id"
-          class="group flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors"
-          :class="conversation.id === selectedConversationId ? 'bg-white text-slate-950 shadow-sm' : 'text-slate-600 hover:bg-stone-200/70 hover:text-slate-950'"
-          type="button"
-          @click="selectConversation(conversation.id)"
-        >
-          <MessageCircleMore
-            :size="15"
-            aria-hidden="true"
-            class="shrink-0 opacity-70"
-          />
-          <span class="truncate">{{ conversationTitle(conversation) }}</span>
-          <ChevronRight
-            v-if="conversation.id === selectedConversationId"
-            :size="14"
-            aria-hidden="true"
-            class="ml-auto text-slate-400"
-          />
-        </button>
-        <p
-          v-if="conversations.length === 0 && !isLoading"
-          class="px-2 py-3 text-sm leading-6 text-slate-500"
-        >
-          新建一个会话后即可开始。
-        </p>
-      </nav>
-    </aside>
+  <main class="relative flex h-screen min-h-0 min-w-0 overflow-hidden bg-canvas text-foreground">
+    <AppSidebar
+      :conversations="conversations"
+      :selected-conversation-id="selectedConversationId"
+      :active-view="activeView"
+      :memory-updated="memoryUpdated"
+      :busy="busyAction !== null"
+      :loading="isLoading"
+      @create="createConversation"
+      @select="selectConversation"
+      @open-chat="activeView = 'chat'"
+      @open-knowledge="openKnowledgeView"
+      @open-memory="openMemoryView"
+    />
 
     <p
       v-if="memoryNotice"
       role="status"
-      class="absolute right-5 top-5 z-10 max-w-sm rounded border border-sky-200 bg-sky-50 px-3 py-2 text-sm text-sky-900 shadow-sm"
+      class="absolute right-5 top-5 z-10 max-w-sm rounded-md border border-strong-border bg-surface px-3 py-2 text-sm text-body shadow-[0_8px_24px_rgba(30,44,49,0.08)]"
     >
       {{ memoryNotice }}
     </p>
-    <section
+    <ChatWorkspace
       v-if="activeView === 'chat'"
-      class="flex min-w-0 flex-1 flex-col"
-    >
-      <header class="flex h-16 shrink-0 items-center justify-between border-b border-stone-200 bg-stone-50/90 px-8">
-        <div>
-          <p class="text-sm font-semibold text-slate-900">
-            {{ selectedConversation ? conversationTitle(selectedConversation) : "Langley" }}
-          </p>
-          <p class="mt-0.5 text-xs text-slate-500">
-            {{ selectedConversation ? "学习对话" : "请选择或新建会话" }}
-          </p>
-        </div>
-        <div class="flex items-center gap-1">
-          <Button
-            v-if="selectedConversation"
-            variant="ghost"
-            size="icon"
-            aria-label="重命名会话"
-            :disabled="busyAction !== null"
-            @click="renameConversation"
-          >
-            <Pencil
-              :size="16"
-              aria-hidden="true"
-            />
-          </Button>
-          <Button
-            v-if="selectedConversation"
-            variant="ghost"
-            size="icon"
-            aria-label="删除会话"
-            :disabled="busyAction !== null"
-            @click="deleteSelectedConversation"
-          >
-            <Trash2
-              :size="16"
-              aria-hidden="true"
-            />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            aria-label="刷新会话"
-            :disabled="isLoading"
-            @click="refreshFacts()"
-          >
-            <RefreshCw
-              :size="17"
-              :class="{ 'animate-spin': isLoading }"
-              aria-hidden="true"
-            />
-          </Button>
-        </div>
-      </header>
-
-      <div class="flex min-h-0 flex-1 flex-col">
-        <div class="mx-auto flex w-full max-w-3xl flex-1 flex-col px-8 py-10">
-          <p
-            v-if="requestError"
-            role="alert"
-            class="mb-5 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
-          >
-            {{ requestError }}
-            <Button
-              v-if="pendingNetworkCommand"
-              variant="outline"
-              size="small"
-              class="ml-3"
-              @click="retryNetworkRequest"
-            >
-              重试请求
-            </Button>
-          </p>
-
-          <div
-            v-if="!selectedConversation && !isLoading"
-            class="flex flex-1 items-center justify-center"
-          >
-            <div class="max-w-sm text-center">
-              <h1 class="text-xl font-semibold tracking-tight text-slate-900">
-                开始学习对话
-              </h1>
-              <p class="mt-2 text-sm leading-6 text-slate-500">
-                新建一个会话，开始提问。
-              </p>
-            </div>
-          </div>
-
-          <div
-            v-else
-            class="space-y-7"
-          >
-            <template
-              v-for="message in messages"
-              :key="message.id"
-            >
-              <article
-                v-if="message.role === 'USER'"
-                class="flex justify-end"
-              >
-                <div class="max-w-[82%] break-words whitespace-pre-wrap rounded-2xl rounded-br-md bg-slate-900 px-4 py-3 text-sm leading-6 text-white shadow-sm">
-                  {{ message.content }}
-                </div>
-              </article>
-              <article
-                v-else
-                class="max-w-[88%] text-[15px] leading-7 text-slate-700"
-              >
-                <p class="mb-1 text-[11px] font-semibold tracking-[0.13em] text-slate-400">
-                  Langley
-                </p>
-                <MessageContent :content="message.content" />
-              </article>
-            </template>
-
-            <article
-              v-if="hasCurrentStream"
-              class="max-w-[88%] text-[15px] leading-7 text-slate-700"
-              aria-live="polite"
-            >
-              <p class="mb-1 text-[11px] font-semibold tracking-[0.13em] text-slate-400">
-                Langley
-              </p>
-              <MessageContent :content="streamState?.content || '正在生成…'" />
-            </article>
-
-            <div
-              v-if="messages.length === 0 && selectedConversation && !isLoading"
-              class="py-16 text-center text-sm text-slate-500"
-            >
-              这个会话已准备好，随时可以开始提问。
-            </div>
-
-            <div
-              v-if="busyAction"
-              class="flex items-center gap-2 text-sm text-slate-500"
-              aria-live="polite"
-            >
-              <span
-                class="size-2 animate-pulse rounded-full bg-slate-400"
-                aria-hidden="true"
-              />
-              {{ busyAction }}
-            </div>
-
-            <div
-              v-else-if="hasActiveRun"
-              class="flex items-center gap-3 text-sm text-slate-500"
-              aria-live="polite"
-            >
-              <span
-                class="size-2 animate-pulse rounded-full bg-slate-400"
-                aria-hidden="true"
-              />
-              {{ latestRun?.status === "PENDING" ? "正在生成…" : "正在处理…" }}
-              <Button
-                variant="outline"
-                size="small"
-                :disabled="busyAction !== null"
-                @click="stopAnswer"
-              >
-                停止
-              </Button>
-            </div>
-
-            <div
-              v-else-if="latestRun?.status === 'FAILED'"
-              class="flex items-center justify-between rounded-lg border border-rose-200 bg-rose-50 px-4 py-3"
-            >
-              <div>
-                <p class="text-sm font-medium text-rose-950">
-                  回答失败
-                </p>
-                <p class="mt-0.5 text-xs text-rose-700">
-                  {{ runFailureMessage }}
-                </p>
-              </div>
-              <Button
-                variant="outline"
-                size="small"
-                @click="retryAnswer"
-              >
-                <RotateCcw
-                  :size="14"
-                  aria-hidden="true"
-                />
-                重试
-              </Button>
-            </div>
-
-            <div
-              v-else-if="latestRun?.status === 'CANCELLED'"
-              class="flex items-center justify-between rounded-lg border border-stone-200 bg-stone-100 px-4 py-3"
-            >
-              <div>
-                <p class="text-sm font-medium text-slate-900">
-                  已停止回答
-                </p>
-                <p class="mt-0.5 text-xs text-slate-600">
-                  问题已保存，可以重新尝试。
-                </p>
-              </div>
-              <Button
-                variant="outline"
-                size="small"
-                @click="retryAnswer"
-              >
-                <RotateCcw
-                  :size="14"
-                  aria-hidden="true"
-                />
-                重试
-              </Button>
-            </div>
-
-            <div
-              v-else-if="latestRun?.status === 'SUCCEEDED'"
-              class="flex items-center justify-between border-t border-stone-200 pt-4"
-            >
-              <p class="text-xs text-slate-500">
-                回答已保存
-              </p>
-              <Button
-                variant="ghost"
-                size="small"
-                @click="regenerateAnswer"
-              >
-                <RotateCcw
-                  :size="14"
-                  aria-hidden="true"
-                />
-                重新生成
-              </Button>
-            </div>
-          </div>
-
-          <form
-            v-if="selectedConversation"
-            class="mt-8 border-t border-stone-200 pt-6"
-            @submit.prevent="sendQuestion"
-          >
-            <label
-              class="sr-only"
-              for="question"
-            >输入问题</label>
-            <div class="rounded-xl border border-stone-300 bg-white p-2 shadow-sm focus-within:border-slate-400 focus-within:ring-2 focus-within:ring-slate-200">
-              <textarea
-                id="question"
-                v-model="composerContent"
-                class="block min-h-24 w-full resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-6 text-slate-800 outline-none placeholder:text-slate-400"
-                :disabled="busyAction !== null || hasActiveRun"
-                placeholder="输入你的学习问题…"
-                @keydown.meta.enter.prevent="sendQuestion"
-                @keydown.ctrl.enter.prevent="sendQuestion"
-              />
-              <div class="flex items-center justify-between px-1 pt-1">
-                <span class="text-xs text-slate-400">Ctrl/⌘ + Enter 发送</span>
-                <Button
-                  type="submit"
-                  size="icon"
-                  aria-label="发送问题"
-                  :disabled="busyAction !== null || hasActiveRun || !composerContent.trim()"
-                >
-                  <ArrowUp
-                    :size="16"
-                    aria-hidden="true"
-                  />
-                </Button>
-              </div>
-            </div>
-          </form>
-        </div>
-      </div>
-    </section>
+      v-model:composer-content="composerContent"
+      :selected-conversation="selectedConversation ?? null"
+      :messages="messages"
+      :latest-run="latestRun"
+      :stream-content="hasCurrentStream ? streamState?.content ?? '' : null"
+      :busy-action="busyAction"
+      :is-loading="isLoading"
+      :request-error="requestError"
+      :has-pending-network-command="pendingNetworkCommand !== null"
+      :has-active-run="hasActiveRun"
+      :run-failure-message="runFailureMessage"
+      @refresh="refreshFacts()"
+      @rename="renameConversation"
+      @delete="deleteSelectedConversation"
+      @retry-network="retryNetworkRequest"
+      @stop="stopAnswer"
+      @retry="retryAnswer"
+      @regenerate="regenerateAnswer"
+      @send="sendQuestion"
+    />
     <section
       v-else-if="activeView === 'memory'"
-      class="min-w-0 flex-1 overflow-y-auto"
+      class="min-w-0 flex-1 overflow-y-auto bg-workspace"
     >
       <MemoryPage
         ref="memoryPage"
@@ -903,7 +527,7 @@ onBeforeUnmount(() => {
     </section>
     <section
       v-else
-      class="min-w-0 flex-1 overflow-y-auto"
+      class="min-w-0 flex-1 overflow-y-auto bg-workspace"
     >
       <KnowledgePage @notice="showMemoryNotice" />
     </section>

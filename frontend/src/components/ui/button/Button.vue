@@ -10,16 +10,16 @@ type ButtonVariant = "accent" | "ghost" | "outline";
 type ButtonSize = "default" | "icon" | "small";
 
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-2 rounded-md font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex shrink-0 items-center justify-center gap-2 rounded-md font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30 disabled:pointer-events-none disabled:opacity-50",
   {
     variants: {
       variant: {
         accent:
-          "bg-slate-900 text-white hover:bg-slate-700 focus-visible:ring-slate-500",
+          "bg-primary-deep text-primary-foreground hover:bg-primary focus-visible:ring-ring",
         ghost:
-          "bg-transparent text-slate-600 hover:bg-slate-100 hover:text-slate-950 focus-visible:ring-slate-400",
+          "bg-transparent text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:ring-ring",
         outline:
-          "border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 focus-visible:ring-slate-400",
+          "border border-strong-border bg-surface text-body hover:bg-subtle hover:text-foreground focus-visible:ring-ring",
       },
       size: {
         default: "h-9 px-3.5 text-sm",
