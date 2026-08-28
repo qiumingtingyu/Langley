@@ -17,6 +17,34 @@ export interface KnowledgeBase {
   created_at: string;
 }
 
+export interface Memory {
+  id: number;
+  content: string;
+  valid_until: string | null;
+  source_message_id: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type MemoryPolicyStatus = "READY" | "NOT_CONFIGURED" | "PROVIDER_CONFIGURATION_UNAVAILABLE";
+
+export interface MemoryOperationalStatus {
+  auto_memory_enabled: boolean;
+  policy_status: MemoryPolicyStatus;
+  pending_evidence_count: number;
+  oldest_pending_message_id: number | null;
+  oldest_pending_created_at: string | null;
+}
+
+export interface MemorySyncResult {
+  processed_count: number;
+  remaining_count: number;
+  complete: boolean;
+  stop_reason: "COMPLETE" | "LIMIT_REACHED" | "POLICY_UNAVAILABLE" | "PROVIDER_FAILURE" | "CONTEXT_INFEASIBLE" | "TIMEOUT";
+  oldest_pending_message_id: number | null;
+  oldest_pending_created_at: string | null;
+}
+
 export interface MessageCitation {
   evidence_handle: number;
   document_version_id: number;

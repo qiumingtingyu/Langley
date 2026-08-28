@@ -32,6 +32,7 @@ function response(payload: unknown, ok = true): Response { return { ok, json: as
 function conversation(id: number, title: string) { return { id, title, created_at: "2026-08-16T00:00:00Z", updated_at: "2026-08-16T00:00:00Z", last_message_at: null }; }
 function message(id: number, content: string, role: Message["role"] = "USER", runId: number | null = null, citations: MessageCitation[] = []): Message { return { id, sequence_no: id, role, content, run_id: runId, regenerated_from_message_id: null, created_at: "2026-08-16T00:00:00Z", citations }; }
 function run(id: number, status: RunStatus, knowledgeBaseId: number | null = null, groundingPolicy: "AUTO" | "REQUIRED" = "AUTO"): Run { return { id, input_message_id: id, attempt_no: 1, knowledge_base_id: knowledgeBaseId, grounding_policy: groundingPolicy, status, started_at: status === "PENDING" ? null : "2026-08-16T00:00:00Z", finished_at: ["SUCCEEDED", "FAILED", "CANCELLED"].includes(status) ? "2026-08-16T00:01:00Z" : null, error_code: status === "FAILED" ? "LLM_PROVIDER_FAILED" : null }; }
+function memoryStatus(autoMemoryEnabled: boolean, pendingEvidenceCount = 0) { return { auto_memory_enabled: autoMemoryEnabled, policy_status: "READY", pending_evidence_count: pendingEvidenceCount, oldest_pending_message_id: null, oldest_pending_created_at: null }; }
 function button(wrapper: VueWrapper, text: string) { const found = wrapper.findAll("button").find((candidate) => candidate.text().includes(text)); if (found === undefined) throw new Error(`button not found: ${text}`); return found; }
 async function settle(): Promise<void> { await flushPromises(); await nextTick(); await flushPromises(); }
 
@@ -323,18 +324,18 @@ describe("App user behavior", () => {
 
   it("switches to Memory, loads effective facts, and serializes a local expiry absolutely", async () => {
     const wrapper = await mountInitial();
-    enqueue(response({ auto_memory_enabled: true }));
+    enqueue(response(memoryStatus(true)));
     enqueue(response([]));
     await button(wrapper, "记忆").trigger("click");
     await settle();
     expect(wrapper.text()).toContain("还没有长期记忆");
-    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/memory-settings");
+    expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/memory-status");
     expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/memories");
 
     await wrapper.get('textarea[maxlength="1000"]').setValue("记住偏好");
     await wrapper.get('input[type="datetime-local"]').setValue("2030-01-02T03:04");
     enqueue(response({ id: 3 }));
-    enqueue(response({ auto_memory_enabled: true }));
+    enqueue(response(memoryStatus(true)));
     enqueue(response([]));
     await wrapper.findAll("form").at(-1)!.trigger("submit");
     await settle();
@@ -377,7 +378,7 @@ describe("App user behavior", () => {
   it("maps Memory errors, handles direct and conversational source lazily, and forgets idempotently", async () => {
     vi.stubGlobal("confirm", () => true);
     const wrapper = await mountInitial();
-    enqueue(response({ auto_memory_enabled: false }));
+    enqueue(response(memoryStatus(false)));
     enqueue(response([{ id: 4, content: "直接记忆", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]));
     await button(wrapper, "记忆").trigger("click");
     await settle();
@@ -385,8 +386,8 @@ describe("App user behavior", () => {
     enqueue(response({ kind: "direct" }));
     await button(wrapper, "来源").trigger("click");
     await settle();
-    expect(wrapper.text()).toContain("由你直接设置或修改");
-    enqueue(response({})); enqueue(response({ auto_memory_enabled: false })); enqueue(response([]));
+    expect(wrapper.text()).toContain("由你直接添加或修改");
+    enqueue(response({})); enqueue(response(memoryStatus(false))); enqueue(response([]));
     await button(wrapper, "忘记").trigger("click");
     await settle();
     expect(wrapper.text()).toContain("还没有长期记忆");
@@ -396,9 +397,9 @@ describe("App user behavior", () => {
   it("keeps one Memory SSE across view switches, maps all outcomes, refreshes Memory, and closes on unmount", async () => {
     const wrapper = await mountInitial();
     const memorySource = FakeEventSource.instances.find((item) => item.url === "/api/memory-events")!;
-    enqueue(response({ auto_memory_enabled: true })); enqueue(response([]));
+    enqueue(response(memoryStatus(true))); enqueue(response([]));
     await button(wrapper, "记忆").trigger("click"); await settle();
-    enqueue(response({ auto_memory_enabled: true })); enqueue(response([]));
+    enqueue(response(memoryStatus(true))); enqueue(response([]));
     memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: JSON.stringify({ user_requested_memory_action: true, changed_count: 1 }) })); await settle();
     expect(wrapper.text()).toContain("长期记忆已更新");
     for (const [event, message] of [["memory.no_change", "本次未对长期记忆做出修改"], ["memory.retry_pending", "长期记忆同步暂时未完成"], ["memory.not_saved", "本次内容未保存为长期记忆"]] as const) {
@@ -415,7 +416,7 @@ describe("App user behavior", () => {
     memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: JSON.stringify({ user_requested_memory_action: false }) })); await settle();
     expect(wrapper.get('[aria-label="记忆有更新"]').exists()).toBe(true);
     expect(wrapper.find('[role="status"]').exists()).toBe(false);
-    enqueue(response({ auto_memory_enabled: true })); enqueue(response([]));
+    enqueue(response(memoryStatus(true))); enqueue(response([]));
     await button(wrapper, "记忆").trigger("click"); await settle();
     expect(wrapper.find('[aria-label="记忆有更新"]').exists()).toBe(false);
     await button(wrapper, "聊天").trigger("click");
@@ -429,16 +430,16 @@ describe("App user behavior", () => {
   it("corrects without changing an absolute expiry, handles toggle rollback, and renders conversational source", async () => {
     const wrapper = await mountInitial();
     const memory = { id: 9, content: "旧内容", valid_until: "2030-01-02T03:04:37Z", source_message_id: 22, created_at: "x", updated_at: "x" };
-    enqueue(response({ auto_memory_enabled: false })); enqueue(response([memory]));
+    enqueue(response(memoryStatus(false))); enqueue(response([memory]));
     await button(wrapper, "记忆").trigger("click"); await settle();
     await button(wrapper, "修改").trigger("click");
-    enqueue(response(memory)); enqueue(response({ auto_memory_enabled: false })); enqueue(response([memory]));
+    enqueue(response(memory)); enqueue(response(memoryStatus(false))); enqueue(response([memory]));
     await wrapper.findAll("form").at(-1)!.trigger("submit"); await settle();
     const put = fetchMock.mock.calls.find(([path, init]) => path === "/api/memories/9" && init?.method === "PUT");
     expect(JSON.parse(String(put?.[1]?.body)).valid_until).toBe("2030-01-02T03:04:37.000Z");
-    enqueue(response({ auto_memory_enabled: true })); await button(wrapper, "开启").trigger("click"); await settle(); expect(wrapper.text()).toContain("自动记忆：开");
-    enqueue(response({ detail: { code: "MEMORY_SYNC_UNAVAILABLE" } }, false)); await button(wrapper, "关闭").trigger("click"); await settle();
-    expect(wrapper.text()).toContain("自动记忆：开"); expect(wrapper.text()).toContain("长期记忆同步暂时无法完成");
+    enqueue(response({ auto_memory_enabled: true })); enqueue(response(memoryStatus(true))); enqueue(response([memory])); await button(wrapper, "开启自动整理").trigger("click"); await settle(); expect(wrapper.text()).toContain("关闭自动整理");
+    enqueue(response({ detail: { code: "MEMORY_SYNC_UNAVAILABLE" } }, false)); await button(wrapper, "关闭自动整理").trigger("click"); await settle();
+    expect(wrapper.text()).toContain("关闭自动整理"); expect(wrapper.text()).toContain("自动整理暂时不可用");
     enqueue(response({ kind: "conversation", conversation_title: null, conversation_deleted: true, context_messages: [{ id: 21, role: "USER", content: "前文" }, { id: 22, role: "USER", content: "证据" }, { id: 23, role: "ASSISTANT", content: "后文" }] }));
     await button(wrapper, "来源").trigger("click"); await settle(); expect(wrapper.text()).toContain("原会话已删除"); expect(wrapper.text()).toContain("证据");
     wrapper.unmount();
@@ -450,37 +451,37 @@ describe("App user behavior", () => {
       { id: 31, content: "A", valid_until: null, source_message_id: 1, created_at: "x", updated_at: "x" },
       { id: 32, content: "B", valid_until: null, source_message_id: 2, created_at: "x", updated_at: "x" },
     ];
-    enqueue(response({ auto_memory_enabled: true })); enqueue(response(memories));
+    enqueue(response(memoryStatus(true))); enqueue(response(memories));
     await button(wrapper, "记忆").trigger("click"); await settle();
     const oldSource = deferred<Response>(); enqueue(oldSource.promise);
-    await wrapper.findAll("button").filter((item) => item.text() === "来源")[0]!.trigger("click"); await nextTick();
+    await wrapper.findAll("button").filter((item) => item.text() === "查看来源")[0]!.trigger("click"); await nextTick();
     enqueue(response({ kind: "direct" }));
-    await wrapper.findAll("button").filter((item) => item.text() === "来源")[1]!.trigger("click"); await settle();
+    await wrapper.findAll("button").filter((item) => item.text() === "查看来源")[1]!.trigger("click"); await settle();
     oldSource.resolve(response({ kind: "conversation", conversation_title: null, conversation_deleted: false, context_messages: [{ id: 1, role: "USER", content: "stale A" }] })); await settle();
-    expect(wrapper.text()).toContain("由你直接设置或修改"); expect(wrapper.text()).not.toContain("stale A");
+    expect(wrapper.text()).toContain("由你直接添加或修改"); expect(wrapper.text()).not.toContain("stale A");
     wrapper.unmount();
   });
 
   it("does not let decoded stale Memory bodies overwrite a newer reload", async () => {
     const wrapper = await mountInitial();
     const memorySource = FakeEventSource.instances.find((item) => item.url === "/api/memory-events")!;
-    enqueue(response({ auto_memory_enabled: false })); enqueue(response([]));
+    enqueue(response(memoryStatus(false))); enqueue(response([]));
     await button(wrapper, "记忆").trigger("click"); await settle();
-    const oldSettings = deferred<unknown>(); const oldMemories = deferred<unknown>();
-    enqueue({ ok: true, json: () => oldSettings.promise } as Response);
+    const oldStatus = deferred<unknown>(); const oldMemories = deferred<unknown>();
+    enqueue({ ok: true, json: () => oldStatus.promise } as Response);
     enqueue({ ok: true, json: () => oldMemories.promise } as Response);
     memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: "{}" }));
     await flushPromises();
-    enqueue(response({ auto_memory_enabled: true })); enqueue(response([{ id: 50, content: "new", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]));
+    enqueue(response(memoryStatus(true))); enqueue(response([{ id: 50, content: "new", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]));
     memorySource.emit("memory.updated", new MessageEvent("memory.updated", { data: "{}" })); await settle();
-    oldSettings.resolve({ auto_memory_enabled: false }); oldMemories.resolve([{ id: 51, content: "old", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]); await settle();
-    expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("old"); expect(wrapper.text()).toContain("自动记忆：开");
+    oldStatus.resolve(memoryStatus(false)); oldMemories.resolve([{ id: 51, content: "old", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]); await settle();
+    expect(wrapper.text()).toContain("new"); expect(wrapper.text()).not.toContain("old"); expect(wrapper.text()).toContain("关闭自动整理");
     wrapper.unmount();
   });
 
   it("maps not-found and validation failures without rendering backend detail", async () => {
     const wrapper = await mountInitial();
-    enqueue(response({ auto_memory_enabled: true })); enqueue(response([{ id: 41, content: "现有", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]));
+    enqueue(response(memoryStatus(true))); enqueue(response([{ id: 41, content: "现有", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]));
     await button(wrapper, "记忆").trigger("click"); await settle();
     enqueue(response({ detail: { code: "MEMORY_NOT_FOUND", internal: "never show" } }, false));
     await button(wrapper, "来源").trigger("click"); await settle();
