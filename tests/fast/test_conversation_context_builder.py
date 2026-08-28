@@ -5,7 +5,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from langley.answering.contracts import LLMFinishReason, LLMResponseCompleted
+from langley.answering.contracts import LLMFinishReason, LLMResponseCompleted, LLMUsage
 from langley.answering.conversation_context import (
     ConversationCompactState,
     LLMConversationCompactor,
@@ -15,6 +15,7 @@ from langley.answering.conversation_context_builder import (
     _AuthoritativeContextFacts,
 )
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
+from langley.answering.tracing import context_compaction_trace_context
 from langley.infrastructure.models import (
     ConversationContextSnapshot,
     Memory,
@@ -108,12 +109,18 @@ def _state_payload(
     }
 
 
-def _completion(payload: dict[str, object]) -> LLMResponseCompleted:
+def _completion(
+    payload: dict[str, object],
+    *,
+    usage: LLMUsage | None = None,
+    provider_model: str | None = None,
+) -> LLMResponseCompleted:
     return LLMResponseCompleted(
         assistant_content=json.dumps(payload),
         tool_calls=(),
         finish_reason=LLMFinishReason.STOP,
-        usage=None,
+        usage=usage,
+        provider_model=provider_model,
     )
 
 
@@ -148,6 +155,15 @@ class _RecordingBuilder(ConversationContextBuilder):
 
     def _log_compaction(self, **event) -> None:
         self.compaction_events.append(event)
+        super()._log_compaction(**event)
+
+
+class _RecordingContextCompactionTrace:
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+
+    def context_compact(self, **event) -> None:
+        self.events.append(event)
 
 
 def _builder(
@@ -200,10 +216,13 @@ def test_short_history_does_not_invoke_compactor() -> None:
         (_run(10, 1), _run(11, 3, "RUNNING")),
     )
     builder = _builder(facts, provider, trigger=50)
+    trace = _RecordingContextCompactionTrace()
 
-    context = _build(builder, 3)
+    with context_compaction_trace_context(trace):
+        context = _build(builder, 3)
 
     assert provider.requests == []
+    assert trace.events == []
     assert context.conversation_compact_context is None
     assert [turn.user_content for turn in context.completed_turns] == ["hello"]
 
@@ -252,8 +271,10 @@ def test_orion_canary_compact_while_recent_is_raw() -> None:
         trigger=25,
         recent_target=12,
     )
+    trace = _RecordingContextCompactionTrace()
 
-    context = _build(builder, 7)
+    with context_compaction_trace_context(trace):
+        context = _build(builder, 7)
 
     assert "ORION" in (context.conversation_compact_context or "")
     assert "CANARY" in (context.conversation_compact_context or "")
@@ -261,6 +282,20 @@ def test_orion_canary_compact_while_recent_is_raw() -> None:
         "I meant B, not A."
     ]
     assert builder.persisted[0][0] == 4
+    assert len(trace.events) == 1
+    assert trace.events[0] == {
+        "estimated_before": builder.compaction_events[-1]["estimated_before"],
+        "estimated_after": builder.compaction_events[-1]["estimated_after"],
+        "newly_compacted_turn_count": 2,
+        "recent_raw_turn_count": 1,
+        "compactor_model": "qwen-compactor",
+        "provider_model": None,
+        "provider_input_tokens": None,
+        "provider_output_tokens": None,
+        "duration_ms": builder.compaction_events[-1]["duration_ms"],
+        "success": True,
+        "outcome": "COMPACTED",
+    }
     request_payload = json.loads(provider.requests[0].transcript[0].content)
     assert [
         message["message_id"] for message in request_payload["newly_aged_out_messages"]
@@ -396,7 +431,13 @@ def test_non_beneficial_output_is_rejected_before_snapshot_persistence() -> None
     provider = FakeProvider(
         [
             ScriptedProviderRound(
-                events=(_completion(_state_payload([("X" * 500, [3])])),)
+                events=(
+                    _completion(
+                        _state_payload([("X" * 500, [3])]),
+                        usage=LLMUsage(input_tokens=321, output_tokens=45),
+                        provider_model="provider-compactor",
+                    ),
+                )
             )
         ]
     )
@@ -419,8 +460,10 @@ def test_non_beneficial_output_is_rejected_before_snapshot_persistence() -> None
         trigger=15,
         recent_target=8,
     )
+    trace = _RecordingContextCompactionTrace()
 
-    context = _build(builder, 7)
+    with context_compaction_trace_context(trace):
+        context = _build(builder, 7)
 
     assert builder.persisted == []
     assert "ORION" in (context.conversation_compact_context or "")
@@ -430,6 +473,12 @@ def test_non_beneficial_output_is_rejected_before_snapshot_persistence() -> None
     ]
     assert builder.compaction_events[-1]["success"] is False
     assert builder.compaction_events[-1]["outcome"] == "NON_BENEFICIAL_OUTPUT"
+    assert builder.compaction_events[-1]["provider_model"] == "provider-compactor"
+    assert builder.compaction_events[-1]["provider_input_tokens"] == 321
+    assert builder.compaction_events[-1]["provider_output_tokens"] == 45
+    assert trace.events[0]["provider_model"] == "provider-compactor"
+    assert trace.events[0]["provider_input_tokens"] == 321
+    assert trace.events[0]["provider_output_tokens"] == 45
 
 
 def test_beneficial_candidate_over_working_budget_is_rejected() -> None:

@@ -19,7 +19,7 @@ from langley.answering.contracts import (
     ToolCall,
     ToolResult,
 )
-from langley.answering.tracing import KnowledgeSearchOrigin
+from langley.answering.tracing import CitationNamespace, KnowledgeSearchOrigin
 
 FORMAL_B0_MAX_CHUNK_CHARS = 1200
 FORMAL_B0_CHUNK_OVERLAP = 0
@@ -408,17 +408,20 @@ class _CasebookExecutionTrace:
     def citation_validate(
         self,
         *,
+        namespace: CitationNamespace,
         available_evidence_count: int,
-        cited_handles: tuple[int, ...],
+        cited_handles: tuple[int | str, ...],
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
         abstention_control_token_leaked: bool = False,
     ) -> None:
+        del namespace
         self._value["abstention_control_token_leaked"] = bool(
             self._value["abstention_control_token_leaked"]
             or abstention_control_token_leaked
         )
+
         self._value["citation_validations"].append(
             {
                 "available_evidence_count": available_evidence_count,
@@ -429,6 +432,9 @@ class _CasebookExecutionTrace:
                 "abstention_control_token_leaked": (abstention_control_token_leaked),
             }
         )
+
+    def context_compact(self, **kwargs: object) -> None:
+        del kwargs
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
         self._finish("SUCCEEDED", None)

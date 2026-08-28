@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from datetime import datetime
 from typing import cast
 
 import pytest
@@ -18,7 +19,11 @@ from langley.answering.contracts import (
     ToolResultKind,
     UserRuntimeMessage,
 )
-from langley.answering.tracing import LangSmithTracer
+from langley.answering.tracing import (
+    CitationNamespace,
+    KnowledgeSearchOrigin,
+    LangSmithTracer,
+)
 
 
 def test_disabled_tracing_does_not_create_a_client() -> None:
@@ -241,7 +246,23 @@ async def test_llm_span_records_real_monotonic_timing_ttft_and_provider_usage(
     assert update["end_time"] is not None
     assert update["outputs"] == {}
     metadata = cast(dict[str, object], update["extra"])["metadata"]
+    create_metadata = cast(dict[str, object], llm_create["extra"])["metadata"]
+    for key in (
+        "langley_run_id",
+        "workflow",
+        "provider",
+        "model",
+        "llm_round",
+    ):
+        assert (
+            cast(dict[str, object], metadata)[key]
+            == cast(dict[str, object], create_metadata)[key]
+        )
     assert metadata == {
+        "langley_run_id": 2,
+        "workflow": "learning_assistant",
+        "provider": "qwen",
+        "model": "requested-model",
         "llm_round": 1,
         "finish_reason": "STOP",
         "tool_call_count": 0,
@@ -337,6 +358,7 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
         ToolResult("search-1", "search_knowledge", ToolResultKind.SUCCESS, "secret")
     )
     trace.citation_validate(
+        namespace=CitationNamespace.KNOWLEDGE,
         available_evidence_count=1,
         cited_handles=(1,),
         cited_document_version_ids=(13,),
@@ -382,6 +404,20 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
     assert tool_update["error"] is None
     assert tool_update["outputs"] == {}
     tool_metadata = cast(dict[str, object], tool_update["extra"])["metadata"]
+    tool_create_metadata = cast(dict[str, object], tool_span["extra"])["metadata"]
+    for key in (
+        "langley_run_id",
+        "workflow",
+        "provider",
+        "model",
+        "tool_name",
+        "tool_call_id",
+        "tool_calls_used",
+    ):
+        assert (
+            cast(dict[str, object], tool_metadata)[key]
+            == cast(dict[str, object], tool_create_metadata)[key]
+        )
     assert cast(dict[str, object], tool_metadata)["tool_result_kind"] == (
         ToolResultKind.SUCCESS.value
     )
@@ -389,6 +425,22 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
     assert knowledge_update["error"] is None
     assert knowledge_update["outputs"] == {}
     knowledge_metadata = cast(dict[str, object], knowledge_update["extra"])["metadata"]
+    knowledge_create_metadata = cast(dict[str, object], knowledge_span["extra"])[
+        "metadata"
+    ]
+    for key in (
+        "langley_run_id",
+        "workflow",
+        "provider",
+        "model",
+        "origin",
+        "knowledge_base_id",
+        "top_k",
+    ):
+        assert (
+            cast(dict[str, object], knowledge_metadata)[key]
+            == cast(dict[str, object], knowledge_create_metadata)[key]
+        )
     assert cast(dict[str, object], knowledge_metadata)["success"] is True
     assert cast(dict[str, object], knowledge_metadata)["hit_count"] == 1
     assert citation_span["extra"] == {
@@ -397,6 +449,7 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
             "workflow": "learning_assistant",
             "provider": "qwen",
             "model": "test",
+            "namespace": "KNOWLEDGE",
             "available_evidence_count": 1,
             "citation_count": 1,
             "evidence_handles": [1],
@@ -404,6 +457,158 @@ async def test_agent_tool_and_citation_spans_export_only_authorized_metadata() -
             "abstained": False,
             "success": True,
         }
+    }
+
+
+@pytest.mark.anyio
+async def test_required_knowledge_failure_preserves_static_metadata_on_update() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.creates: list[dict[str, object]] = []
+            self.updates: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            self.creates.append(kwargs)
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args
+            self.updates.append(kwargs)
+            self.ready.set()
+
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(10, "qwen", "test", False)
+    search = trace.begin_knowledge_search(
+        origin=KnowledgeSearchOrigin.HARNESS_REQUIRED,
+        knowledge_base_id=88,
+        top_k=5,
+        query="private required query",
+    )
+    search.finish(hit_count=None, error_code="KNOWLEDGE_SEARCH_FAILED")
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    search_create = next(
+        item for item in client.creates if item["name"] == "knowledge.search"
+    )
+    update = client.updates[0]
+    create_metadata = cast(dict[str, object], search_create["extra"])["metadata"]
+    update_metadata = cast(dict[str, object], update["extra"])["metadata"]
+    for key in (
+        "langley_run_id",
+        "workflow",
+        "provider",
+        "model",
+        "origin",
+        "knowledge_base_id",
+        "top_k",
+    ):
+        assert (
+            cast(dict[str, object], update_metadata)[key]
+            == cast(dict[str, object], create_metadata)[key]
+        )
+    assert cast(dict[str, object], update_metadata)["success"] is False
+    assert cast(dict[str, object], update_metadata)["error_code"] == (
+        "KNOWLEDGE_SEARCH_FAILED"
+    )
+    assert "knowledge_search_duration_ms" in cast(dict[str, object], update_metadata)
+    assert search_create["inputs"] == {}
+    assert update["outputs"] == {}
+    assert "private required query" not in repr((client.creates, client.updates))
+
+
+@pytest.mark.anyio
+async def test_context_compaction_and_web_citation_export_only_safe_metadata() -> None:
+    class RecordingClient:
+        def __init__(self) -> None:
+            self.creates: list[dict[str, object]] = []
+            self.ready = threading.Event()
+
+        def create_run(self, **kwargs: object) -> None:
+            self.creates.append(kwargs)
+            if len(self.creates) == 3:
+                self.ready.set()
+
+        def update_run(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+
+    client = RecordingClient()
+    trace = LangSmithTracer(
+        enabled=True,
+        project=None,
+        client_factory=lambda: client,  # type: ignore[arg-type]
+    ).start(9, "qwen", "answer-model", True)
+    trace.context_compact(
+        estimated_before=17_500,
+        estimated_after=7_200,
+        newly_compacted_turn_count=30,
+        recent_raw_turn_count=12,
+        compactor_model="configured-compactor",
+        provider_model="provider-compactor",
+        provider_input_tokens=8_000,
+        provider_output_tokens=900,
+        duration_ms=321.5,
+        success=True,
+        outcome="COMPACTED",
+    )
+    trace.citation_validate(
+        namespace=CitationNamespace.WEB,
+        available_evidence_count=2,
+        cited_handles=("W1:E1",),
+        cited_document_version_ids=(),
+        abstained=False,
+        error_code=None,
+    )
+
+    assert await asyncio.to_thread(client.ready.wait, 1)
+    context_span = client.creates[1]
+    web_citation_span = client.creates[2]
+    assert context_span["name"] == "context.compact"
+    assert context_span["parent_run_id"] == client.creates[0]["id"]
+    assert context_span["inputs"] == {}
+    assert context_span["outputs"] == {}
+    span_duration_ms = (
+        cast(datetime, context_span["end_time"])
+        - cast(datetime, context_span["start_time"])
+    ).total_seconds() * 1000
+    assert span_duration_ms > 300
+    assert span_duration_ms == pytest.approx(321.5, abs=25)
+    assert context_span["extra"] == {
+        "metadata": {
+            "langley_run_id": 9,
+            "workflow": "learning_assistant",
+            "provider": "qwen",
+            "model": "answer-model",
+            "estimated_before": 17_500,
+            "estimated_after": 7_200,
+            "newly_compacted_turn_count": 30,
+            "recent_raw_turn_count": 12,
+            "compactor_model": "configured-compactor",
+            "provider_model": "provider-compactor",
+            "provider_input_tokens": 8_000,
+            "provider_output_tokens": 900,
+            "duration_ms": 321.5,
+            "success": True,
+            "outcome": "COMPACTED",
+        }
+    }
+    assert web_citation_span["name"] == "citation.validate"
+    assert web_citation_span["inputs"] == {}
+    assert web_citation_span["outputs"] == {}
+    web_metadata = cast(dict[str, object], web_citation_span["extra"])["metadata"]
+    assert web_metadata == {
+        "langley_run_id": 9,
+        "workflow": "learning_assistant",
+        "provider": "qwen",
+        "model": "answer-model",
+        "namespace": "WEB",
+        "available_evidence_count": 2,
+        "citation_count": 1,
+        "abstained": False,
+        "success": True,
     }
 
 

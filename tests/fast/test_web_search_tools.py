@@ -70,6 +70,29 @@ class _FakeWebProvider:
         return self.extract_response
 
 
+class _RecordingToolTrace:
+    def __init__(self) -> None:
+        self.metadata: dict[str, object] | None = None
+
+    def finish(
+        self,
+        result: object,
+        error_code: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        del result, error_code
+        self.metadata = metadata
+
+
+class _RecordingExecutionTrace:
+    def __init__(self) -> None:
+        self.tool = _RecordingToolTrace()
+
+    def begin_tool(self, call: ToolCall, tool_calls_used: int) -> _RecordingToolTrace:
+        del call, tool_calls_used
+        return self.tool
+
+
 def _executor(provider: _FakeWebProvider) -> ToolExecutor:
     return ToolExecutor(tools=(SearchWebTool(provider), ReadWebpageTool(provider)))
 
@@ -84,12 +107,16 @@ def _context(session: WebToolSession | None = None) -> ToolContext:
 
 
 async def _search(
-    executor: ToolExecutor, context: ToolContext, call_id: str = "search-1"
+    executor: ToolExecutor,
+    context: ToolContext,
+    call_id: str = "search-1",
+    trace: Any = None,
 ):
     return (
         await executor.execute_batch(
             (ToolCall(call_id, "search_web", '{"query":"latest facts"}'),),
             context=context,
+            trace=trace,
         )
     )[0]
 
@@ -134,8 +161,9 @@ async def test_search_web_rejects_invalid_arguments(raw_arguments: str) -> None:
 async def test_search_web_assigns_deterministic_run_local_handles() -> None:
     provider = _FakeWebProvider()
     context = _context()
+    trace = _RecordingExecutionTrace()
 
-    result = await _search(_executor(provider), context)
+    result = await _search(_executor(provider), context, trace=trace)
 
     assert result.kind is ToolResultKind.SUCCESS
     assert json.loads(result.content) == {
@@ -160,6 +188,8 @@ async def test_search_web_assigns_deterministic_run_local_handles() -> None:
     }
     assert provider.search_queries == ["latest facts"]
     assert [source.result_id for source in context.web_session.sources] == ["W1", "W2"]
+    assert trace.tool.metadata is not None
+    assert trace.tool.metadata["success"] is True
 
 
 @pytest.mark.anyio
@@ -167,14 +197,21 @@ async def test_search_web_maps_provider_failure_to_safe_tool_error() -> None:
     provider = _FakeWebProvider(
         search_error=WebProviderError("WEB_PROVIDER_UNAVAILABLE", retryable=True)
     )
+    trace = _RecordingExecutionTrace()
 
-    result = await _search(_executor(provider), _context())
+    result = await _search(_executor(provider), _context(), trace=trace)
 
     assert result.kind is ToolResultKind.TOOL_ERROR
     assert json.loads(result.content) == {
         "error": {"code": "WEB_PROVIDER_UNAVAILABLE", "retryable": True}
     }
     assert "exception" not in result.content.lower()
+    assert trace.tool.metadata == {
+        "success": False,
+        "tool_error_code": "WEB_PROVIDER_UNAVAILABLE",
+        "retryable": True,
+    }
+    assert "latest facts" not in repr(trace.tool.metadata)
 
 
 @pytest.mark.anyio

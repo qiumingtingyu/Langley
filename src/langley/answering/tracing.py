@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from time import monotonic
 from typing import Protocol
@@ -36,6 +36,13 @@ class KnowledgeSearchOrigin(StrEnum):
     HARNESS_REQUIRED = "HARNESS_REQUIRED"
 
 
+class CitationNamespace(StrEnum):
+    """Current-run evidence namespace validated by one citation event."""
+
+    KNOWLEDGE = "KNOWLEDGE"
+    WEB = "WEB"
+
+
 class ExecutionTrace(Protocol):
     def begin_llm(self, request: LLMRequest, round_: int) -> "LLMTrace": ...
 
@@ -57,12 +64,29 @@ class ExecutionTrace(Protocol):
     def citation_validate(
         self,
         *,
+        namespace: "CitationNamespace",
         available_evidence_count: int,
-        cited_handles: tuple[int, ...],
+        cited_handles: tuple[int | str, ...],
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
         abstention_control_token_leaked: bool = False,
+    ) -> None: ...
+
+    def context_compact(
+        self,
+        *,
+        estimated_before: int,
+        estimated_after: int | None,
+        newly_compacted_turn_count: int,
+        recent_raw_turn_count: int,
+        compactor_model: str | None,
+        provider_model: str | None,
+        provider_input_tokens: int | None,
+        provider_output_tokens: int | None,
+        duration_ms: float | None,
+        success: bool,
+        outcome: str,
     ) -> None: ...
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None: ...
@@ -121,9 +145,32 @@ class KnowledgeSearchTraceParent(Protocol):
     ) -> KnowledgeSearchTrace: ...
 
 
+class ContextCompactionTraceParent(Protocol):
+    """Narrow context-compaction trace seam without business DTO coupling."""
+
+    def context_compact(
+        self,
+        *,
+        estimated_before: int,
+        estimated_after: int | None,
+        newly_compacted_turn_count: int,
+        recent_raw_turn_count: int,
+        compactor_model: str | None,
+        provider_model: str | None,
+        provider_input_tokens: int | None,
+        provider_output_tokens: int | None,
+        duration_ms: float | None,
+        success: bool,
+        outcome: str,
+    ) -> None: ...
+
+
 _current_retrieval_trace_parent: ContextVar[KnowledgeSearchTraceParent | None] = (
     ContextVar("current_retrieval_trace_parent", default=None)
 )
+_current_context_compaction_trace_parent: ContextVar[
+    ContextCompactionTraceParent | None
+] = ContextVar("current_context_compaction_trace_parent", default=None)
 
 
 @contextmanager
@@ -142,6 +189,24 @@ def tool_trace_context(trace: ToolTrace | None):
 
 def current_retrieval_trace_parent() -> KnowledgeSearchTraceParent | None:
     return _current_retrieval_trace_parent.get()
+
+
+@contextmanager
+def context_compaction_trace_context(trace: ContextCompactionTraceParent | None):
+    """Keep trace parenting out of the context-builder protocol and DTOs."""
+
+    if trace is None:
+        yield
+        return
+    token = _current_context_compaction_trace_parent.set(trace)
+    try:
+        yield
+    finally:
+        _current_context_compaction_trace_parent.reset(token)
+
+
+def current_context_compaction_trace_parent() -> ContextCompactionTraceParent | None:
+    return _current_context_compaction_trace_parent.get()
 
 
 class LangSmithTracer:
@@ -211,20 +276,51 @@ class _NoopTrace:
     def citation_validate(
         self,
         *,
+        namespace: CitationNamespace,
         available_evidence_count: int,
-        cited_handles: tuple[int, ...],
+        cited_handles: tuple[int | str, ...],
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
         abstention_control_token_leaked: bool = False,
     ) -> None:
         del (
+            namespace,
             available_evidence_count,
             cited_handles,
             cited_document_version_ids,
             abstained,
             error_code,
             abstention_control_token_leaked,
+        )
+
+    def context_compact(
+        self,
+        *,
+        estimated_before: int,
+        estimated_after: int | None,
+        newly_compacted_turn_count: int,
+        recent_raw_turn_count: int,
+        compactor_model: str | None,
+        provider_model: str | None,
+        provider_input_tokens: int | None,
+        provider_output_tokens: int | None,
+        duration_ms: float | None,
+        success: bool,
+        outcome: str,
+    ) -> None:
+        del (
+            estimated_before,
+            estimated_after,
+            newly_compacted_turn_count,
+            recent_raw_turn_count,
+            compactor_model,
+            provider_model,
+            provider_input_tokens,
+            provider_output_tokens,
+            duration_ms,
+            success,
+            outcome,
         )
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
@@ -300,21 +396,24 @@ class _LangSmithTrace:
     def citation_validate(
         self,
         *,
+        namespace: CitationNamespace,
         available_evidence_count: int,
-        cited_handles: tuple[int, ...],
+        cited_handles: tuple[int | str, ...],
         cited_document_version_ids: tuple[int, ...],
         abstained: bool,
         error_code: str | None,
         abstention_control_token_leaked: bool = False,
     ) -> None:
         metadata: dict[str, JSONValue] = {
+            "namespace": namespace.value,
             "available_evidence_count": available_evidence_count,
             "citation_count": len(cited_handles),
-            "evidence_handles": list(cited_handles),
-            "document_version_ids": list(cited_document_version_ids),
             "abstained": abstained,
             "success": error_code is None,
         }
+        if namespace is CitationNamespace.KNOWLEDGE:
+            metadata["evidence_handles"] = list(cited_handles)
+            metadata["document_version_ids"] = list(cited_document_version_ids)
         if error_code is not None:
             metadata["error_code"] = error_code
         if abstention_control_token_leaked:
@@ -327,6 +426,47 @@ class _LangSmithTrace:
             metadata,
             self._root_id,
             True,
+        )
+
+    def context_compact(
+        self,
+        *,
+        estimated_before: int,
+        estimated_after: int | None,
+        newly_compacted_turn_count: int,
+        recent_raw_turn_count: int,
+        compactor_model: str | None,
+        provider_model: str | None,
+        provider_input_tokens: int | None,
+        provider_output_tokens: int | None,
+        duration_ms: float | None,
+        success: bool,
+        outcome: str,
+    ) -> None:
+        finished_at = datetime.now(UTC)
+        started_at = finished_at - timedelta(milliseconds=max(duration_ms or 0.0, 0.0))
+        self._create_with_id(
+            uuid4(),
+            "context.compact",
+            "chain",
+            {},
+            {},
+            {
+                "estimated_before": estimated_before,
+                "estimated_after": estimated_after,
+                "newly_compacted_turn_count": newly_compacted_turn_count,
+                "recent_raw_turn_count": recent_raw_turn_count,
+                "compactor_model": compactor_model,
+                "provider_model": provider_model,
+                "provider_input_tokens": provider_input_tokens,
+                "provider_output_tokens": provider_output_tokens,
+                "duration_ms": duration_ms,
+                "success": success,
+                "outcome": outcome,
+            },
+            self._root_id,
+            True,
+            started_at,
         )
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
@@ -480,6 +620,7 @@ class _LangSmithLLMTrace:
         self._started_monotonic = monotonic()
         self._ttft_ms: float | None = None
         self._finished = False
+        self._static_metadata: dict[str, JSONValue] = {"llm_round": round_}
         inputs: dict[str, JSONValue] = {}
         if trace._include_content:
             inputs = {
@@ -499,7 +640,7 @@ class _LangSmithLLMTrace:
             "llm",
             inputs,
             {},
-            {"llm_round": round_},
+            self._static_metadata,
             trace._root_id,
             False,
             self._started_at,
@@ -546,7 +687,9 @@ class _LangSmithLLMTrace:
             outputs=outputs,
             error=None,
             end_time=datetime.now(UTC),
-            extra={"metadata": metadata},
+            extra={
+                "metadata": self._trace._metadata | self._static_metadata | metadata
+            },
         )
 
     def failure(self, error_code: str) -> None:
@@ -560,11 +703,12 @@ class _LangSmithLLMTrace:
             error=error_code,
             end_time=datetime.now(UTC),
             extra={
-                "metadata": {
-                    "llm_round": self._round,
+                "metadata": self._trace._metadata
+                | self._static_metadata
+                | {
                     "llm_duration_ms": self._duration_ms(),
                     "ttft_ms": self._ttft_ms,
-                }
+                },
             },
         )
 
@@ -584,6 +728,11 @@ class _LangSmithToolTrace:
         self._call = call
         self._id = uuid4()
         self._started_at = datetime.now(UTC)
+        self._static_metadata: dict[str, JSONValue] = {
+            "tool_name": call.name,
+            "tool_call_id": call.call_id,
+            "tool_calls_used": tool_calls_used,
+        }
         inputs: dict[str, JSONValue] = (
             {"tool_call": _tool_call(call)} if trace._include_content else {}
         )
@@ -593,11 +742,7 @@ class _LangSmithToolTrace:
             "tool",
             inputs,
             {},
-            {
-                "tool_name": call.name,
-                "tool_call_id": call.call_id,
-                "tool_calls_used": tool_calls_used,
-            },
+            self._static_metadata,
             trace._root_id,
             False,
             self._started_at,
@@ -649,7 +794,11 @@ class _LangSmithToolTrace:
             ),
             error=error_code,
             end_time=datetime.now(UTC),
-            extra={"metadata": trace_metadata},
+            extra={
+                "metadata": self._trace._metadata
+                | self._static_metadata
+                | trace_metadata
+            },
         )
 
 
@@ -667,7 +816,7 @@ class _LangSmithKnowledgeSearchTrace:
         self._trace = trace
         self._id = uuid4()
         self._started_at = datetime.now(UTC)
-        metadata: dict[str, JSONValue] = {
+        self._static_metadata: dict[str, JSONValue] = {
             "knowledge_base_id": knowledge_base_id,
             "top_k": top_k,
             "origin": origin.value,
@@ -678,7 +827,7 @@ class _LangSmithKnowledgeSearchTrace:
             "retriever",
             ({"query": query} if self._trace._include_content else {}),
             {},
-            metadata,
+            self._static_metadata,
             parent_id,
             False,
             self._started_at,
@@ -703,7 +852,9 @@ class _LangSmithKnowledgeSearchTrace:
             outputs={},
             error=error_code,
             end_time=datetime.now(UTC),
-            extra={"metadata": metadata},
+            extra={
+                "metadata": self._trace._metadata | self._static_metadata | metadata
+            },
         )
 
 

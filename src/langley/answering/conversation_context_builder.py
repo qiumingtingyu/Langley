@@ -25,6 +25,7 @@ from langley.answering.conversation_context import (
     render_conversation_compact_context,
 )
 from langley.answering.errors import WorkflowFailure
+from langley.answering.tracing import current_context_compaction_trace_parent
 from langley.business_time import utc_now
 from langley.infrastructure.models import (
     Conversation,
@@ -189,11 +190,13 @@ class ConversationContextBuilder:
             )
 
         started_at = perf_counter()
+        completed_compaction: ConversationCompactionResult | None = None
         try:
             compaction = await self._compactor.compact(
                 previous_state=previous_state,
                 newly_aged_out_messages=self._messages_for_compactor(aged_turns),
             )
+            completed_compaction = compaction
             estimated_after = self._estimate_visible_conversation(
                 compaction.state, recent_turns
             )
@@ -218,6 +221,7 @@ class ConversationContextBuilder:
                 observed_snapshot_valid=valid_snapshot is not None,
             )
         except asyncio.CancelledError:
+            usage = None if completed_compaction is None else completed_compaction.usage
             self._log_compaction(
                 triggered=True,
                 previous_snapshot_present=snapshot_present,
@@ -229,10 +233,19 @@ class ConversationContextBuilder:
                 success=False,
                 outcome="CANCELLED",
                 duration_ms=self._duration_ms(started_at),
+                compactor_model=self._compactor.model,
+                provider_model=(
+                    None
+                    if completed_compaction is None
+                    else completed_compaction.provider_model
+                ),
+                provider_input_tokens=None if usage is None else usage.input_tokens,
+                provider_output_tokens=(None if usage is None else usage.output_tokens),
             )
             raise
         except Exception as error:
             fallback_turns = self._fallback_raw_turns(unincorporated_turns)
+            usage = None if completed_compaction is None else completed_compaction.usage
             self._log_compaction(
                 triggered=True,
                 previous_snapshot_present=snapshot_present,
@@ -246,6 +259,14 @@ class ConversationContextBuilder:
                 success=False,
                 outcome=self._failure_outcome(error),
                 duration_ms=self._duration_ms(started_at),
+                compactor_model=self._compactor.model,
+                provider_model=(
+                    None
+                    if completed_compaction is None
+                    else completed_compaction.provider_model
+                ),
+                provider_input_tokens=None if usage is None else usage.input_tokens,
+                provider_output_tokens=(None if usage is None else usage.output_tokens),
             )
             return self._answer_context(
                 raw_turns=fallback_turns,
@@ -636,3 +657,24 @@ class ConversationContextBuilder:
             success=success,
             outcome=outcome,
         )
+        if not triggered:
+            return
+        trace_parent = current_context_compaction_trace_parent()
+        if trace_parent is None:
+            return
+        try:
+            trace_parent.context_compact(
+                estimated_before=estimated_before,
+                estimated_after=estimated_after,
+                newly_compacted_turn_count=newly_compacted_turn_count,
+                recent_raw_turn_count=recent_raw_turn_count,
+                compactor_model=compactor_model,
+                provider_model=provider_model,
+                provider_input_tokens=provider_input_tokens,
+                provider_output_tokens=provider_output_tokens,
+                duration_ms=duration_ms,
+                success=success,
+                outcome=outcome,
+            )
+        except Exception:
+            logger.warning("conversation_context.compaction_trace_failed")

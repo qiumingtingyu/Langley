@@ -41,10 +41,12 @@ from langley.answering.knowledge_qa import (
 )
 from langley.answering.tools import ToolContext, ToolExecutionOutput, ToolExecutor
 from langley.answering.tracing import (
+    CitationNamespace,
     ExecutionTrace,
     KnowledgeSearchOrigin,
     LLMTrace,
     Tracer,
+    context_compaction_trace_context,
 )
 from langley.answering.web import WebToolSession, validated_web_answer
 from langley.knowledge.retrieval import RetrievalHit
@@ -171,11 +173,12 @@ class LearningAssistantWorkflow:
         trace = self._start_trace(run_id)
         try:
             async with asyncio.timeout(self._overall_deadline_seconds):
-                context = await self._context_builder.build(
-                    session_factory,
-                    conversation_id=conversation_id,
-                    current_user_message_id=input_message_id,
-                )
+                with context_compaction_trace_context(trace):
+                    context = await self._context_builder.build(
+                        session_factory,
+                        conversation_id=conversation_id,
+                        current_user_message_id=input_message_id,
+                    )
                 web_session = (
                     WebToolSession()
                     if any(
@@ -548,6 +551,7 @@ class LearningAssistantWorkflow:
             )
             self._trace(
                 lambda: trace.citation_validate(
+                    namespace=CitationNamespace.KNOWLEDGE,
                     available_evidence_count=0,
                     cited_handles=(),
                     cited_document_version_ids=(),
@@ -572,6 +576,7 @@ class LearningAssistantWorkflow:
             )
             self._trace(
                 lambda: trace.citation_validate(
+                    namespace=CitationNamespace.KNOWLEDGE,
                     available_evidence_count=len(state["retrieval_hits"]),
                     cited_handles=(),
                     cited_document_version_ids=(),
@@ -582,6 +587,7 @@ class LearningAssistantWorkflow:
             raise
         self._trace(
             lambda: trace.citation_validate(
+                namespace=CitationNamespace.KNOWLEDGE,
                 available_evidence_count=len(state["retrieval_hits"]),
                 cited_handles=tuple(
                     citation.evidence_handle for citation in result.citations
@@ -626,7 +632,35 @@ class LearningAssistantWorkflow:
             subtype = error.invalid_response_subtype
             if subtype is not None:
                 self._record_rejected_response(trace, completion, subtype)
+            error_code = (
+                subtype.value if subtype is not None else error.error_code.value
+            )
+            self._trace(
+                lambda: trace.citation_validate(
+                    namespace=CitationNamespace.WEB,
+                    available_evidence_count=len(web_session.evidence),
+                    cited_handles=(),
+                    cited_document_version_ids=(),
+                    abstained=result.abstained,
+                    error_code=error_code,
+                )
+            )
             raise
+        cited_web_handles = tuple(
+            evidence.evidence_handle
+            for evidence in web_session.evidence
+            if f"[{evidence.evidence_handle}]" in result.content
+        )
+        self._trace(
+            lambda: trace.citation_validate(
+                namespace=CitationNamespace.WEB,
+                available_evidence_count=len(web_session.evidence),
+                cited_handles=cited_web_handles,
+                cited_document_version_ids=(),
+                abstained=result.abstained,
+                error_code=None,
+            )
+        )
         return replace(result, content=validated_content)
 
     async def _run_required(
@@ -649,6 +683,7 @@ class LearningAssistantWorkflow:
         except KnowledgeSearchError:
             self._trace(
                 lambda: trace.citation_validate(
+                    namespace=CitationNamespace.KNOWLEDGE,
                     available_evidence_count=0,
                     cited_handles=(),
                     cited_document_version_ids=(),
@@ -664,6 +699,7 @@ class LearningAssistantWorkflow:
         if not result.hits:
             self._trace(
                 lambda: trace.citation_validate(
+                    namespace=CitationNamespace.KNOWLEDGE,
                     available_evidence_count=0,
                     cited_handles=(),
                     cited_document_version_ids=(),
@@ -790,6 +826,7 @@ class LearningAssistantWorkflow:
             )
             self._trace(
                 lambda: trace.citation_validate(
+                    namespace=CitationNamespace.KNOWLEDGE,
                     available_evidence_count=len(result.hits),
                     cited_handles=(),
                     cited_document_version_ids=(),
@@ -800,6 +837,7 @@ class LearningAssistantWorkflow:
             raise
         self._trace(
             lambda: trace.citation_validate(
+                namespace=CitationNamespace.KNOWLEDGE,
                 available_evidence_count=len(result.hits),
                 cited_handles=tuple(
                     citation.evidence_handle for citation in answer.citations

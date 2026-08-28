@@ -443,11 +443,12 @@ class ToolExecutor:
 
             try:
                 with tool_trace_context(tool_trace):
-                    result = await self._execute_call(
+                    result, execution_trace_metadata = await self._execute_call(
                         call,
                         context,
                         capture_execution,
                     )
+                    trace_metadata.update(execution_trace_metadata)
             except asyncio.CancelledError:
                 error_code = "CANCELLED"
                 raise
@@ -468,33 +469,40 @@ class ToolExecutor:
         call: ToolCall,
         context: ToolContext | None,
         on_tool_execution: Callable[[ToolCall, ToolExecutionOutput], None] | None,
-    ) -> ToolResult:
+    ) -> tuple[ToolResult, dict[str, JSONValue]]:
         tool = self._tools_by_name.get(call.name)
         if tool is None:
-            return self._result(call, ToolResultKind.NOT_ALLOWED)
+            return self._result(call, ToolResultKind.NOT_ALLOWED), {}
 
         arguments = self._parse_arguments(call.raw_arguments)
         if arguments is None or not tool.validate_arguments(arguments):
-            return self._result(call, ToolResultKind.INVALID_ARGUMENTS)
+            return self._result(call, ToolResultKind.INVALID_ARGUMENTS), {}
 
         try:
             output = await tool.execute(arguments, context)
         except asyncio.CancelledError:
             raise
         except ToolExecutionError as error:
-            return ToolResult(
-                call_id=call.call_id,
-                name=call.name,
-                kind=ToolResultKind.TOOL_ERROR,
-                content=json.dumps(
-                    {
-                        "error": {
-                            "code": error.code,
-                            "retryable": error.retryable,
-                        }
-                    },
-                    separators=(",", ":"),
+            return (
+                ToolResult(
+                    call_id=call.call_id,
+                    name=call.name,
+                    kind=ToolResultKind.TOOL_ERROR,
+                    content=json.dumps(
+                        {
+                            "error": {
+                                "code": error.code,
+                                "retryable": error.retryable,
+                            }
+                        },
+                        separators=(",", ":"),
+                    ),
                 ),
+                {
+                    "success": False,
+                    "tool_error_code": error.code,
+                    "retryable": error.retryable,
+                },
             )
         except Exception as error:
             raise WorkflowFailure(RunErrorCode.TOOL_EXECUTION_FAILED) from error
@@ -502,11 +510,14 @@ class ToolExecutor:
         if on_tool_execution is not None:
             on_tool_execution(call, output)
 
-        return ToolResult(
-            call_id=call.call_id,
-            name=call.name,
-            kind=ToolResultKind.SUCCESS,
-            content=output.observation,
+        return (
+            ToolResult(
+                call_id=call.call_id,
+                name=call.name,
+                kind=ToolResultKind.SUCCESS,
+                content=output.observation,
+            ),
+            {"success": True},
         )
 
     @staticmethod

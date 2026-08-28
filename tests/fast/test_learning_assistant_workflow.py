@@ -45,7 +45,7 @@ from langley.answering.tools import (
     ToolExecutionOutput,
     ToolExecutor,
 )
-from langley.answering.tracing import KnowledgeSearchOrigin, Tracer
+from langley.answering.tracing import CitationNamespace, KnowledgeSearchOrigin, Tracer
 from langley.answering.web import (
     WebExtractResponse,
     WebSearchResponse,
@@ -198,6 +198,9 @@ class _LifecycleExecutionTrace:
     def citation_validate(self, **kwargs: object) -> None:
         del kwargs
 
+    def context_compact(self, **kwargs: object) -> None:
+        del kwargs
+
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
         del answer, stop_reason
         self._events.append("success")
@@ -220,6 +223,67 @@ class _LifecycleTracer:
     ) -> _LifecycleExecutionTrace:
         del run_id, provider, model, include_content
         return self._trace
+
+
+class _RecordingCitationLLMTrace:
+    def content_delta(self, delta: AssistantContentDelta) -> None:
+        del delta
+
+    def finish(self, response: LLMResponseCompleted) -> None:
+        del response
+
+    def failure(self, error_code: str) -> None:
+        del error_code
+
+
+class _RecordingCitationToolTrace:
+    def finish(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+
+class _RecordingCitationTrace:
+    def __init__(self) -> None:
+        self.validations: list[dict[str, object]] = []
+
+    def begin_llm(self, request: LLMRequest, round_: int) -> _RecordingCitationLLMTrace:
+        del request, round_
+        return _RecordingCitationLLMTrace()
+
+    def begin_tool(
+        self, call: ToolCall, tool_calls_used: int
+    ) -> _RecordingCitationToolTrace:
+        del call, tool_calls_used
+        return _RecordingCitationToolTrace()
+
+    def rejected_response(
+        self, response: LLMResponseCompleted, subtype: str | None
+    ) -> None:
+        del response, subtype
+
+    def citation_validate(self, **kwargs: object) -> None:
+        self.validations.append(kwargs)
+
+    def context_compact(self, **kwargs: object) -> None:
+        del kwargs
+
+    def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
+        del answer, stop_reason
+
+    def failure(
+        self, error_code: str, invalid_response_subtype: str | None = None
+    ) -> None:
+        del error_code, invalid_response_subtype
+
+
+class _RecordingCitationTracer:
+    def __init__(self) -> None:
+        self.trace = _RecordingCitationTrace()
+
+    def start(
+        self, run_id: int, provider: str, model: str, include_content: bool
+    ) -> _RecordingCitationTrace:
+        del run_id, provider, model, include_content
+        return self.trace
 
 
 class _BoundaryCheckingProvider:
@@ -1469,6 +1533,7 @@ async def test_graph_scope_disables_automatic_langsmith_tracing_despite_global_e
 @pytest.mark.anyio
 async def test_web_evidence_citation_is_validated_and_sources_are_appended() -> None:
     web_provider = _WorkflowWebProvider()
+    tracer = _RecordingCitationTracer()
     llm_provider = FakeProvider(
         _web_rounds(
             "Version 1 at https://official.example.test/releases/1 is current [W1:E1]."
@@ -1476,7 +1541,11 @@ async def test_web_evidence_citation_is_validated_and_sources_are_appended() -> 
     )
 
     result = await _execute_workflow(
-        _workflow(llm_provider, tool_executor=_web_executor(web_provider))
+        _workflow(
+            llm_provider,
+            tool_executor=_web_executor(web_provider),
+            tracer=tracer,
+        )
     )
 
     assert result.content == (
@@ -1497,6 +1566,18 @@ async def test_web_evidence_citation_is_validated_and_sources_are_appended() -> 
     assert tuple(tool.name for tool in llm_provider.requests[1].allowed_tools) == (
         "read_webpage",
     )
+    assert [event["namespace"] for event in tracer.trace.validations] == [
+        CitationNamespace.KNOWLEDGE,
+        CitationNamespace.WEB,
+    ]
+    assert tracer.trace.validations[-1] == {
+        "namespace": CitationNamespace.WEB,
+        "available_evidence_count": 1,
+        "cited_handles": ("W1:E1",),
+        "cited_document_version_ids": (),
+        "abstained": False,
+        "error_code": None,
+    }
 
 
 @pytest.mark.anyio
@@ -1655,12 +1736,14 @@ async def test_web_enabled_run_neutralizes_historical_web_handles() -> None:
 @pytest.mark.anyio
 async def test_fabricated_web_evidence_citation_is_rejected() -> None:
     provider = FakeProvider(_web_rounds("Unsupported claim [W2:E1]."))
+    tracer = _RecordingCitationTracer()
 
     with pytest.raises(WorkflowFailure) as error:
         await _execute_workflow(
             _workflow(
                 provider,
                 tool_executor=_web_executor(_WorkflowWebProvider()),
+                tracer=tracer,
             )
         )
 
@@ -1669,6 +1752,14 @@ async def test_fabricated_web_evidence_citation_is_rejected() -> None:
         error.value.invalid_response_subtype
         is InvalidResponseSubtype.UNKNOWN_CITATION_HANDLE
     )
+    assert tracer.trace.validations[-1] == {
+        "namespace": CitationNamespace.WEB,
+        "available_evidence_count": 1,
+        "cited_handles": (),
+        "cited_document_version_ids": (),
+        "abstained": False,
+        "error_code": InvalidResponseSubtype.UNKNOWN_CITATION_HANDLE.value,
+    }
 
 
 @pytest.mark.anyio
