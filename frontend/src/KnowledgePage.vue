@@ -218,6 +218,10 @@ function sourceRegionText(region: SourceRegion): string {
   return region.kind;
 }
 
+function sourceFormat(mediaType: string): string {
+  return mediaType === "text/markdown" ? "Markdown" : mediaType;
+}
+
 function toggleChunk(ordinal: number): void {
   expandedChunkOrdinals.value = expandedChunkOrdinals.value.includes(ordinal)
     ? expandedChunkOrdinals.value.filter((value) => value !== ordinal)
@@ -345,85 +349,49 @@ onBeforeUnmount(stopIndexPolling);
 </script>
 
 <template>
-  <section class="mx-auto grid w-full max-w-5xl gap-6 px-5 py-8 lg:grid-cols-[15rem_1fr] sm:px-8">
-    <aside class="space-y-4">
+  <section class="grid min-h-0 w-full grid-cols-1 bg-workspace lg:grid-cols-[15rem_minmax(0,1fr)]">
+    <aside class="flex min-h-0 flex-col border-b border-border bg-sidebar px-4 py-5 lg:border-b-0 lg:border-r">
+      <div class="mb-5 px-1">
+        <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
+          KNOWLEDGE
+        </p>
+        <h1 class="mt-1 text-sm font-semibold text-foreground">
+          知识库
+        </h1>
+      </div>
       <form
-        class="space-y-2 rounded-lg border border-stone-200 bg-white p-3"
+        class="order-3 mt-5 space-y-2 border-t border-border pt-4"
         @submit.prevent="createKnowledgeBase"
       >
-        <label class="block text-sm font-medium">新建知识库<input
+        <label class="block text-xs font-medium text-body">新建知识库<input
           v-model="knowledgeBaseName"
-          class="mt-1 w-full rounded border border-stone-300 p-2"
+          class="mt-1 w-full rounded-sm border border-strong-border bg-surface px-2 py-1.5 text-sm text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
           maxlength="255"
         ></label>
         <Button
           type="submit"
           :disabled="creating"
         >
-          {{ creating ? "正在创建…" : "创建知识库" }}
+          {{ creating ? "正在创建…" : "新建知识库" }}
         </Button>
       </form>
-      <section class="rounded-lg border border-stone-200 bg-white p-4 text-sm">
-        <div class="flex items-center justify-between gap-3">
-          <div>
-            <h2 class="font-semibold text-slate-900">
-              知识索引
-            </h2>
-            <p class="mt-1 text-slate-600">
-              当前索引状态：{{ currentIndexStatusText(indexStatus?.index_status) }}
-            </p>
-          </div>
-          <Button
-            type="button"
-            :disabled="startingIndexBuild || indexStatus?.index_status === 'INDEXING'"
-            @click="startIndexBuild"
-          >
-            {{ startingIndexBuild ? "正在提交…" : "建立索引" }}
-          </Button>
-        </div>
-        <div
-          v-if="indexStatus?.latest_job"
-          class="mt-3 rounded border border-stone-100 bg-stone-50 p-3"
-        >
-          <p
-            v-if="indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING'"
-            class="font-medium"
-          >
-            最近一次构建：进行中
-          </p>
-          <p>阶段：{{ indexStatus.latest_job.stage ?? "等待执行" }}</p>
-          <p>进度：{{ indexStatus.latest_job.processed_chunk_count }} / {{ indexStatus.latest_job.total_chunk_count }}</p>
-          <p
-            v-if="indexStatus.latest_job.status === 'SUCCEEDED'"
-            class="text-emerald-700"
-          >
-            最近一次构建：已完成
-          </p>
-          <p
-            v-if="indexStatus.latest_job.status === 'FAILED' || indexStatus.latest_job.status === 'INTERRUPTED'"
-            class="text-red-700"
-          >
-            {{ indexStatus.latest_job.error_message ?? "索引建立失败，请重试。" }}
-          </p>
-        </div>
-      </section>
       <p
         v-if="loading"
-        class="text-sm text-slate-500"
+        class="order-1 text-sm text-muted-foreground"
       >
         正在加载…
       </p>
       <p
         v-else-if="knowledgeBases.length === 0"
-        class="text-sm text-slate-500"
+        class="order-1 text-sm text-muted-foreground"
       >
         还没有知识库。
       </p>
       <button
         v-for="knowledgeBase in knowledgeBases"
         :key="knowledgeBase.id"
-        class="block w-full rounded px-3 py-2 text-left text-sm"
-        :class="knowledgeBase.id === selectedKnowledgeBaseId ? 'bg-slate-900 text-white' : 'bg-stone-100'"
+        class="order-2 block w-full break-words border-l-2 px-3 py-2 text-left text-sm transition-colors"
+        :class="knowledgeBase.id === selectedKnowledgeBaseId ? 'border-primary bg-surface text-foreground' : 'border-transparent text-muted-foreground hover:bg-subtle hover:text-foreground'"
         @click="selectKnowledgeBase(knowledgeBase.id)"
       >
         {{ knowledgeBase.name }}
@@ -431,28 +399,64 @@ onBeforeUnmount(stopIndexPolling);
     </aside>
     <main
       v-if="selectedKnowledgeBaseId !== null"
-      class="min-w-0 space-y-5"
+      class="min-w-0 space-y-6 px-5 py-7 sm:px-8 lg:px-10"
     >
+      <header class="border-b border-border pb-5">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
+              KNOWLEDGE BASE
+            </p>
+            <h2 class="mt-1 text-xl font-semibold tracking-[-0.02em] text-foreground">
+              {{ knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId)?.name }}
+            </h2>
+            <p class="mt-2 text-sm text-muted-foreground">
+              索引状态：{{ currentIndexStatusText(indexStatus?.index_status) }}
+            </p>
+          </div>
+          <Button
+            type="button"
+            :disabled="startingIndexBuild || indexStatus?.index_status === 'INDEXING'"
+            @click="startIndexBuild"
+          >
+            {{ startingIndexBuild ? "正在提交…" : indexStatus?.index_status === "READY" ? "重建索引" : "建立索引" }}
+          </Button>
+        </div>
+        <div
+          v-if="indexStatus?.latest_job && (indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING' || indexStatus.latest_job.status === 'FAILED' || indexStatus.latest_job.status === 'INTERRUPTED')"
+          class="mt-4 border-l-2 border-primary bg-subtle px-3 py-2 text-sm text-body"
+        >
+          <p v-if="indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING'">
+            正在建立索引 · {{ indexStatus.latest_job.stage ?? "等待执行" }} · {{ indexStatus.latest_job.processed_chunk_count }} / {{ indexStatus.latest_job.total_chunk_count }}
+          </p>
+          <p v-else>
+            {{ indexStatus.latest_job.error_message ?? "索引建立失败，请重试。" }}
+          </p>
+        </div>
+      </header>
       <form
-        class="space-y-3 rounded-lg border border-stone-200 bg-white p-4"
+        class="space-y-3 border-b border-border pb-6"
         @submit.prevent="upload"
       >
-        <h1 class="font-semibold text-slate-900">
-          知识文档
-        </h1>
-        <label class="inline-flex cursor-pointer items-center rounded border border-stone-300 bg-stone-50 px-3 py-2 text-sm font-medium text-slate-800 hover:bg-stone-100 focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-slate-700">选择 Markdown 文件<input
+        <h3 class="text-sm font-semibold text-foreground">
+          添加资料
+        </h3>
+        <p class="text-sm text-muted-foreground">
+          当前支持 Markdown 文件。
+        </p>
+        <label class="inline-flex cursor-pointer items-center rounded-sm border border-strong-border bg-surface px-3 py-2 text-sm font-medium text-body hover:bg-subtle focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring">选择文件<input
           class="sr-only"
           type="file"
           accept=".md,text/markdown"
           :disabled="uploading"
           @change="chooseFile"
         ></label>
-        <p class="text-sm text-slate-600">
+        <p class="break-all text-sm text-muted-foreground">
           {{ selectedFile === null ? "未选择文件" : `已选择：${selectedFile.name}` }}
         </p>
-        <label class="block text-sm">文档名称（可编辑）<input
+        <label class="block text-sm text-body">文档名称（可编辑）<input
           v-model="documentName"
-          class="mt-1 w-full rounded border border-stone-300 p-2"
+          class="mt-1 w-full rounded-sm border border-strong-border bg-surface px-2 py-1.5 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
           maxlength="255"
           :disabled="uploading"
         ></label>
@@ -460,38 +464,44 @@ onBeforeUnmount(stopIndexPolling);
           type="submit"
           :disabled="uploading || selectedFile === null"
         >
-          {{ uploading ? "正在上传…" : "上传 Markdown" }}
+          {{ uploading ? "正在上传…" : "上传资料" }}
         </Button>
       </form>
       <p
         v-if="documents.length === 0 && !loading"
-        class="rounded-lg border border-dashed border-stone-300 p-6 text-center text-sm text-slate-500"
+        class="border border-dashed border-strong-border px-5 py-10 text-center text-sm text-muted-foreground"
       >
         这个知识库还没有文档。
       </p>
       <div
         v-else
-        class="grid gap-4 md:grid-cols-2"
+        class="grid gap-6 lg:grid-cols-[minmax(12rem,0.75fr)_minmax(0,1.5fr)]"
       >
-        <div class="space-y-2">
+        <section class="min-w-0 space-y-1 border-b border-border pb-5 lg:border-b-0 lg:border-r lg:pb-0 lg:pr-5">
+          <h3 class="mb-3 font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
+            DOCUMENTS
+          </h3>
           <button
             v-for="document in documents"
             :key="document.id"
-            class="block w-full rounded border p-3 text-left"
-            :class="document.id === selectedDocumentId ? 'border-slate-700 bg-stone-100' : 'border-stone-200 bg-white'"
+            class="block w-full border-l-2 px-3 py-2.5 text-left"
+            :class="document.id === selectedDocumentId ? 'border-primary bg-subtle text-foreground' : 'border-transparent text-body hover:bg-subtle'"
             @click="selectDocument(document.id); verifiedVersionId = null; verifiedAt = null"
           >
-            <span class="block font-medium">{{ document.name }}</span><span class="mt-1 block text-xs text-slate-500">{{ document.source.filename }}</span>
+            <span class="block break-words font-medium">{{ document.name }}</span><span class="mt-1 block break-all text-xs text-muted-foreground">{{ document.source.filename }}</span>
           </button>
-        </div>
+        </section>
         <article
           v-if="selectedDocument"
-          class="rounded-lg border border-stone-200 bg-white p-4 text-sm"
+          class="min-w-0 text-sm"
         >
-          <h2 class="font-semibold">
+          <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
+            SELECTED DOCUMENT
+          </p>
+          <h3 class="mt-1 break-words text-lg font-semibold text-foreground">
             {{ selectedDocument.name }}
-          </h2>
-          <dl class="mt-3 space-y-1 text-slate-600">
+          </h3>
+          <dl class="mt-4 grid gap-x-6 gap-y-2 text-sm text-body sm:grid-cols-2">
             <div>
               <dt class="inline">
                 上传时间：
@@ -506,9 +516,9 @@ onBeforeUnmount(stopIndexPolling);
               </dd>
             </div><div>
               <dt class="inline">
-                类型：
+                格式：
               </dt><dd class="inline">
-                {{ selectedDocument.source.media_type }}
+                {{ sourceFormat(selectedDocument.source.media_type) }}
               </dd>
             </div><div>
               <dt class="inline">
@@ -516,46 +526,46 @@ onBeforeUnmount(stopIndexPolling);
               </dt><dd class="inline">
                 {{ selectedDocument.source.size_bytes }} bytes
               </dd>
-            </div><div>
-              <dt class="inline">
-                SHA-256：
-              </dt><dd class="break-all">
-                {{ selectedDocument.source.sha256 }}
-              </dd>
             </div>
           </dl>
-          <Button
-            class="mt-4"
-            :disabled="verifying"
-            @click="verifySource"
-          >
-            {{ verifying ? "正在验证…" : "验证原始文件" }}
-          </Button>
-          <p
-            class="mt-3 text-sm"
-            :class="verifiedVersionId === selectedDocument.source.document_version_id ? 'text-emerald-700' : 'text-slate-500'"
-          >
-            原文件完整性：{{ verifiedVersionId === selectedDocument.source.document_version_id ? "刚刚验证通过" : "尚未验证" }}
-          </p>
-          <p
-            v-if="verifiedAt && verifiedVersionId === selectedDocument.source.document_version_id"
-            class="text-xs text-emerald-700"
-          >
-            {{ verifiedAt }}
-          </p>
-          <section class="mt-6 border-t border-stone-200 pt-5">
-            <h3 class="font-semibold text-slate-900">
+          <details class="mt-5 border-t border-border pt-3 text-body">
+            <summary class="cursor-pointer text-sm font-medium text-foreground">
+              来源与完整性
+            </summary>
+            <div class="mt-3 space-y-3">
+              <p class="break-all font-mono text-xs text-muted-foreground">
+                SHA-256 · {{ selectedDocument.source.sha256 }}
+              </p>
+              <Button
+                :disabled="verifying"
+                @click="verifySource"
+              >
+                {{ verifying ? "正在验证…" : "验证原始文件" }}
+              </Button>
+              <p class="text-sm text-muted-foreground">
+                原文件完整性：{{ verifiedVersionId === selectedDocument.source.document_version_id ? "刚刚验证通过" : "尚未验证" }}
+              </p>
+              <p
+                v-if="verifiedAt && verifiedVersionId === selectedDocument.source.document_version_id"
+                class="font-mono text-xs text-muted-foreground"
+              >
+                {{ verifiedAt }}
+              </p>
+            </div>
+          </details>
+          <section class="mt-6 border-t border-border pt-5">
+            <h4 class="font-semibold text-foreground">
               文档处理
-            </h3>
+            </h4>
             <p
               v-if="successfulChunkMaxChars !== null"
-              class="mt-2 text-slate-600"
+              class="mt-2 text-muted-foreground"
             >
-              当前 Chunk 配置：{{ successfulChunkMaxChars }}
+              当前分块配置：{{ successfulChunkMaxChars }}
             </p>
             <p
               v-else-if="chunkCount === 0 && !chunksLoading"
-              class="mt-2 text-slate-600"
+              class="mt-2 text-muted-foreground"
             >
               尚未处理
             </p>
@@ -583,10 +593,11 @@ onBeforeUnmount(stopIndexPolling);
               @submit.prevent="rebuildChunks"
             >
               <label class="block text-sm">
-                {{ successfulChunkMaxChars === null ? "max_chunk_chars" : "本次 max_chunk_chars" }}
+                单个分块最大字符数
+                <span class="ml-1 font-mono text-[10px] text-muted-light">max_chunk_chars</span>
                 <input
                   v-model="draftMaxChunkChars"
-                  class="mt-1 block w-40 rounded border border-stone-300 p-2"
+                  class="mt-1 block w-40 rounded-sm border border-strong-border bg-surface p-2 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
                   inputmode="numeric"
                   :disabled="processingPending || processingBlockedByIndex"
                 >
@@ -599,17 +610,17 @@ onBeforeUnmount(stopIndexPolling);
               </Button>
             </form>
           </section>
-          <section class="mt-6 border-t border-stone-200 pt-5">
+          <section class="mt-6 border-t border-border pt-5">
             <div class="flex items-baseline justify-between gap-3">
-              <h3 class="font-semibold text-slate-900">
-                Chunk Inspector
-              </h3>
+              <h4 class="font-semibold text-foreground">
+                分块预览
+              </h4>
             </div>
             <p
               v-if="chunksLoading"
-              class="mt-3 text-slate-500"
+              class="mt-3 text-muted-foreground"
             >
-              正在读取 Chunk…
+              正在读取分块…
             </p>
             <p
               v-if="chunkLoadError"
@@ -620,16 +631,16 @@ onBeforeUnmount(stopIndexPolling);
             </p>
             <p
               v-else-if="chunkCount === 0"
-              class="mt-3 text-slate-500"
+              class="mt-3 text-muted-foreground"
             >
-              暂无 Chunk。
+              暂无分块。
             </p>
             <div
               v-else
               class="mt-3 space-y-3"
             >
-              <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
-                <p>共 {{ chunkCount }} 个 Chunk · {{ chunksRange }}</p>
+              <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
+                <p>共 {{ chunkCount }} 个分块 · {{ chunksRange }}</p>
                 <div class="flex items-center gap-3">
                   <Button
                     type="button"
@@ -654,37 +665,42 @@ onBeforeUnmount(stopIndexPolling);
               <article
                 v-for="chunk in chunks"
                 :key="chunk.ordinal"
-                class="rounded border border-stone-200 bg-stone-50 p-3"
+                class="border border-border bg-subtle p-3"
               >
-                <p class="font-medium text-slate-900">
+                <p class="font-medium text-foreground">
                   #{{ chunk.ordinal }}
                 </p>
                 <p
                   v-if="chunk.heading_path.length > 0"
-                  class="mt-1 text-xs text-slate-600"
+                  class="mt-1 text-xs text-muted-foreground"
                 >
-                  heading path: {{ chunk.heading_path.join(" > ") }}
+                  当前位置：{{ chunk.heading_path.join(" › ") }}
                 </p>
-                <p class="mt-2 whitespace-pre-wrap text-slate-700">
+                <p class="mt-2 break-words whitespace-pre-wrap text-body">
                   {{ expandedChunkOrdinals.includes(chunk.ordinal) ? chunk.content : `${chunk.content.slice(0, 240)}${chunk.content.length > 240 ? "…" : ""}` }}
                 </p>
                 <button
-                  class="mt-2 text-sm text-slate-700 underline"
+                  class="mt-2 text-sm text-primary-deep underline underline-offset-2"
                   type="button"
                   @click="toggleChunk(chunk.ordinal)"
                 >
                   {{ expandedChunkOrdinals.includes(chunk.ordinal) ? "收起" : "展开" }}
                 </button>
-                <p class="mt-2 text-xs text-slate-600">
-                  source regions: {{ chunk.source_regions.map(sourceRegionText).join("；") }}
-                </p>
+                <details class="mt-3 text-xs text-muted-foreground">
+                  <summary class="cursor-pointer">
+                    位置详情
+                  </summary>
+                  <p class="mt-1 break-all font-mono">
+                    {{ chunk.source_regions.map(sourceRegionText).join("；") }}
+                  </p>
+                </details>
               </article>
             </div>
             <div
               v-if="chunkCount > 0"
-              class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500"
+              class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"
             >
-              <p>共 {{ chunkCount }} 个 Chunk · {{ chunksRange }}</p>
+              <p>共 {{ chunkCount }} 个分块 · {{ chunksRange }}</p>
               <div class="flex items-center gap-3">
                 <Button
                   type="button"
@@ -712,9 +728,9 @@ onBeforeUnmount(stopIndexPolling);
     </main>
     <main
       v-else
-      class="rounded-lg border border-dashed border-stone-300 p-8 text-center text-sm text-slate-500"
+      class="m-5 border border-dashed border-strong-border px-6 py-12 text-center text-sm text-muted-foreground sm:m-8"
     >
-      创建或选择一个知识库后即可上传 Markdown 文档。
+      创建或选择一个知识库后即可管理资料。当前支持 Markdown 文件。
     </main>
   </section>
 </template>

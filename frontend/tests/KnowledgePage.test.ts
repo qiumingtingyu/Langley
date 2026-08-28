@@ -59,12 +59,13 @@ describe("KnowledgePage", () => {
     await settle();
 
     const input = wrapper.get('input[type="file"]');
+    expect(input.attributes("accept")).toBe(".md,text/markdown");
     Object.defineProperty(input.element, "files", {
       value: [new File(["# new"], "new.md", { type: "text/markdown" })],
     });
     await input.trigger("change");
     expect(wrapper.text()).toContain("已选择：new.md");
-    expect(wrapper.text()).toContain("选择 Markdown 文件");
+    expect(wrapper.text()).toContain("当前支持 Markdown 文件。");
     await wrapper.findAll("form")[1]!.trigger("submit");
     await settle();
 
@@ -161,7 +162,7 @@ describe("KnowledgePage", () => {
     await wrapper.findAll("form")[1]!.trigger("submit");
     await settle();
     expect(indexStatusCalls).toBe(2);
-    expect(wrapper.text()).toContain("当前索引状态：需要重建");
+    expect(wrapper.text()).toContain("索引状态：需要重建");
     wrapper.unmount();
   });
 
@@ -187,9 +188,8 @@ describe("KnowledgePage", () => {
     await settle();
 
     expect(fetchMock.mock.calls.filter(([path, init]) => path === "/api/knowledge-bases/4/index-build" && init?.method === "POST")).toHaveLength(1);
-    expect(wrapper.text()).toContain("当前索引状态：正在建立");
-    expect(wrapper.text()).toContain("最近一次构建：进行中");
-    expect(wrapper.text()).toContain("进度：0 / 2");
+    expect(wrapper.text()).toContain("索引状态：正在建立");
+    expect(wrapper.text()).toContain("正在建立索引 · 等待执行 · 0 / 2");
     wrapper.unmount();
   });
 
@@ -209,7 +209,7 @@ describe("KnowledgePage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    expect(wrapper.text()).toContain("进度：1 / 2");
+    expect(wrapper.text()).toContain("正在建立索引 · EMBEDDING · 1 / 2");
 
     await vi.advanceTimersByTimeAsync(5000);
     await settle();
@@ -286,9 +286,8 @@ describe("KnowledgePage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    expect(wrapper.text()).toContain("当前索引状态：需要重建");
-    expect(wrapper.text()).toContain("最近一次构建：已完成");
-    expect(wrapper.text()).toContain("进度：120 / 120");
+    expect(wrapper.text()).toContain("索引状态：需要重建");
+    expect(wrapper.text()).not.toContain("最近一次构建：已完成");
     expect(wrapper.text()).not.toContain("索引已就绪，可用于后续检索。");
     wrapper.unmount();
   });
@@ -351,12 +350,12 @@ describe("KnowledgePage processing bridge", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    expect(wrapper.text()).toContain("当前 Chunk 配置：1200");
+    expect(wrapper.text()).toContain("当前分块配置：1200");
     expect(wrapper.text()).toContain("重新切片");
     const processingInput = wrapper.findAll("input").find((item) => item.attributes("inputmode") === "numeric")!;
     await processingInput.setValue("800");
-    expect(wrapper.text()).toContain("当前 Chunk 配置：1200");
-    expect(wrapper.text()).toContain("本次 max_chunk_chars");
+    expect(wrapper.text()).toContain("当前分块配置：1200");
+    expect(wrapper.text()).toContain("单个分块最大字符数");
     wrapper.unmount();
   });
 
@@ -369,7 +368,7 @@ describe("KnowledgePage processing bridge", () => {
     expect(wrapper.text()).toContain("处理文档");
     expect((wrapper.findAll("input").find((item) => item.attributes("inputmode") === "numeric")!.element as HTMLInputElement).value).toBe("1200");
     expect(wrapper.text()).toContain("#1");
-    expect(wrapper.text()).toContain("操作系统 > 进程");
+    expect(wrapper.text()).toContain("操作系统 › 进程");
     expect(wrapper.text()).toContain("text_span [12, 48)");
     await wrapper.findAll("button").find((item) => item.text() === "展开")!.trigger("click");
     expect(wrapper.text()).toContain(chunk.content);
@@ -398,7 +397,7 @@ describe("KnowledgePage processing bridge", () => {
     expect(wrapper.text()).toContain("#1");
     resolveRebuild!(response({ document_version_id: 17, successful_chunk_max_chars: 800, chunk_count: 1, resulting_index_status: "STALE" }));
     await settle();
-    expect(wrapper.text()).toContain("当前 Chunk 配置：800");
+    expect(wrapper.text()).toContain("当前分块配置：800");
     expect(fetchMock.mock.calls.some(([path]) => path === "/api/document-versions/17/chunks?offset=0&limit=50")).toBe(true);
     expect(wrapper.text()).toContain("需要重建");
     wrapper.unmount();
@@ -431,7 +430,7 @@ describe("KnowledgePage processing bridge", () => {
     await wrapper.findAll("form").at(-1)!.trigger("submit");
     await settle();
     expect(wrapper.text()).toContain("知识库正在建立索引，本次重新切片未生效。");
-    expect(wrapper.text()).toContain("当前 Chunk 配置：1200");
+    expect(wrapper.text()).toContain("当前分块配置：1200");
     expect(statusCalls).toBe(2);
     wrapper.unmount();
   });
@@ -453,7 +452,7 @@ describe("KnowledgePage processing bridge", () => {
     await wrapper.findAll("form").at(-1)!.trigger("submit");
     await settle();
     expect(wrapper.text()).toContain("输入内容无效，请检查后重试。");
-    expect(wrapper.text()).toContain("当前 Chunk 配置：1200");
+    expect(wrapper.text()).toContain("当前分块配置：1200");
     expect(wrapper.text()).toContain("#1");
     expect((input.element as HTMLInputElement).value).toBe("800");
     wrapper.unmount();
@@ -500,7 +499,7 @@ describe("KnowledgePage processing bridge", () => {
     await wrapper.findAll("button").find((item) => item.text() === "下一页")!.trigger("click");
     await settle();
     expect((input.element as HTMLInputElement).value).toBe("800");
-    expect(wrapper.text()).toContain("当前 Chunk 配置：1200");
+    expect(wrapper.text()).toContain("当前分块配置：1200");
     wrapper.unmount();
   });
 
@@ -520,7 +519,7 @@ describe("KnowledgePage processing bridge", () => {
     await settle();
     await wrapper.findAll("form").at(-1)!.trigger("submit");
     await settle();
-    expect(wrapper.text()).toContain("当前 Chunk 配置：800");
+    expect(wrapper.text()).toContain("当前分块配置：800");
     expect(wrapper.text()).toContain("处理已完成，但暂时无法刷新 Chunk，请刷新后查看。");
     expect(wrapper.text()).toContain("需要重建");
     expect(wrapper.text()).not.toContain("尚未处理");
@@ -546,9 +545,9 @@ describe("KnowledgePage processing bridge", () => {
     await wrapper.findAll("button").find((item) => item.text().includes("New"))!.trigger("click");
     resolveA!(response(chunksPage(1200)));
     await settle();
-    expect(wrapper.text()).toContain("当前 Chunk 配置：800");
+    expect(wrapper.text()).toContain("当前分块配置：800");
     expect(wrapper.text()).toContain("B chunk");
-    expect(wrapper.text()).not.toContain("当前 Chunk 配置：1200");
+    expect(wrapper.text()).not.toContain("当前分块配置：1200");
     wrapper.unmount();
   });
 
@@ -573,7 +572,7 @@ describe("KnowledgePage processing bridge", () => {
     await settle();
     resolveRebuild!(response({ document_version_id: 17, successful_chunk_max_chars: 600, chunk_count: 1, resulting_index_status: "STALE" }));
     await settle();
-    expect(wrapper.text()).toContain("当前 Chunk 配置：800");
+    expect(wrapper.text()).toContain("当前分块配置：800");
     expect(wrapper.text()).toContain("B chunk");
     expect(wrapper.findAll("button").find((item) => item.text().includes("重新切片"))?.attributes("disabled")).toBeUndefined();
     wrapper.unmount();
@@ -602,7 +601,7 @@ describe("KnowledgePage processing bridge", () => {
     resolveRebuild!(response({ document_version_id: 17, successful_chunk_max_chars: 600, chunk_count: 1, resulting_index_status: "STALE" }));
     await settle();
     expect(wrapper.text()).toContain("B chunk");
-    expect(wrapper.text()).toContain("当前 Chunk 配置：800");
+    expect(wrapper.text()).toContain("当前分块配置：800");
     expect(wrapper.text()).toContain("需要重建");
     expect(statusCalls).toBe(2);
     wrapper.unmount();
