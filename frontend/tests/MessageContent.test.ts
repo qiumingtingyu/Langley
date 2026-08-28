@@ -63,6 +63,42 @@ describe("MessageContent", () => {
     expect(wrapper.get("pre code").text()).toContain("const partial = true;");
   });
 
+  it("promotes only authoritative citation markers outside code", async () => {
+    const citation = {
+      evidence_handle: 1,
+      document_version_id: 41,
+      evidence_text: "authoritative evidence",
+      source_display_name: "TCP Notes.md",
+      heading_path: ["Transport", "TCP"],
+      source_regions: [{ start_byte: 10, end_byte: 32 }],
+    };
+    const wrapper = mount(MessageContent, {
+      props: {
+        content: [
+          "真实证据 [K1]，缺失证据 [K9]，inline code `[K1]`。",
+          "",
+          "[K1](https://example.com/citation-label)",
+          "",
+          "```text",
+          "fenced [K1]",
+          "```",
+        ].join("\n"),
+        citations: [citation],
+      },
+    });
+
+    const citationTriggers = wrapper.findAll('button[data-citation-handle="1"]');
+    expect(citationTriggers).toHaveLength(1);
+    expect(citationTriggers[0]?.text()).toBe("[1]");
+    expect(wrapper.text()).toContain("[K9]");
+    expect(wrapper.get("p code").text()).toBe("[K1]");
+    expect(wrapper.get("pre code").text()).toContain("fenced [K1]");
+    expect(wrapper.get('a[href="https://example.com/citation-label"]').text()).toBe("K1");
+
+    await citationTriggers[0]?.trigger("click");
+    expect(wrapper.emitted("selectCitation")?.[0]?.[0]).toEqual(citation);
+  });
+
   it("does not render Markdown images as externally loadable elements", () => {
     const wrapper = mount(MessageContent, {
       props: {

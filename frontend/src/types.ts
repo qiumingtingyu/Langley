@@ -10,6 +10,15 @@ export interface Conversation {
   last_message_at: string | null;
 }
 
+export interface MessageCitation {
+  evidence_handle: number;
+  document_version_id: number;
+  evidence_text: string;
+  source_display_name: string;
+  heading_path: unknown[];
+  source_regions: unknown[];
+}
+
 export interface Message {
   id: number;
   sequence_no: number;
@@ -18,6 +27,7 @@ export interface Message {
   run_id: number | null;
   regenerated_from_message_id: number | null;
   created_at: string;
+  citations: MessageCitation[];
 }
 
 export interface Run {

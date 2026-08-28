@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { ArrowUp, Pencil, RefreshCw, RotateCcw, Trash2 } from "lucide-vue-next";
+import { ref, watch } from "vue";
 
+import EvidenceSheet from "@/components/EvidenceSheet.vue";
 import MessageContent from "@/components/MessageContent.vue";
 import { Button } from "@/components/ui/button";
-import type { Conversation, Message, Run } from "@/types";
+import type { Conversation, Message, MessageCitation, Run } from "@/types";
 
-defineProps<{
+const props = defineProps<{
   selectedConversation: Conversation | null;
   messages: Message[];
   latestRun: Run | null;
@@ -19,6 +21,7 @@ defineProps<{
 }>();
 
 const composerContent = defineModel<string>("composerContent", { required: true });
+const selectedCitation = ref<MessageCitation | null>(null);
 
 const emit = defineEmits<{
   refresh: [];
@@ -34,6 +37,13 @@ const emit = defineEmits<{
 function conversationTitle(conversation: Conversation): string {
   return conversation.title ?? "未命名会话";
 }
+
+watch(
+  () => props.selectedConversation?.id,
+  () => {
+    selectedCitation.value = null;
+  },
+);
 </script>
 
 <template>
@@ -152,7 +162,11 @@ function conversationTitle(conversation: Conversation): string {
               <p class="mb-2 font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
                 ASSISTANT
               </p>
-              <MessageContent :content="message.content" />
+              <MessageContent
+                :content="message.content"
+                :citations="message.citations"
+                @select-citation="selectedCitation = $event"
+              />
             </article>
           </template>
 
@@ -315,5 +329,10 @@ function conversationTitle(conversation: Conversation): string {
         </form>
       </div>
     </div>
+
+    <EvidenceSheet
+      :citation="selectedCitation"
+      @close="selectedCitation = null"
+    />
   </section>
 </template>

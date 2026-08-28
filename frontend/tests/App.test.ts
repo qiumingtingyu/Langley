@@ -6,7 +6,8 @@ import App from "../src/App.vue";
 
 type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 type Run = { id: number; input_message_id: number; attempt_no: number; status: RunStatus; started_at: string | null; finished_at: string | null; error_code: string | null };
-type Message = { id: number; sequence_no: number; role: "USER" | "ASSISTANT"; content: string; run_id: number | null; regenerated_from_message_id: number | null; created_at: string };
+type MessageCitation = { evidence_handle: number; document_version_id: number; evidence_text: string; source_display_name: string; heading_path: unknown[]; source_regions: unknown[] };
+type Message = { id: number; sequence_no: number; role: "USER" | "ASSISTANT"; content: string; run_id: number | null; regenerated_from_message_id: number | null; created_at: string; citations: MessageCitation[] };
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -28,7 +29,7 @@ function deferred<Value>(): { promise: Promise<Value>; resolve(value: Value): vo
 
 function response(payload: unknown, ok = true): Response { return { ok, json: async () => payload } as Response; }
 function conversation(id: number, title: string) { return { id, title, created_at: "2026-08-16T00:00:00Z", updated_at: "2026-08-16T00:00:00Z", last_message_at: null }; }
-function message(id: number, content: string, role: Message["role"] = "USER", runId: number | null = null): Message { return { id, sequence_no: id, role, content, run_id: runId, regenerated_from_message_id: null, created_at: "2026-08-16T00:00:00Z" }; }
+function message(id: number, content: string, role: Message["role"] = "USER", runId: number | null = null, citations: MessageCitation[] = []): Message { return { id, sequence_no: id, role, content, run_id: runId, regenerated_from_message_id: null, created_at: "2026-08-16T00:00:00Z", citations }; }
 function run(id: number, status: RunStatus): Run { return { id, input_message_id: id, attempt_no: 1, status, started_at: status === "PENDING" ? null : "2026-08-16T00:00:00Z", finished_at: ["SUCCEEDED", "FAILED", "CANCELLED"].includes(status) ? "2026-08-16T00:01:00Z" : null, error_code: status === "FAILED" ? "LLM_PROVIDER_FAILED" : null }; }
 function button(wrapper: VueWrapper, text: string) { const found = wrapper.findAll("button").find((candidate) => candidate.text().includes(text)); if (found === undefined) throw new Error(`button not found: ${text}`); return found; }
 async function settle(): Promise<void> { await flushPromises(); await nextTick(); await flushPromises(); }
@@ -48,11 +49,11 @@ describe("App user behavior", () => {
     vi.stubGlobal("crypto", { randomUUID: () => `request-${++request}` });
   });
 
-  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); document.body.innerHTML = ""; });
 
-  async function mountInitial(activeRun: Run | null = null): Promise<VueWrapper> {
+  async function mountInitial(activeRun: Run | null = null, initialMessages: Message[] = [message(1, "问题 A")]): Promise<VueWrapper> {
     enqueue(response([conversation(1, "A"), conversation(2, "B")]));
-    enqueue(response({ messages: [message(1, "问题 A")], latest_run: activeRun }));
+    enqueue(response({ messages: initialMessages, latest_run: activeRun }));
     const wrapper = mount(App);
     await settle();
     return wrapper;
@@ -130,6 +131,40 @@ describe("App user behavior", () => {
     await settle();
     expect(wrapper.text()).toContain("已保存回答");
     expect(wrapper.text()).toContain("回答已保存");
+    wrapper.unmount();
+  });
+
+  it("opens a durable Knowledge citation in the evidence sheet", async () => {
+    const citation: MessageCitation = {
+      evidence_handle: 1,
+      document_version_id: 41,
+      evidence_text: "TCP uses a four-way handshake to close a connection.",
+      source_display_name: "TCP Notes.md",
+      heading_path: ["Transport", "TCP", "Close"],
+      source_regions: [{ start_byte: 10, end_byte: 64 }],
+    };
+    const wrapper = await mountInitial(run(201, "SUCCEEDED"), [
+      message(1, "TCP 如何关闭连接？"),
+      message(2, "TCP 使用四次挥手关闭连接。[K1]", "ASSISTANT", 201, [citation]),
+    ]);
+
+    const trigger = wrapper.get('button[data-citation-handle="1"]');
+    expect(trigger.text()).toBe("[1]");
+    expect(trigger.attributes("aria-label")).toBe("查看证据 1");
+    await trigger.trigger("click");
+    await settle();
+
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.textContent).toContain("EVIDENCE 01");
+    expect(dialog?.textContent).toContain("TCP Notes.md");
+    expect(dialog?.textContent).toContain("Transport › TCP › Close");
+    expect(dialog?.textContent).toContain("TCP uses a four-way handshake");
+    expect(dialog?.textContent).not.toContain("document_version_id");
+
+    dialog?.querySelector<HTMLElement>('[data-slot="sheet-close"]')?.click();
+    await settle();
+    expect(document.body.querySelector('[role="dialog"]')).toBeNull();
     wrapper.unmount();
   });
 
