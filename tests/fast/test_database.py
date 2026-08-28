@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from langley.answering.fake_provider import FakeProvider
 from langley.infrastructure.database import (
     create_database_engine,
     create_session_factory,
@@ -12,6 +13,7 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.models import Memory, Message, User
 from langley.main import create_app
+from langley.memory.policy import MemoryPolicy
 from langley.settings import Settings
 
 
@@ -64,6 +66,31 @@ def test_create_app_does_not_connect_to_configured_database() -> None:
     )
 
     assert app.state.settings.database_url is not None
+
+
+def test_create_app_constructs_no_memory_policy_without_model() -> None:
+    app = create_app(
+        Settings(
+            database_url="mysql+asyncmy://root:password@127.0.0.1:3306/langley",
+            memory_policy_estimated_token_budget=24_576,
+        ),
+        memory_provider=FakeProvider([]),
+    )
+
+    assert not hasattr(app.state, "memory_policy")
+
+
+def test_create_app_constructs_configured_memory_policy() -> None:
+    app = create_app(
+        Settings(
+            database_url="mysql+asyncmy://root:password@127.0.0.1:3306/langley",
+            memory_policy_model="qwen3.7-plus-2026-05-26",
+            memory_policy_estimated_token_budget=24_576,
+        ),
+        memory_provider=FakeProvider([]),
+    )
+
+    assert isinstance(app.state.memory_policy, MemoryPolicy)
 
 
 def test_memory_orm_metadata_matches_the_persistence_contract() -> None:

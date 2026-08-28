@@ -78,6 +78,19 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
+    def configured_memory_policy_requires_budget(self) -> "Settings":
+        """Reject a semantic Memory Policy that cannot safely process evidence."""
+        if (
+            self.memory_policy_model is not None
+            and self.memory_policy_estimated_token_budget is None
+        ):
+            raise ValueError(
+                "LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET is required when "
+                "LANGLEY_MEMORY_POLICY_MODEL is configured"
+            )
+        return self
+
+    @model_validator(mode="after")
     def enabled_web_search_requires_tavily_key(self) -> "Settings":
         """Fail at startup instead of exposing a misconfigured capability."""
         if self.web_search_enabled and self.tavily_api_key is None:

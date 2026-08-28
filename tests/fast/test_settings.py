@@ -112,7 +112,7 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     monkeypatch.setenv("LANGLEY_COMPACT_STATE_TARGET_ESTIMATE", "2500")
     monkeypatch.setenv("LANGLEY_CONVERSATION_COMPACTOR_MODEL", "compact-test-model")
     monkeypatch.setenv("LANGLEY_MEMORY_ESTIMATED_TOKEN_BUDGET", "8192")
-    monkeypatch.setenv("LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET", "12000")
+    monkeypatch.setenv("LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET", "24576")
     monkeypatch.setenv("LANGLEY_MEMORY_POLICY_MODEL", "memory-policy-test-model")
     monkeypatch.setenv("LANGLEY_LOCAL_TIMEZONE", "Asia/Shanghai")
     monkeypatch.setenv("LANGLEY_MAX_LLM_ROUNDS", "5")
@@ -148,7 +148,7 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.compact_state_target_estimate == 2_500
     assert settings.conversation_compactor_model == "compact-test-model"
     assert settings.memory_estimated_token_budget == 8_192
-    assert settings.memory_policy_estimated_token_budget == 12_000
+    assert settings.memory_policy_estimated_token_budget == 24_576
     assert settings.memory_policy_model == "memory-policy-test-model"
     assert settings.local_timezone == "Asia/Shanghai"
     assert settings.max_llm_rounds == 5
@@ -169,6 +169,20 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
 def test_settings_reject_an_invalid_local_timezone() -> None:
     with pytest.raises(ValueError, match="IANA timezone"):
         Settings(local_timezone="not-a-timezone")
+
+
+def test_settings_allow_memory_policy_budget_without_model() -> None:
+    settings = Settings(memory_policy_estimated_token_budget=24_576)
+
+    assert settings.memory_policy_model is None
+    assert settings.memory_policy_estimated_token_budget == 24_576
+
+
+def test_settings_reject_memory_policy_model_without_budget() -> None:
+    with pytest.raises(
+        ValueError, match="LANGLEY_MEMORY_POLICY_ESTIMATED_TOKEN_BUDGET"
+    ):
+        Settings(memory_policy_model="qwen3.7-plus-2026-05-26")
 
 
 def test_settings_reject_enabled_web_search_without_tavily_key(monkeypatch) -> None:
