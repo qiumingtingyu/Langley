@@ -44,6 +44,7 @@ def _settings(
     *,
     configured: bool = True,
     estimated_token_budget: int = 10_000,
+    budget_only: bool = False,
 ) -> Settings:
     return Settings(
         environment="test",
@@ -53,7 +54,7 @@ def _settings(
         qwen_base_url=None,
         memory_policy_model="test-memory-policy" if configured else None,
         memory_policy_estimated_token_budget=(
-            estimated_token_budget if configured else None
+            estimated_token_budget if configured or budget_only else None
         ),
     )
 
@@ -63,6 +64,7 @@ def _bootstrap(
     *,
     configured: bool = True,
     estimated_token_budget: int = 10_000,
+    budget_only: bool = False,
 ) -> None:
     assert asyncio.run(
         bootstrap_local_user(
@@ -70,6 +72,7 @@ def _bootstrap(
                 database_url,
                 configured=configured,
                 estimated_token_budget=estimated_token_budget,
+                budget_only=budget_only,
             )
         )
     )
@@ -146,6 +149,50 @@ def test_memory_status_and_empty_sync_do_not_require_policy(
         }
 
 
+def test_empty_backlog_direct_crud_uses_budget_without_policy_provider(
+    migrated_database: str,
+) -> None:
+    budget = estimate_load_all_memory_contribution(["abc"])
+    _bootstrap(
+        migrated_database,
+        configured=False,
+        estimated_token_budget=budget,
+        budget_only=True,
+    )
+    delete_id = _insert_memory(migrated_database, content="delete me")
+    app = create_app(
+        _settings(
+            migrated_database,
+            configured=False,
+            estimated_token_budget=budget,
+            budget_only=True,
+        )
+    )
+
+    with TestClient(app) as client:
+        assert client.delete(f"/api/memories/{delete_id}").status_code == 204
+
+        created = client.post("/api/memories", json={"content": "abc"})
+        assert created.status_code == 201
+        memory_id = created.json()["id"]
+
+        corrected = client.put(f"/api/memories/{memory_id}", json={"content": "xyz"})
+        assert corrected.status_code == 200
+        assert corrected.json()["content"] == "xyz"
+
+
+def test_empty_backlog_growing_write_still_requires_capacity_budget(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database, configured=False)
+    app = create_app(_settings(migrated_database, configured=False))
+
+    with TestClient(app) as client:
+        response = client.post("/api/memories", json={"content": "direct"})
+        assert response.status_code == 503
+        assert response.json() == {"detail": {"code": "MEMORY_CAPACITY_UNAVAILABLE"}}
+
+
 def test_memory_status_and_explicit_sync_progress_are_user_global(
     migrated_database: str,
 ) -> None:
@@ -217,6 +264,104 @@ def test_memory_status_and_explicit_sync_progress_are_user_global(
         assert no_backlog.status_code == 200
         assert no_backlog.json()["processed_count"] == 0
         assert no_backlog.json()["stop_reason"] == "COMPLETE"
+        assert len(provider.requests) == 5
+
+
+def test_direct_add_reports_durable_bounded_progress_before_retry(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    _seed_pending_evidence(
+        migrated_database,
+        [([f"pending {index}" for index in range(5)], False)],
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            )
+            for _ in range(5)
+        ]
+    )
+    app = create_app(_settings(migrated_database), memory_provider=provider)
+
+    with TestClient(app) as client:
+        incomplete = client.post("/api/memories", json={"content": "direct"})
+        assert incomplete.status_code == 409
+        assert incomplete.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_INCOMPLETE",
+                "stop_reason": "LIMIT_REACHED",
+                "processed_count": 4,
+                "remaining_count": 1,
+            }
+        }
+        assert client.get("/api/memories").json() == []
+
+        continued = client.post("/api/memory-sync")
+        assert continued.status_code == 200
+        assert continued.json()["stop_reason"] == "COMPLETE"
+        assert continued.json()["processed_count"] == 1
+
+        retried = client.post("/api/memories", json={"content": "direct"})
+        assert retried.status_code == 201
+        assert len(provider.requests) == 5
+
+
+def test_off_to_on_reports_bounded_progress_and_remains_off_until_complete(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    _seed_pending_evidence(
+        migrated_database,
+        [([f"pending {index}" for index in range(5)], False)],
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            )
+            for _ in range(5)
+        ]
+    )
+    app = create_app(_settings(migrated_database), memory_provider=provider)
+
+    with TestClient(app) as client:
+        disabled = client.patch(
+            "/api/memory-settings", json={"auto_memory_enabled": False}
+        )
+        assert disabled.status_code == 200
+        assert provider.requests == []
+
+        incomplete = client.patch(
+            "/api/memory-settings", json={"auto_memory_enabled": True}
+        )
+        assert incomplete.status_code == 409
+        assert incomplete.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_INCOMPLETE",
+                "stop_reason": "LIMIT_REACHED",
+                "processed_count": 4,
+                "remaining_count": 1,
+            }
+        }
+        assert client.get("/api/memory-settings").json() == {
+            "auto_memory_enabled": False
+        }
+
+        completed = client.patch(
+            "/api/memory-settings", json={"auto_memory_enabled": True}
+        )
+        assert completed.status_code == 200
+        assert completed.json() == {"auto_memory_enabled": True}
         assert len(provider.requests) == 5
 
 
@@ -301,6 +446,93 @@ def test_memory_sync_context_infeasible_is_distinct_and_preserves_pending(
         }
         assert client.get("/api/memory-status").json()["pending_evidence_count"] == 1
         assert provider.requests == []
+
+
+def test_direct_barrier_provider_failure_uses_stable_progress_mapping(
+    migrated_database: str,
+) -> None:
+    _bootstrap(migrated_database)
+    _seed_pending_evidence(migrated_database, [(["pending"], False)])
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(), failure=WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED)
+            )
+        ]
+    )
+    app = create_app(_settings(migrated_database), memory_provider=provider)
+
+    with TestClient(app) as client:
+        response = client.post("/api/memories", json={"content": "direct"})
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_UNAVAILABLE",
+                "stop_reason": "PROVIDER_FAILURE",
+                "processed_count": 0,
+                "remaining_count": 1,
+            }
+        }
+
+
+def test_direct_barrier_context_infeasible_uses_blocked_mapping(
+    migrated_database: str,
+) -> None:
+    budget = estimate_load_all_memory_contribution(["existing"]) - 1
+    _bootstrap(migrated_database, estimated_token_budget=budget)
+    _seed_pending_evidence(migrated_database, [(["pending"], False)])
+    memory_id = _insert_memory(migrated_database, content="existing")
+    provider = FakeProvider([])
+    app = create_app(
+        _settings(migrated_database, estimated_token_budget=budget),
+        memory_provider=provider,
+    )
+
+    with TestClient(app) as client:
+        response = client.delete(f"/api/memories/{memory_id}")
+        assert response.status_code == 409
+        assert response.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_BLOCKED",
+                "stop_reason": "CONTEXT_INFEASIBLE",
+                "processed_count": 0,
+                "remaining_count": 1,
+            }
+        }
+        assert client.get(f"/api/memories/{memory_id}/source").status_code == 200
+        assert provider.requests == []
+
+
+def test_direct_barrier_timeout_uses_stable_progress_mapping(
+    migrated_database: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _bootstrap(migrated_database)
+    _seed_pending_evidence(migrated_database, [(["pending"], False)])
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        {"mutations": [], "user_requested_memory_action": False}
+                    ),
+                )
+            )
+        ]
+    )
+    monkeypatch.setattr("langley.memory.processing.MANUAL_SYNC_TIMEOUT_SECONDS", 0)
+    app = create_app(_settings(migrated_database), memory_provider=provider)
+
+    with TestClient(app) as client:
+        response = client.post("/api/memories", json={"content": "direct"})
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_UNAVAILABLE",
+                "stop_reason": "TIMEOUT",
+                "processed_count": 0,
+                "remaining_count": 1,
+            }
+        }
 
 
 def test_memory_api_crud_validation_and_settings(migrated_database: str) -> None:
@@ -467,7 +699,21 @@ def test_memory_api_source_ownership_and_unavailable_barrier(
         assert client.get(f"/api/memories/{other_id}/source").status_code == 404
         unavailable = client.post("/api/memories", json={"content": "direct"})
         assert unavailable.status_code == 503
-        assert unavailable.json() == {"detail": {"code": "MEMORY_SYNC_UNAVAILABLE"}}
+        assert unavailable.json() == {
+            "detail": {
+                "code": "MEMORY_SYNC_UNAVAILABLE",
+                "stop_reason": "POLICY_UNAVAILABLE",
+                "processed_count": 0,
+                "remaining_count": 3,
+            }
+        }
+        assert (
+            client.put(
+                f"/api/memories/{memory_id}", json={"content": "corrected"}
+            ).json()
+            == unavailable.json()
+        )
+        assert client.delete(f"/api/memories/{memory_id}").json() == unavailable.json()
         assert (
             client.patch(
                 "/api/memory-settings", json={"auto_memory_enabled": False}

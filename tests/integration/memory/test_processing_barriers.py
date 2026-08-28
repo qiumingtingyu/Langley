@@ -12,7 +12,7 @@ from langley.infrastructure.database import (
     dispose_database_engine,
 )
 from langley.memory.processing import (
-    MemorySynchronizationUnavailableError,
+    MemorySynchronizationError,
     add_memory_direct,
     correct_memory_direct,
     forget_memory_direct,
@@ -46,13 +46,14 @@ def test_manual_add_refuses_to_bypass_an_unavailable_ordered_barrier(
         engine = create_database_engine(migrated_database)
         session_factory = create_session_factory(engine)
         try:
-            with pytest.raises(MemorySynchronizationUnavailableError):
+            with pytest.raises(MemorySynchronizationError):
                 await add_memory_direct(
                     session_factory,
                     user_id=1,
                     content="manual fact",
                     valid_until=None,
                     policy=policy,
+                    estimated_token_budget=10_000,
                     local_timezone="Asia/Shanghai",
                     lane=asyncio.Lock(),
                 )
@@ -91,6 +92,7 @@ def test_manual_barrier_propagates_an_unexpected_policy_error(
                     content="manual fact",
                     valid_until=None,
                     policy=policy,
+                    estimated_token_budget=10_000,
                     local_timezone="Asia/Shanghai",
                     lane=asyncio.Lock(),
                 )
@@ -126,13 +128,14 @@ def test_manual_barrier_stops_after_its_bounded_prefix_without_mass_closure(
         engine = create_database_engine(migrated_database)
         session_factory = create_session_factory(engine)
         try:
-            with pytest.raises(MemorySynchronizationUnavailableError):
+            with pytest.raises(MemorySynchronizationError):
                 await add_memory_direct(
                     session_factory,
                     user_id=1,
                     content="must not bypass backlog",
                     valid_until=None,
                     policy=policy,
+                    estimated_token_budget=10_000,
                     local_timezone="Asia/Shanghai",
                     lane=asyncio.Lock(),
                 )
@@ -171,6 +174,7 @@ def test_manual_correct_and_forget_reread_current_target_after_barrier(
                 content="corrected fact",
                 valid_until=None,
                 policy=policy,
+                estimated_token_budget=10_000,
                 local_timezone="Asia/Shanghai",
                 lane=asyncio.Lock(),
             )

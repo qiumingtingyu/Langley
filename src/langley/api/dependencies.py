@@ -60,6 +60,8 @@ def get_local_file_storage(request: Request) -> LocalFileStorage:
 
 
 def get_memory_policy(request: Request) -> MemoryPolicy | None:
+    if request.app.state.memory_policy_status is not MemoryPolicyStatus.READY:
+        return None
     return getattr(request.app.state, "memory_policy", None)
 
 

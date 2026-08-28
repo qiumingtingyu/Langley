@@ -22,7 +22,7 @@ from langley.memory.policy import (
     MemoryPolicyResult,
 )
 from langley.memory.processing import (
-    MemorySynchronizationUnavailableError,
+    MemorySynchronizationError,
     process_memory_through,
     set_auto_memory_enabled,
 )
@@ -403,7 +403,7 @@ def test_off_to_on_failure_keeps_auto_memory_disabled(migrated_database: str) ->
                 local_timezone="Asia/Shanghai",
                 lane=asyncio.Lock(),
             )
-            with pytest.raises(MemorySynchronizationUnavailableError):
+            with pytest.raises(MemorySynchronizationError):
                 await set_auto_memory_enabled(
                     session_factory,
                     user_id=1,

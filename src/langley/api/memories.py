@@ -28,8 +28,10 @@ from langley.memory.events import MemoryEventSubscribers, MemoryOutcome
 from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
 from langley.memory.processing import (
     MemoryCapacityReachedError,
+    MemoryCapacityUnavailableError,
     MemoryProcessingStopReason,
-    MemorySynchronizationUnavailableError,
+    MemorySynchronizationError,
+    MemorySyncResult,
     add_memory_direct,
     correct_memory_direct,
     forget_memory_direct,
@@ -135,11 +137,13 @@ def _raise_memory_error(error: Exception) -> None:
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "MEMORY_CAPACITY_REACHED"},
         ) from error
-    if isinstance(error, MemorySynchronizationUnavailableError):
+    if isinstance(error, MemoryCapacityUnavailableError):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"code": "MEMORY_SYNC_UNAVAILABLE"},
+            detail={"code": "MEMORY_CAPACITY_UNAVAILABLE"},
         ) from error
+    if isinstance(error, MemorySynchronizationError):
+        _raise_incomplete_sync(_memory_sync_response(error.sync))
     if isinstance(error, KeyError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -170,8 +174,6 @@ async def post_memory(
     lane: asyncio.Lock = Depends(get_memory_lane),
     current_user_id: int = Depends(get_current_user_id),
 ) -> MemoryResponse:
-    if policy is None:
-        raise HTTPException(status_code=503, detail={"code": "MEMORY_SYNC_UNAVAILABLE"})
     try:
         memory = await add_memory_direct(
             session_factory,
@@ -179,6 +181,7 @@ async def post_memory(
             content=body.content,
             valid_until=_normalized_valid_until(body.valid_until),
             policy=policy,
+            estimated_token_budget=settings.memory_policy_estimated_token_budget,
             local_timezone=settings.local_timezone,
             lane=lane,
         )
@@ -197,8 +200,6 @@ async def put_memory(
     lane: asyncio.Lock = Depends(get_memory_lane),
     current_user_id: int = Depends(get_current_user_id),
 ) -> MemoryResponse:
-    if policy is None:
-        raise HTTPException(status_code=503, detail={"code": "MEMORY_SYNC_UNAVAILABLE"})
     try:
         memory = await correct_memory_direct(
             session_factory,
@@ -207,6 +208,7 @@ async def put_memory(
             content=body.content,
             valid_until=_normalized_valid_until(body.valid_until),
             policy=policy,
+            estimated_token_budget=settings.memory_policy_estimated_token_budget,
             local_timezone=settings.local_timezone,
             lane=lane,
         )
@@ -230,8 +232,6 @@ async def delete_memory(
         )
     if existing is None:
         return Response(status_code=204)
-    if policy is None:
-        raise HTTPException(status_code=503, detail={"code": "MEMORY_SYNC_UNAVAILABLE"})
     try:
         await forget_memory_direct(
             session_factory,
@@ -323,7 +323,13 @@ async def post_memory_sync(
         lane=lane,
         outcome_callback=subscribers.publish,
     )
-    response = MemorySyncResponse(
+    response = _memory_sync_response(sync)
+    _raise_incomplete_sync(response, limit_is_success=True)
+    return response
+
+
+def _memory_sync_response(sync: MemorySyncResult) -> MemorySyncResponse:
+    return MemorySyncResponse(
         processed_count=sync.processing.processed_count,
         remaining_count=sync.pending.pending_evidence_count,
         complete=sync.processing.complete,
@@ -333,16 +339,28 @@ async def post_memory_sync(
             sync.pending.oldest_pending_created_at
         ),
     )
-    if response.stop_reason in {
-        MemoryProcessingStopReason.COMPLETE,
-        MemoryProcessingStopReason.LIMIT_REACHED,
-    }:
-        return response
+
+
+def _raise_incomplete_sync(
+    response: MemorySyncResponse, *, limit_is_success: bool = False
+) -> None:
+    if response.stop_reason is MemoryProcessingStopReason.COMPLETE:
+        return
+    if (
+        limit_is_success
+        and response.stop_reason is MemoryProcessingStopReason.LIMIT_REACHED
+    ):
+        return
     detail = {
         "stop_reason": response.stop_reason.value,
         "processed_count": response.processed_count,
         "remaining_count": response.remaining_count,
     }
+    if response.stop_reason is MemoryProcessingStopReason.LIMIT_REACHED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "MEMORY_SYNC_INCOMPLETE", **detail},
+        )
     if response.stop_reason is MemoryProcessingStopReason.CONTEXT_INFEASIBLE:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

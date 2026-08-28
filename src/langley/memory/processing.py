@@ -38,12 +38,12 @@ MANUAL_SYNC_TIMEOUT_SECONDS = 20
 logger = structlog.get_logger(__name__)
 
 
-class MemorySynchronizationUnavailableError(RuntimeError):
-    """The mandatory ordered Memory barrier could not complete safely."""
-
-
 class MemoryCapacityReachedError(RuntimeError):
     """A direct write would exceed the configured Load-All capacity."""
+
+
+class MemoryCapacityUnavailableError(RuntimeError):
+    """A growing direct write has no configured Load-All capacity contract."""
 
 
 class MemoryProcessingStopReason(StrEnum):
@@ -82,6 +82,14 @@ class MemorySyncResult:
 
     processing: MemoryProcessingResult
     pending: PendingMemoryEvidenceStatus
+
+
+class MemorySynchronizationError(RuntimeError):
+    """A mandatory ordered barrier stopped before its captured prefix completed."""
+
+    def __init__(self, sync: MemorySyncResult) -> None:
+        super().__init__(sync.processing.stop_reason.value)
+        self.sync = sync
 
 
 @dataclass(frozen=True)
@@ -186,61 +194,15 @@ async def synchronize_memory(
     """Process one captured batch without adding durable operational state."""
 
     async with lane:
-        boundary = await _capture_canonical_boundary(session_factory, user_id)
-        before = await _pending_status_from_factory(
+        sync = await _synchronize_memory_locked(
             session_factory,
             user_id=user_id,
-            through_message_id=boundary,
+            policy=policy,
+            local_timezone=local_timezone,
         )
-        if before.pending_evidence_count == 0:
-            processing = MemoryProcessingResult(
-                processed_count=0,
-                complete=True,
-                stop_reason=MemoryProcessingStopReason.COMPLETE,
-            )
-            remaining = before
-        elif policy is None:
-            processing = MemoryProcessingResult(
-                processed_count=0,
-                complete=False,
-                stop_reason=MemoryProcessingStopReason.POLICY_UNAVAILABLE,
-            )
-            remaining = before
-        else:
-            try:
-                async with asyncio.timeout(MANUAL_SYNC_TIMEOUT_SECONDS):
-                    processing = await _process_memory_through_locked(
-                        session_factory,
-                        user_id=user_id,
-                        through_message_id=boundary,
-                        policy=policy,
-                        local_timezone=local_timezone,
-                        limit=MANUAL_SYNC_LIMIT,
-                    )
-            except TimeoutError:
-                remaining = await _pending_status_from_factory(
-                    session_factory,
-                    user_id=user_id,
-                    through_message_id=boundary,
-                )
-                processing = MemoryProcessingResult(
-                    processed_count=max(
-                        0,
-                        before.pending_evidence_count
-                        - remaining.pending_evidence_count,
-                    ),
-                    complete=False,
-                    stop_reason=MemoryProcessingStopReason.TIMEOUT,
-                )
-            else:
-                remaining = await _pending_status_from_factory(
-                    session_factory,
-                    user_id=user_id,
-                    through_message_id=boundary,
-                )
     return MemorySyncResult(
-        processing=_publish_processing_outcomes(processing, outcome_callback),
-        pending=remaining,
+        processing=_publish_processing_outcomes(sync.processing, outcome_callback),
+        pending=sync.pending,
     )
 
 
@@ -250,7 +212,8 @@ async def add_memory_direct(
     user_id: int,
     content: str,
     valid_until: datetime | None,
-    policy: MemoryPolicy,
+    policy: MemoryPolicy | None,
+    estimated_token_budget: int | None,
     local_timezone: str,
     lane: asyncio.Lock,
 ) -> Memory:
@@ -270,13 +233,14 @@ async def add_memory_direct(
         async with session_factory() as session, session.begin():
             await _lock_user(session, user_id)
             current_memories = await _lock_current_memories(session, user_id, now)
-            if (
-                estimate_load_all_memory_contribution(
-                    [memory.content for memory in current_memories] + [content]
-                )
-                > policy.estimated_token_budget
-            ):
-                raise MemoryCapacityReachedError
+            _require_direct_post_state_capacity(
+                before_contents=[memory.content for memory in current_memories],
+                after_contents=[
+                    *[memory.content for memory in current_memories],
+                    content,
+                ],
+                estimated_token_budget=estimated_token_budget,
+            )
             memory = Memory(
                 user_id=user_id,
                 content=content,
@@ -297,7 +261,8 @@ async def correct_memory_direct(
     memory_id: int,
     content: str,
     valid_until: datetime | None,
-    policy: MemoryPolicy,
+    policy: MemoryPolicy | None,
+    estimated_token_budget: int | None,
     local_timezone: str,
     lane: asyncio.Lock,
 ) -> Memory:
@@ -326,11 +291,11 @@ async def correct_memory_direct(
                 content if current.id == memory_id else current.content
                 for current in current_memories
             ]
-            if (
-                estimate_load_all_memory_contribution(post_state_contents)
-                > policy.estimated_token_budget
-            ):
-                raise MemoryCapacityReachedError
+            _require_direct_post_state_capacity(
+                before_contents=[memory.content for memory in current_memories],
+                after_contents=post_state_contents,
+                estimated_token_budget=estimated_token_budget,
+            )
             memory.content = content
             memory.valid_until = valid_until
             memory.source_message_id = None
@@ -343,7 +308,7 @@ async def forget_memory_direct(
     *,
     user_id: int,
     memory_id: int,
-    policy: MemoryPolicy,
+    policy: MemoryPolicy | None,
     local_timezone: str,
     lane: asyncio.Lock,
 ) -> None:
@@ -381,25 +346,14 @@ async def set_auto_memory_enabled(
             user.auto_memory_enabled = False
         return
 
-    if policy is None:
-        raise MemorySynchronizationUnavailableError
-
     async with lane:
-        boundary = await _capture_canonical_boundary(session_factory, user_id)
-        try:
-            async with asyncio.timeout(MANUAL_SYNC_TIMEOUT_SECONDS):
-                result = await _process_memory_through_locked(
-                    session_factory,
-                    user_id=user_id,
-                    through_message_id=boundary,
-                    policy=policy,
-                    local_timezone=local_timezone,
-                    limit=MANUAL_SYNC_LIMIT,
-                )
-        except TimeoutError as error:
-            raise MemorySynchronizationUnavailableError from error
-        if not result.complete:
-            raise MemorySynchronizationUnavailableError
+        sync = await _synchronize_memory_locked(
+            session_factory,
+            user_id=user_id,
+            policy=policy,
+            local_timezone=local_timezone,
+        )
+        _require_complete_sync(sync)
         async with session_factory() as session, session.begin():
             user = await _lock_user(session, user_id)
             user.auto_memory_enabled = True
@@ -409,13 +363,54 @@ async def _require_manual_barrier(
     session_factory: SessionFactory,
     *,
     user_id: int,
-    policy: MemoryPolicy,
+    policy: MemoryPolicy | None,
     local_timezone: str,
 ) -> None:
+    sync = await _synchronize_memory_locked(
+        session_factory,
+        user_id=user_id,
+        policy=policy,
+        local_timezone=local_timezone,
+    )
+    _require_complete_sync(sync)
+
+
+async def _synchronize_memory_locked(
+    session_factory: SessionFactory,
+    *,
+    user_id: int,
+    policy: MemoryPolicy | None,
+    local_timezone: str,
+) -> MemorySyncResult:
+    """Capture and process one finite prefix while the process-local lane is held."""
+
     boundary = await _capture_canonical_boundary(session_factory, user_id)
+    before = await _pending_status_from_factory(
+        session_factory,
+        user_id=user_id,
+        through_message_id=boundary,
+    )
+    if before.pending_evidence_count == 0:
+        return MemorySyncResult(
+            processing=MemoryProcessingResult(
+                processed_count=0,
+                complete=True,
+                stop_reason=MemoryProcessingStopReason.COMPLETE,
+            ),
+            pending=before,
+        )
+    if policy is None:
+        return MemorySyncResult(
+            processing=MemoryProcessingResult(
+                processed_count=0,
+                complete=False,
+                stop_reason=MemoryProcessingStopReason.POLICY_UNAVAILABLE,
+            ),
+            pending=before,
+        )
     try:
         async with asyncio.timeout(MANUAL_SYNC_TIMEOUT_SECONDS):
-            result = await _process_memory_through_locked(
+            processing = await _process_memory_through_locked(
                 session_factory,
                 user_id=user_id,
                 through_message_id=boundary,
@@ -423,10 +418,48 @@ async def _require_manual_barrier(
                 local_timezone=local_timezone,
                 limit=MANUAL_SYNC_LIMIT,
             )
-    except TimeoutError as error:
-        raise MemorySynchronizationUnavailableError from error
-    if not result.complete:
-        raise MemorySynchronizationUnavailableError
+    except TimeoutError:
+        remaining = await _pending_status_from_factory(
+            session_factory,
+            user_id=user_id,
+            through_message_id=boundary,
+        )
+        processing = MemoryProcessingResult(
+            processed_count=max(
+                0,
+                before.pending_evidence_count - remaining.pending_evidence_count,
+            ),
+            complete=False,
+            stop_reason=MemoryProcessingStopReason.TIMEOUT,
+        )
+    else:
+        remaining = await _pending_status_from_factory(
+            session_factory,
+            user_id=user_id,
+            through_message_id=boundary,
+        )
+    return MemorySyncResult(processing=processing, pending=remaining)
+
+
+def _require_complete_sync(sync: MemorySyncResult) -> None:
+    if not sync.processing.complete:
+        raise MemorySynchronizationError(sync)
+
+
+def _require_direct_post_state_capacity(
+    *,
+    before_contents: list[str],
+    after_contents: list[str],
+    estimated_token_budget: int | None,
+) -> None:
+    before_estimate = estimate_load_all_memory_contribution(before_contents)
+    after_estimate = estimate_load_all_memory_contribution(after_contents)
+    if estimated_token_budget is None:
+        if after_estimate > before_estimate:
+            raise MemoryCapacityUnavailableError
+        return
+    if after_estimate > estimated_token_budget:
+        raise MemoryCapacityReachedError
 
 
 async def _process_memory_through_locked(
