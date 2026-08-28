@@ -23,6 +23,7 @@ from langley.memory.policy import (
     estimate_load_all_memory_contribution,
 )
 from langley.memory.processing import (
+    MemoryProcessingStopReason,
     process_memory_through,
 )
 
@@ -326,7 +327,11 @@ def test_policy_mutation_and_marker_commit_atomically(migrated_database: str) ->
         migrated_database, through_message_id=message_ids[0], policy=policy
     )
 
-    assert result == type(result)(processed_count=1, complete=True)
+    assert result == type(result)(
+        processed_count=1,
+        complete=True,
+        stop_reason=MemoryProcessingStopReason.COMPLETE,
+    )
     assert (
         _scalar(
             migrated_database,
@@ -491,7 +496,9 @@ def test_forget_does_not_resurrect_from_already_closed_old_evidence(
         policy=_policy([]),
     )
     assert replay_old_boundary == type(replay_old_boundary)(
-        processed_count=0, complete=True
+        processed_count=0,
+        complete=True,
+        stop_reason=MemoryProcessingStopReason.COMPLETE,
     )
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 0
 

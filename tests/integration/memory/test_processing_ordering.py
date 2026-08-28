@@ -14,6 +14,7 @@ from langley.memory.policy import (
     MemoryPolicyInput,
     MemoryPolicyResult,
 )
+from langley.memory.processing import MemoryProcessingStopReason
 
 from ._support import (
     _completion,
@@ -191,7 +192,11 @@ def test_processed_retry_evidence_is_not_processed_twice(
         migrated_database, through_message_id=message_ids[0], policy=policy
     )
 
-    assert retry_drain == type(retry_drain)(processed_count=0, complete=True)
+    assert retry_drain == type(retry_drain)(
+        processed_count=0,
+        complete=True,
+        stop_reason=MemoryProcessingStopReason.COMPLETE,
+    )
     assert _scalar(migrated_database, "SELECT COUNT(*) FROM memories") == 1
 
 
@@ -282,7 +287,11 @@ def test_cross_conversation_transient_failure_blocks_the_user_global_prefix(
     policy = _RecordingPolicy([WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED)])
     result = _process(migrated_database, through_message_id=later_id, policy=policy)
 
-    assert result == type(result)(processed_count=0, complete=False)
+    assert result == type(result)(
+        processed_count=0,
+        complete=False,
+        stop_reason=MemoryProcessingStopReason.PROVIDER_FAILURE,
+    )
     assert [item.evidence_message_id for item in policy.inputs] == [first_ids[0]]
     assert (
         _scalar(
