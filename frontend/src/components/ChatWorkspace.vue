@@ -5,7 +5,7 @@ import { ref, watch } from "vue";
 import EvidenceSheet from "@/components/EvidenceSheet.vue";
 import MessageContent from "@/components/MessageContent.vue";
 import { Button } from "@/components/ui/button";
-import type { Conversation, Message, MessageCitation, Run } from "@/types";
+import type { Conversation, GroundingPolicy, KnowledgeBase, Message, MessageCitation, Run } from "@/types";
 
 const props = defineProps<{
   selectedConversation: Conversation | null;
@@ -18,6 +18,12 @@ const props = defineProps<{
   hasPendingNetworkCommand: boolean;
   hasActiveRun: boolean;
   runFailureMessage: string;
+  knowledgeBases: KnowledgeBase[];
+  knowledgeBaseId: number | null;
+  groundingPolicy: GroundingPolicy;
+  isKnowledgeScopeLocked: boolean;
+  isLoadingKnowledgeBases: boolean;
+  knowledgeBaseLoadError: string | null;
 }>();
 
 const composerContent = defineModel<string>("composerContent", { required: true });
@@ -32,10 +38,22 @@ const emit = defineEmits<{
   retry: [];
   regenerate: [];
   send: [];
+  "update:knowledgeBaseId": [value: number | null];
+  "update:groundingPolicy": [value: GroundingPolicy];
+  retryKnowledgeBases: [];
 }>();
 
 function conversationTitle(conversation: Conversation): string {
   return conversation.title ?? "未命名会话";
+}
+
+function selectKnowledgeBase(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value;
+  emit("update:knowledgeBaseId", value === "" ? null : Number(value));
+}
+
+function selectGroundingPolicy(event: Event): void {
+  emit("update:groundingPolicy", (event.target as HTMLSelectElement).value as GroundingPolicy);
 }
 
 watch(
@@ -310,7 +328,68 @@ watch(
               @keydown.meta.enter.prevent="emit('send')"
               @keydown.ctrl.enter.prevent="emit('send')"
             />
-            <div class="flex items-center justify-between gap-3 px-1 pt-1">
+            <div class="flex flex-col gap-2 px-1 pt-2 sm:flex-row sm:items-center sm:justify-between">
+              <div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
+                <label
+                  for="knowledge-base"
+                  class="font-mono text-[9px] tracking-[0.1em] text-muted-light"
+                >资料范围</label>
+                <select
+                  id="knowledge-base"
+                  aria-label="资料范围"
+                  class="min-w-0 max-w-full rounded-sm border border-border bg-surface px-2 py-1 text-xs text-body outline-none focus:border-primary focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:text-muted-light"
+                  :value="knowledgeBaseId ?? ''"
+                  :disabled="isKnowledgeScopeLocked || isLoadingKnowledgeBases || knowledgeBaseLoadError !== null"
+                  @change="selectKnowledgeBase"
+                >
+                  <option value="">
+                    不使用资料
+                  </option>
+                  <option
+                    v-for="knowledgeBase in knowledgeBases"
+                    :key="knowledgeBase.id"
+                    :value="knowledgeBase.id"
+                  >
+                    {{ knowledgeBase.name }}
+                  </option>
+                </select>
+                <template v-if="knowledgeBaseId !== null">
+                  <label
+                    for="grounding-policy"
+                    class="font-mono text-[9px] tracking-[0.1em] text-muted-light"
+                  >依据方式</label>
+                  <select
+                    id="grounding-policy"
+                    aria-label="依据方式"
+                    class="rounded-sm border border-border bg-surface px-2 py-1 text-xs text-body outline-none focus:border-primary focus:ring-2 focus:ring-ring/20 disabled:cursor-not-allowed disabled:text-muted-light"
+                    :value="groundingPolicy"
+                    :disabled="isKnowledgeScopeLocked"
+                    @change="selectGroundingPolicy"
+                  >
+                    <option value="AUTO">
+                      自动参考
+                    </option>
+                    <option value="REQUIRED">
+                      必须依据资料
+                    </option>
+                  </select>
+                </template>
+                <span
+                  v-if="isLoadingKnowledgeBases"
+                  class="text-xs text-muted-light"
+                >正在读取资料…</span>
+                <span
+                  v-else-if="knowledgeBaseLoadError"
+                  class="flex items-center gap-1.5 text-xs text-muted-foreground"
+                >
+                  {{ knowledgeBaseLoadError }}
+                  <button
+                    type="button"
+                    class="text-primary-deep underline underline-offset-2"
+                    @click="emit('retryKnowledgeBases')"
+                  >重新读取</button>
+                </span>
+              </div>
               <span class="font-mono text-[9px] tracking-[0.1em] text-muted-light">COMPOSER · CTRL/⌘ + ENTER</span>
               <Button
                 type="submit"

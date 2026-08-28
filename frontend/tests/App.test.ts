@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../src/App.vue";
 
 type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
-type Run = { id: number; input_message_id: number; attempt_no: number; status: RunStatus; started_at: string | null; finished_at: string | null; error_code: string | null };
+type Run = { id: number; input_message_id: number; attempt_no: number; knowledge_base_id: number | null; grounding_policy: "AUTO" | "REQUIRED"; status: RunStatus; started_at: string | null; finished_at: string | null; error_code: string | null };
+type KnowledgeBase = { id: number; name: string; created_at: string };
 type MessageCitation = { evidence_handle: number; document_version_id: number; evidence_text: string; source_display_name: string; heading_path: unknown[]; source_regions: unknown[] };
 type Message = { id: number; sequence_no: number; role: "USER" | "ASSISTANT"; content: string; run_id: number | null; regenerated_from_message_id: number | null; created_at: string; citations: MessageCitation[] };
 
@@ -30,7 +31,7 @@ function deferred<Value>(): { promise: Promise<Value>; resolve(value: Value): vo
 function response(payload: unknown, ok = true): Response { return { ok, json: async () => payload } as Response; }
 function conversation(id: number, title: string) { return { id, title, created_at: "2026-08-16T00:00:00Z", updated_at: "2026-08-16T00:00:00Z", last_message_at: null }; }
 function message(id: number, content: string, role: Message["role"] = "USER", runId: number | null = null, citations: MessageCitation[] = []): Message { return { id, sequence_no: id, role, content, run_id: runId, regenerated_from_message_id: null, created_at: "2026-08-16T00:00:00Z", citations }; }
-function run(id: number, status: RunStatus): Run { return { id, input_message_id: id, attempt_no: 1, status, started_at: status === "PENDING" ? null : "2026-08-16T00:00:00Z", finished_at: ["SUCCEEDED", "FAILED", "CANCELLED"].includes(status) ? "2026-08-16T00:01:00Z" : null, error_code: status === "FAILED" ? "LLM_PROVIDER_FAILED" : null }; }
+function run(id: number, status: RunStatus, knowledgeBaseId: number | null = null, groundingPolicy: "AUTO" | "REQUIRED" = "AUTO"): Run { return { id, input_message_id: id, attempt_no: 1, knowledge_base_id: knowledgeBaseId, grounding_policy: groundingPolicy, status, started_at: status === "PENDING" ? null : "2026-08-16T00:00:00Z", finished_at: ["SUCCEEDED", "FAILED", "CANCELLED"].includes(status) ? "2026-08-16T00:01:00Z" : null, error_code: status === "FAILED" ? "LLM_PROVIDER_FAILED" : null }; }
 function button(wrapper: VueWrapper, text: string) { const found = wrapper.findAll("button").find((candidate) => candidate.text().includes(text)); if (found === undefined) throw new Error(`button not found: ${text}`); return found; }
 async function settle(): Promise<void> { await flushPromises(); await nextTick(); await flushPromises(); }
 
@@ -40,7 +41,7 @@ describe("App user behavior", () => {
 
   beforeEach(() => {
     const responses: Array<Response | Promise<Response>> = [];
-    fetchMock = vi.fn(() => { const next = responses.shift(); if (next === undefined) throw new Error("unexpected fetch"); return Promise.resolve(next); });
+    fetchMock = vi.fn((path: string) => { const next = responses.shift(); if (next !== undefined) return Promise.resolve(next); if (path === "/api/knowledge-bases") return Promise.resolve(response([])); throw new Error(`unexpected fetch: ${path}`); });
     enqueue = (value) => responses.push(value);
     FakeEventSource.instances = [];
     vi.stubGlobal("fetch", fetchMock);
@@ -51,9 +52,10 @@ describe("App user behavior", () => {
 
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); document.body.innerHTML = ""; });
 
-  async function mountInitial(activeRun: Run | null = null, initialMessages: Message[] = [message(1, "问题 A")]): Promise<VueWrapper> {
+  async function mountInitial(activeRun: Run | null = null, initialMessages: Message[] = [message(1, "问题 A")], knowledgeBases: KnowledgeBase[] = []): Promise<VueWrapper> {
     enqueue(response([conversation(1, "A"), conversation(2, "B")]));
     enqueue(response({ messages: initialMessages, latest_run: activeRun }));
+    enqueue(response(knowledgeBases));
     const wrapper = mount(App);
     await settle();
     return wrapper;
@@ -105,17 +107,86 @@ describe("App user behavior", () => {
   });
 
   it("keeps the client request id when a network command is retried", async () => {
-    const wrapper = await mountInitial();
+    const wrapper = await mountInitial(null, [message(1, "问题 A")], [{ id: 9, name: "网络基础", created_at: "x" }]);
+    await wrapper.get('select[aria-label="资料范围"]').setValue("9");
+    await wrapper.get('select[aria-label="依据方式"]').setValue("REQUIRED");
     enqueue(Promise.reject(new TypeError("network failure")));
     await sendQuestion(wrapper, "第一个问题");
     await settle();
     expect(button(wrapper, "重试请求").exists()).toBe(true);
+    expect((wrapper.get('select[aria-label="资料范围"]').element as HTMLSelectElement).value).toBe("9");
+    expect((wrapper.get('select[aria-label="依据方式"]').element as HTMLSelectElement).value).toBe("REQUIRED");
     enqueue(response({ user_message: message(2, "第一个问题"), run: run(201, "PENDING") }));
     await button(wrapper, "重试请求").trigger("click");
     await settle();
     const requests = fetchMock.mock.calls.filter(([path, init]) => path === "/api/conversations/1/messages" && init?.method === "POST");
     expect(requests).toHaveLength(2);
-    expect(JSON.parse(String(requests[0]?.[1]?.body)).client_request_id).toBe(JSON.parse(String(requests[1]?.[1]?.body)).client_request_id);
+    expect(JSON.parse(String(requests[0]?.[1]?.body))).toEqual(JSON.parse(String(requests[1]?.[1]?.body)));
+    expect(JSON.parse(String(requests[0]?.[1]?.body))).toMatchObject({ knowledge_base_id: 9, grounding_policy: "REQUIRED" });
+    wrapper.unmount();
+  });
+
+  it("shows a recovered active Run scope instead of the next-question draft", async () => {
+    const wrapper = await mountInitial(run(201, "RUNNING", 9, "REQUIRED"), [message(1, "问题 A")], [{ id: 9, name: "网络基础", created_at: "x" }]);
+    expect((wrapper.get('select[aria-label="资料范围"]').element as HTMLSelectElement).value).toBe("9");
+    expect((wrapper.get('select[aria-label="依据方式"]').element as HTMLSelectElement).value).toBe("REQUIRED");
+    expect(wrapper.get('select[aria-label="资料范围"]').attributes("disabled")).toBeDefined();
+    wrapper.unmount();
+  });
+
+  it("retries the authoritative Run scope without sending the modified Composer draft", async () => {
+    const wrapper = await mountInitial(run(201, "FAILED", 9, "REQUIRED"), [message(1, "问题 A")], [
+      { id: 9, name: "网络基础", created_at: "x" },
+      { id: 10, name: "另一份资料", created_at: "x" },
+    ]);
+    await wrapper.get('select[aria-label="资料范围"]').setValue("10");
+    const admission = deferred<Response>();
+    enqueue(admission.promise);
+    await button(wrapper, "重试").trigger("click");
+    await nextTick();
+    const request = fetchMock.mock.calls.find(([path, init]) => path === "/api/conversations/1/retry" && init?.method === "POST");
+    expect(JSON.parse(String(request?.[1]?.body))).toEqual({ client_request_id: "request-1" });
+    expect((wrapper.get('select[aria-label="资料范围"]').element as HTMLSelectElement).value).toBe("9");
+    expect((wrapper.get('select[aria-label="依据方式"]').element as HTMLSelectElement).value).toBe("REQUIRED");
+    admission.resolve(response({ user_message: message(1, "问题 A"), run: run(202, "PENDING", 9, "REQUIRED") }));
+    await settle();
+    expect((wrapper.get('select[aria-label="资料范围"]').element as HTMLSelectElement).value).toBe("9");
+    wrapper.unmount();
+  });
+
+  it("sends the selected knowledge base with automatic reference", async () => {
+    const wrapper = await mountInitial(null, [message(1, "问题 A")], [{ id: 9, name: "网络基础", created_at: "x" }]);
+    await wrapper.get('select[aria-label="资料范围"]').setValue("9");
+    enqueue(response({ user_message: message(2, "问题 A"), run: run(201, "SUCCEEDED") }));
+    await sendQuestion(wrapper, "问题 A");
+    await settle();
+    const request = fetchMock.mock.calls.find(([path, init]) => path === "/api/conversations/1/messages" && init?.method === "POST");
+    expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({ knowledge_base_id: 9, grounding_policy: "AUTO" });
+    wrapper.unmount();
+  });
+
+  it("sends required reference only with the selected knowledge base", async () => {
+    const wrapper = await mountInitial(null, [message(1, "问题 A")], [{ id: 9, name: "网络基础", created_at: "x" }]);
+    await wrapper.get('select[aria-label="资料范围"]').setValue("9");
+    await wrapper.get('select[aria-label="依据方式"]').setValue("REQUIRED");
+    enqueue(response({ user_message: message(2, "问题 A"), run: run(201, "SUCCEEDED") }));
+    await sendQuestion(wrapper, "问题 A");
+    await settle();
+    const request = fetchMock.mock.calls.find(([path, init]) => path === "/api/conversations/1/messages" && init?.method === "POST");
+    expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({ knowledge_base_id: 9, grounding_policy: "REQUIRED" });
+    wrapper.unmount();
+  });
+
+  it("normalizes required reference when the knowledge base is cleared", async () => {
+    const wrapper = await mountInitial(null, [message(1, "问题 A")], [{ id: 9, name: "网络基础", created_at: "x" }]);
+    await wrapper.get('select[aria-label="资料范围"]').setValue("9");
+    await wrapper.get('select[aria-label="依据方式"]').setValue("REQUIRED");
+    await wrapper.get('select[aria-label="资料范围"]').setValue("");
+    enqueue(response({ user_message: message(2, "问题 A"), run: run(201, "SUCCEEDED") }));
+    await sendQuestion(wrapper, "问题 A");
+    await settle();
+    const request = fetchMock.mock.calls.find(([path, init]) => path === "/api/conversations/1/messages" && init?.method === "POST");
+    expect(JSON.parse(String(request?.[1]?.body))).toMatchObject({ knowledge_base_id: null, grounding_policy: "AUTO" });
     wrapper.unmount();
   });
 
@@ -285,6 +356,21 @@ describe("App user behavior", () => {
     expect(wrapper.find("header").text()).toContain("B");
     expect(wrapper.get("textarea").exists()).toBe(true);
     expect(wrapper.text()).not.toContain("创建或选择一个知识库后即可上传 Markdown 文档。");
+    wrapper.unmount();
+  });
+
+  it("refreshes Composer knowledge bases when returning to Chat", async () => {
+    const wrapper = await mountInitial();
+    enqueue(response([]));
+    await button(wrapper, "知识库").trigger("click");
+    await settle();
+
+    enqueue(response([{ id: 9, name: "新资料", created_at: "x" }]));
+    await button(wrapper, "聊天").trigger("click");
+    await settle();
+
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/knowledge-bases")).toHaveLength(3);
+    expect(wrapper.get('select[aria-label="资料范围"]').text()).toContain("新资料");
     wrapper.unmount();
   });
 

@@ -4,13 +4,19 @@ import AppSidebar from "@/components/AppSidebar.vue";
 import ChatWorkspace from "@/components/ChatWorkspace.vue";
 import KnowledgePage from "@/KnowledgePage.vue";
 import MemoryPage from "@/MemoryPage.vue";
-import type { ActiveView, Conversation, Message, Run, StreamState } from "@/types";
+import type { ActiveView, Conversation, GroundingPolicy, KnowledgeBase, Message, Run, StreamState } from "@/types";
+
+interface CommandScope {
+  knowledgeBaseId: number | null;
+  groundingPolicy: GroundingPolicy;
+}
 
 interface PendingCommand {
   conversationId: number;
   label: string;
   path: string;
-  payload: Record<string, string>;
+  payload: Record<string, unknown>;
+  scope: CommandScope;
 }
 
 const ERROR_MESSAGES: Record<string, string> = {
@@ -29,10 +35,16 @@ const selectedConversationId = ref<number | null>(null);
 const messages = ref<Message[]>([]);
 const latestRun = ref<Run | null>(null);
 const composerContent = ref("");
+const knowledgeBases = ref<KnowledgeBase[]>([]);
+const selectedKnowledgeBaseId = ref<number | null>(null);
+const groundingPolicy = ref<GroundingPolicy>("AUTO");
+const isLoadingKnowledgeBases = ref(false);
+const knowledgeBaseLoadError = ref<string | null>(null);
 const busyAction = ref<string | null>(null);
 const isLoading = ref(true);
 const requestError = ref<string | null>(null);
 const pendingNetworkCommand = ref<PendingCommand | null>(null);
+const activeCommandScope = ref<CommandScope | null>(null);
 const streamState = ref<StreamState | null>(null);
 const activeView = ref<ActiveView>("chat");
 const memoryNotice = ref<string | null>(null);
@@ -49,6 +61,15 @@ const selectedConversation = computed(() =>
   conversations.value.find((conversation) => conversation.id === selectedConversationId.value),
 );
 const hasActiveRun = computed(() => latestRun.value !== null && isActive(latestRun.value));
+const displayedKnowledgeScope = computed<CommandScope>(() => {
+  if (activeCommandScope.value !== null) return activeCommandScope.value;
+  if (pendingNetworkCommand.value !== null) return pendingNetworkCommand.value.scope;
+  if (hasActiveRun.value && latestRun.value !== null) return scopeFromRun(latestRun.value);
+  return { knowledgeBaseId: selectedKnowledgeBaseId.value, groundingPolicy: groundingPolicy.value };
+});
+const isKnowledgeScopeLocked = computed(
+  () => busyAction.value !== null || hasActiveRun.value || pendingNetworkCommand.value !== null,
+);
 const runFailureMessage = computed(
   () => ERROR_MESSAGES[latestRun.value?.error_code ?? ""] ?? "回答未完成，请稍后重试。",
 );
@@ -65,6 +86,10 @@ function conversationTitle(conversation: Conversation): string {
 
 function isActive(run: Run): boolean {
   return run.status === "PENDING" || run.status === "RUNNING";
+}
+
+function scopeFromRun(run: Run): CommandScope {
+  return { knowledgeBaseId: run.knowledge_base_id, groundingPolicy: run.grounding_policy };
 }
 
 function isCurrentView(conversationId: number, revision: number): boolean {
@@ -100,6 +125,11 @@ function openMemoryView(): void {
 
 function openKnowledgeView(): void {
   activeView.value = "knowledge";
+}
+
+function openChatView(): void {
+  activeView.value = "chat";
+  void loadKnowledgeBases();
 }
 
 function updatedNotice(payload: {
@@ -146,6 +176,7 @@ function beginView(conversationId: number | null): number {
   busyAction.value = null;
   requestError.value = null;
   pendingNetworkCommand.value = null;
+  activeCommandScope.value = null;
   return viewRevision;
 }
 
@@ -205,6 +236,35 @@ async function refreshFacts(preferredConversationId?: number, revision = viewRev
   } finally {
     if (currentRevision === viewRevision) isLoading.value = false;
   }
+}
+
+async function loadKnowledgeBases(): Promise<void> {
+  isLoadingKnowledgeBases.value = true;
+  try {
+    const response = await fetch("/api/knowledge-bases");
+    const payload = (await response.json()) as KnowledgeBase[];
+    if (!response.ok) throw new Error("资料暂时不可用，请稍后重试。");
+    knowledgeBases.value = payload;
+    if (!payload.some((knowledgeBase) => knowledgeBase.id === selectedKnowledgeBaseId.value)) {
+      updateKnowledgeBaseId(null);
+    }
+    knowledgeBaseLoadError.value = null;
+  } catch {
+    knowledgeBases.value = [];
+    updateKnowledgeBaseId(null);
+    knowledgeBaseLoadError.value = "资料暂时不可用，不影响普通对话。";
+  } finally {
+    isLoadingKnowledgeBases.value = false;
+  }
+}
+
+function updateKnowledgeBaseId(knowledgeBaseId: number | null): void {
+  selectedKnowledgeBaseId.value = knowledgeBaseId;
+  if (knowledgeBaseId === null) groundingPolicy.value = "AUTO";
+}
+
+function updateGroundingPolicy(policy: GroundingPolicy): void {
+  groundingPolicy.value = selectedKnowledgeBaseId.value === null ? "AUTO" : policy;
 }
 
 async function selectConversation(conversationId: number): Promise<void> {
@@ -303,6 +363,7 @@ async function refreshRun(
 async function submitCommand(command: PendingCommand): Promise<void> {
   if (selectedConversationId.value !== command.conversationId) return;
   const revision = viewRevision;
+  activeCommandScope.value = command.scope;
   busyAction.value = command.label;
   try {
     const response = await fetch(command.path, {
@@ -331,7 +392,10 @@ async function submitCommand(command: PendingCommand): Promise<void> {
       requestError.value = error instanceof Error ? error.message : "网络或服务暂时不可用，请稍后重试。";
     }
   } finally {
-    if (isCurrentView(command.conversationId, revision)) busyAction.value = null;
+    if (isCurrentView(command.conversationId, revision)) {
+      activeCommandScope.value = null;
+      busyAction.value = null;
+    }
   }
 }
 
@@ -341,27 +405,35 @@ function sendQuestion(): void {
     conversationId: selectedConversationId.value,
     label: "正在生成…",
     path: `/api/conversations/${selectedConversationId.value}/messages`,
-    payload: { content: composerContent.value, client_request_id: crypto.randomUUID() },
+    payload: {
+      content: composerContent.value,
+      client_request_id: crypto.randomUUID(),
+      knowledge_base_id: selectedKnowledgeBaseId.value,
+      grounding_policy: groundingPolicy.value,
+    },
+    scope: { knowledgeBaseId: selectedKnowledgeBaseId.value, groundingPolicy: groundingPolicy.value },
   });
 }
 
 function retryAnswer(): void {
-  if (selectedConversationId.value === null) return;
+  if (selectedConversationId.value === null || latestRun.value === null) return;
   void submitCommand({
     conversationId: selectedConversationId.value,
     label: "正在重试回答…",
     path: `/api/conversations/${selectedConversationId.value}/retry`,
     payload: { client_request_id: crypto.randomUUID() },
+    scope: scopeFromRun(latestRun.value),
   });
 }
 
 function regenerateAnswer(): void {
-  if (selectedConversationId.value === null) return;
+  if (selectedConversationId.value === null || latestRun.value === null) return;
   void submitCommand({
     conversationId: selectedConversationId.value,
     label: "正在重新生成…",
     path: `/api/conversations/${selectedConversationId.value}/regenerate`,
     payload: { client_request_id: crypto.randomUUID() },
+    scope: scopeFromRun(latestRun.value),
   });
 }
 
@@ -462,7 +534,10 @@ async function deleteSelectedConversation(): Promise<void> {
   }
 }
 
-onMounted(() => { void refreshFacts(); observeMemoryEvents(); });
+onMounted(() => {
+  void refreshFacts().finally(() => void loadKnowledgeBases());
+  observeMemoryEvents();
+});
 onBeforeUnmount(() => {
   readController?.abort();
   closeStream();
@@ -482,7 +557,7 @@ onBeforeUnmount(() => {
       :loading="isLoading"
       @create="createConversation"
       @select="selectConversation"
-      @open-chat="activeView = 'chat'"
+      @open-chat="openChatView"
       @open-knowledge="openKnowledgeView"
       @open-memory="openMemoryView"
     />
@@ -497,6 +572,12 @@ onBeforeUnmount(() => {
     <ChatWorkspace
       v-if="activeView === 'chat'"
       v-model:composer-content="composerContent"
+      :knowledge-bases="knowledgeBases"
+      :knowledge-base-id="displayedKnowledgeScope.knowledgeBaseId"
+      :grounding-policy="displayedKnowledgeScope.groundingPolicy"
+      :is-knowledge-scope-locked="isKnowledgeScopeLocked"
+      :is-loading-knowledge-bases="isLoadingKnowledgeBases"
+      :knowledge-base-load-error="knowledgeBaseLoadError"
       :selected-conversation="selectedConversation ?? null"
       :messages="messages"
       :latest-run="latestRun"
@@ -515,6 +596,9 @@ onBeforeUnmount(() => {
       @retry="retryAnswer"
       @regenerate="regenerateAnswer"
       @send="sendQuestion"
+      @update:knowledge-base-id="updateKnowledgeBaseId"
+      @update:grounding-policy="updateGroundingPolicy"
+      @retry-knowledge-bases="loadKnowledgeBases"
     />
     <section
       v-else-if="activeView === 'memory'"

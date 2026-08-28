@@ -1,6 +1,7 @@
 export type ActiveView = "chat" | "memory" | "knowledge";
 
 export type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
+export type GroundingPolicy = "AUTO" | "REQUIRED";
 
 export interface Conversation {
   id: number;
@@ -8,6 +9,12 @@ export interface Conversation {
   created_at: string;
   updated_at: string;
   last_message_at: string | null;
+}
+
+export interface KnowledgeBase {
+  id: number;
+  name: string;
+  created_at: string;
 }
 
 export interface MessageCitation {
@@ -34,6 +41,8 @@ export interface Run {
   id: number;
   input_message_id: number;
   attempt_no: number;
+  knowledge_base_id: number | null;
+  grounding_policy: GroundingPolicy;
   status: RunStatus;
   started_at: string | null;
   finished_at: string | null;
