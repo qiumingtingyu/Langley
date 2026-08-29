@@ -1,5 +1,6 @@
 """Focused commands for authoritative Knowledge source admission."""
 
+from dataclasses import dataclass
 from hashlib import sha256
 
 from sqlalchemy import delete, select
@@ -9,6 +10,7 @@ from langley.business_time import utc_now
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.models import (
     Document,
+    DocumentProcessingJob,
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
@@ -24,10 +26,14 @@ from langley.knowledge.contracts import (
     FileStorage,
     encode_source_region,
 )
+from langley.knowledge.document_processing import (
+    PDF_PROCESSING_RECIPE_ID,
+    DocumentProcessingAdmission,
+)
 from langley.knowledge.markdown import parse_markdown
 
 _ASCII_WHITESPACE = " \t\n\r\f\v"
-_SUPPORTED_SOURCE_MEDIA_TYPE = "text/markdown"
+_SUPPORTED_SOURCE_MEDIA_TYPES = {"text/markdown", "application/pdf"}
 
 
 class KnowledgeBaseNotFoundError(Exception):
@@ -61,10 +67,16 @@ class DocumentRebuildResult:
         self.index_status = index_status
 
 
+@dataclass(frozen=True)
+class PdfDocumentAdmission:
+    version: DocumentVersion
+    processing: DocumentProcessingAdmission
+
+
 def canonicalize_source_media_type(source_media_type: str) -> str:
     """Canonicalize one unparameterized source media type before support checks."""
     canonical = source_media_type.strip(_ASCII_WHITESPACE).lower()
-    if canonical != _SUPPORTED_SOURCE_MEDIA_TYPE:
+    if canonical not in _SUPPORTED_SOURCE_MEDIA_TYPES:
         raise ValueError("unsupported source_media_type")
     return canonical
 
@@ -109,6 +121,8 @@ async def create_initial_document(
             raise KnowledgeBaseNotFoundError
 
     canonical_media_type = canonicalize_source_media_type(source_media_type)
+    if canonical_media_type != "text/markdown":
+        raise ValueError("unsupported source_media_type")
     _validate_markdown_source(source_bytes)
     stored_source = await file_storage.store_source(user_id, source_bytes)
 
@@ -147,6 +161,89 @@ async def create_initial_document(
             _invalidate_knowledge_base_index(knowledge_base)
             await admission_session.flush()
     return version
+
+
+async def create_initial_pdf_document(
+    session_factory: async_sessionmaker[AsyncSession],
+    file_storage: FileStorage,
+    *,
+    user_id: int,
+    knowledge_base_id: int,
+    name: str,
+    source_filename: str,
+    source_media_type: str,
+    source_bytes: bytes,
+) -> PdfDocumentAdmission:
+    """Persist one PDF source and atomically admit its first processing attempt."""
+    _require_nonblank(name, "name")
+    _require_nonblank(source_filename, "source_filename")
+    canonical_media_type = canonicalize_source_media_type(source_media_type)
+    if canonical_media_type != "application/pdf":
+        raise ValueError("unsupported source_media_type")
+    if not source_bytes:
+        raise ValueError("source_bytes must not be empty")
+
+    async with session_factory() as precheck_session:
+        if not await _knowledge_base_belongs_to_user(
+            precheck_session, knowledge_base_id, user_id
+        ):
+            raise KnowledgeBaseNotFoundError
+    stored_source = await file_storage.store_source(user_id, source_bytes)
+
+    async with session_factory() as session, session.begin():
+        knowledge_base = await session.scalar(
+            select(KnowledgeBase)
+            .where(
+                KnowledgeBase.id == knowledge_base_id,
+                KnowledgeBase.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if knowledge_base is None:
+            raise KnowledgeBaseNotFoundError
+        if knowledge_base.index_status == "INDEXING":
+            raise DocumentAdmissionConflictError("KNOWLEDGE_BASE_INDEXING")
+        now = utc_now()
+        document = Document(
+            knowledge_base_id=knowledge_base_id,
+            name=name,
+            created_at=now,
+        )
+        session.add(document)
+        await session.flush()
+        version = DocumentVersion(
+            document_id=document.id,
+            source_filename=source_filename,
+            source_media_type=canonical_media_type,
+            source_sha256=stored_source.sha256,
+            source_size_bytes=stored_source.size_bytes,
+            storage_key=stored_source.storage_key,
+            created_at=now,
+        )
+        session.add(version)
+        await session.flush()
+        job = DocumentProcessingJob(
+            document_version_id=version.id,
+            attempt_no=1,
+            status="PENDING",
+            stage=None,
+            recipe_id=PDF_PROCESSING_RECIPE_ID,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            started_at=None,
+            finished_at=None,
+        )
+        session.add(job)
+        await session.flush()
+        return PdfDocumentAdmission(
+            version=version,
+            processing=DocumentProcessingAdmission(
+                job_id=job.id,
+                document_version_id=version.id,
+                attempt_no=1,
+            ),
+        )
 
 
 async def load_document_source_ref(

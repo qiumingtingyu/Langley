@@ -256,7 +256,8 @@ class DocumentProcessingJob(Base):
         CheckConstraint(
             "error_code IS NULL OR error_code IN ("
             "'SOURCE_MISSING', 'SOURCE_INTEGRITY_MISMATCH', 'PDF_PROCESS_TIMEOUT', "
-            "'PDF_PROCESS_RESOURCE_LIMIT', 'PDF_PARSE_FAILED', "
+            "'PDF_PROCESS_RESOURCE_LIMIT', 'PDF_PROCESS_LAUNCH_FAILED', "
+            "'PDF_PROCESS_WORKER_EXITED', 'PDF_PARSE_FAILED', "
             "'PDF_CHUNKING_FAILED', 'PDF_OUTPUT_INVALID', "
             "'SOURCE_CHANGED_DURING_PROCESSING', 'PUBLICATION_FAILED', "
             "'PROCESS_INTERRUPTED')",

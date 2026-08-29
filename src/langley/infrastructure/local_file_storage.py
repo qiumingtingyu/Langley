@@ -1,13 +1,65 @@
 """Safe local persistence for immutable Knowledge source bytes."""
 
 import asyncio
+import json
 import os
+import re
 import stat
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid4
 
 from langley.knowledge.contracts import StoredSource
+
+
+def process_is_alive(pid: int) -> bool:
+    """Return process liveness without waiting for or signalling the process."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0 = 0x00000000
+    wait_timeout = 0x00000102
+    error_access_denied = 5
+    error_invalid_parameter = 87
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    wait_for_single_object = kernel32.WaitForSingleObject
+    wait_for_single_object.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    wait_for_single_object.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(synchronize, False, pid)
+    if not handle:
+        error_code = ctypes.get_last_error()
+        if error_code == error_invalid_parameter:
+            return False
+        if error_code == error_access_denied:
+            return True
+        raise ctypes.WinError(error_code)
+    try:
+        wait_result = wait_for_single_object(handle, 0)
+        if wait_result == wait_timeout:
+            return True
+        if wait_result == wait_object_0:
+            return False
+        raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        close_handle(handle)
 
 
 class InvalidStorageKeyError(ValueError):
@@ -28,6 +80,37 @@ class LocalFileStorage:
         """Read exact bytes for a valid generated source key."""
         source_path = self._path_for_storage_key(storage_key)
         return await asyncio.to_thread(source_path.read_bytes)
+
+    def source_path(self, storage_key: str) -> Path:
+        """Resolve one validated opaque key for reference-based local processing."""
+        return self._path_for_storage_key(storage_key)
+
+    async def prepare_processing_result_path(
+        self, job_id: int, attempt_no: int
+    ) -> Path:
+        """Create one exact job-scoped staging directory and return its result path."""
+        result_path = self._processing_result_path(job_id, attempt_no)
+        await asyncio.to_thread(result_path.parent.mkdir, parents=True, exist_ok=False)
+        return result_path
+
+    async def cleanup_processing_attempt(self, job_id: int, attempt_no: int) -> None:
+        """Remove only the known staging files for one completed local execution."""
+        result_path = self._processing_result_path(job_id, attempt_no)
+        await asyncio.to_thread(self._cleanup_processing_attempt, result_path)
+
+    def processing_worker_marker_path(self) -> Path:
+        """Return the contained marker used only to confirm worker process lifetime."""
+        return (self._root / "_processing" / "worker.json").resolve()
+
+    async def confirm_no_processing_worker(self) -> None:
+        """Fail closed if a prior marked worker PID is still alive."""
+        await asyncio.to_thread(
+            self._confirm_no_processing_worker, self.processing_worker_marker_path()
+        )
+
+    async def cleanup_stale_processing_artifacts(self) -> None:
+        """Remove known job staging artifacts while no dispatcher is running."""
+        await asyncio.to_thread(self._cleanup_stale_processing_artifacts)
 
     async def cleanup_partial_sources(self) -> None:
         """Remove managed partial files without deleting finalized sources."""
@@ -102,6 +185,75 @@ class LocalFileStorage:
                 "storage key escapes the storage root"
             ) from error
         return candidate
+
+    def _processing_result_path(self, job_id: int, attempt_no: int) -> Path:
+        if job_id <= 0 or attempt_no <= 0:
+            raise ValueError("processing identity must be positive")
+        candidate = (
+            self._root
+            / "_processing"
+            / f"job-{job_id}-attempt-{attempt_no}"
+            / "result.json"
+        ).resolve()
+        candidate.relative_to(self._root)
+        return candidate
+
+    @staticmethod
+    def _cleanup_processing_attempt(result_path: Path) -> None:
+        for candidate in (result_path, result_path.with_suffix(".json.tmp")):
+            candidate.unlink(missing_ok=True)
+        try:
+            result_path.parent.rmdir()
+        except FileNotFoundError:
+            return
+        try:
+            result_path.parent.parent.rmdir()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _confirm_no_processing_worker(marker_path: Path) -> None:
+        temporary_path = marker_path.with_suffix(".json.tmp")
+        if not marker_path.exists():
+            temporary_path.unlink(missing_ok=True)
+            return
+        try:
+            value = json.loads(marker_path.read_text(encoding="ascii"))
+            pid = value["pid"]
+            if set(value) != {"pid"} or type(pid) is not int or pid <= 0:
+                raise ValueError
+        except (
+            OSError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise RuntimeError("invalid PDF worker marker") from error
+        if not process_is_alive(pid):
+            marker_path.unlink(missing_ok=True)
+            temporary_path.unlink(missing_ok=True)
+            return
+        raise RuntimeError("a prior PDF worker process is still running")
+
+    def _cleanup_stale_processing_artifacts(self) -> None:
+        processing_root = self._root / "_processing"
+        if not processing_root.is_dir():
+            return
+        for attempt_directory in processing_root.iterdir():
+            if (
+                not attempt_directory.is_dir()
+                or re.fullmatch(
+                    r"job-[1-9][0-9]*-attempt-[1-9][0-9]*", attempt_directory.name
+                )
+                is None
+            ):
+                continue
+            self._cleanup_processing_attempt(attempt_directory / "result.json")
+        try:
+            processing_root.rmdir()
+        except OSError:
+            pass
 
     def _cleanup_partial_sources(self) -> None:
         for source_directory in self._generated_source_directories():

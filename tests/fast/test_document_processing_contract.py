@@ -120,18 +120,16 @@ def test_failure_retains_stage_and_records_only_stable_safe_error() -> None:
         )
 
 
-def test_restart_repair_preserves_pending_or_running_progress_shape() -> None:
+def test_restart_repair_applies_only_to_running_progress_shape() -> None:
     pending = _pending_job()
-    mark_document_processing_interrupted(pending, now=_FINISHED)
+    with pytest.raises(DocumentProcessingStateError):
+        mark_document_processing_interrupted(pending, now=_FINISHED)
     assert (pending.status, pending.stage, pending.started_at) == (
-        "INTERRUPTED",
+        "PENDING",
         None,
         None,
     )
-    assert (pending.error_code, pending.finished_at) == (
-        "PROCESS_INTERRUPTED",
-        _FINISHED,
-    )
+    assert (pending.error_code, pending.finished_at) == (None, None)
 
     running = _pending_job()
     mark_document_processing_running(running, now=_STARTED)

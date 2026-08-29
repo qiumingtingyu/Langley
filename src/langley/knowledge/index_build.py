@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from langley.business_time import utc_now
 from langley.infrastructure.models import (
     Document,
+    DocumentProcessingJob,
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
@@ -196,11 +197,27 @@ async def admit_index_build(
                 raise IndexBuildAdmissionError("KNOWLEDGE_BASE_NOT_FOUND")
             if knowledge_base.index_status == "INDEXING":
                 raise IndexBuildAdmissionError("INDEX_BUILD_IN_PROGRESS")
+            active_processing_id = await session.scalar(
+                select(DocumentProcessingJob.id)
+                .join(
+                    DocumentVersion,
+                    DocumentVersion.id == DocumentProcessingJob.document_version_id,
+                )
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    DocumentProcessingJob.status.in_(("PENDING", "RUNNING")),
+                )
+                .limit(1)
+            )
+            if active_processing_id is not None:
+                raise IndexBuildAdmissionError("KNOWLEDGE_BASE_DOCUMENTS_PROCESSING")
             unprocessed_version_id = await session.scalar(
                 select(DocumentVersion.id)
                 .join(Document, Document.id == DocumentVersion.document_id)
                 .where(
                     Document.knowledge_base_id == knowledge_base_id,
+                    DocumentVersion.source_media_type == "text/markdown",
                     DocumentVersion.chunk_max_chars.is_(None),
                 )
                 .limit(1)

@@ -1,14 +1,17 @@
 """Serial real-MySQL coverage for durable document processing attempts."""
 
 import asyncio
+import sys
 from argparse import Namespace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import func, select
 from sqlalchemy.exc import DBAPIError, IntegrityError
+from structlog.testing import capture_logs
 
 from langley.business_time import utc_now
 from langley.infrastructure.database import (
@@ -16,14 +19,19 @@ from langley.infrastructure.database import (
     create_session_factory,
     dispose_database_engine,
 )
+from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.models import (
     Document,
     DocumentProcessingJob,
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
+    KnowledgeIndexJob,
     User,
 )
+from langley.knowledge.chunking import CandidateChunk
+from langley.knowledge.commands import create_initial_pdf_document
+from langley.knowledge.contracts import PdfPageRegion
 from langley.knowledge.document_processing import (
     PDF_PROCESSING_RECIPE_ID,
     DocumentProcessingAdmissionError,
@@ -31,12 +39,21 @@ from langley.knowledge.document_processing import (
     DocumentProcessingStage,
     admit_document_processing_attempt,
     advance_document_processing_attempt_stage,
+    claim_next_document_processing_attempt,
     fail_document_processing_attempt,
     reconcile_interrupted_document_processing_jobs,
     start_document_processing_attempt,
     succeed_document_processing_attempt,
 )
+from langley.knowledge.index_build import IndexBuildAdmissionError, admit_index_build
+from langley.knowledge.pdf_processing import (
+    DocumentProcessingRuntime,
+    PersistentPdfWorker,
+    publish_pdf_processing_result,
+)
+from langley.knowledge.pdf_processing_result import PdfProcessingResult
 from langley.knowledge.reads import read_document_processing_status
+from langley.settings import Settings
 
 
 @pytest.fixture
@@ -300,12 +317,61 @@ def test_concurrent_admission_allows_exactly_one_active_attempt(
     asyncio.run(run())
 
 
-def test_restart_repair_interrupts_only_active_attempts_and_retains_stage(
+def test_processing_and_index_admission_reject_each_other(
     migrated_database: str,
 ) -> None:
     async def run() -> None:
         engine = create_database_engine(migrated_database)
         session_factory = create_session_factory(engine)
+        try:
+            (version_id,) = await _seed_versions(session_factory, 1)
+            async with session_factory() as session, session.begin():
+                knowledge_base = await session.scalar(
+                    select(KnowledgeBase)
+                    .join(Document, Document.knowledge_base_id == KnowledgeBase.id)
+                    .join(DocumentVersion, DocumentVersion.document_id == Document.id)
+                    .where(DocumentVersion.id == version_id)
+                    .with_for_update()
+                )
+                assert knowledge_base is not None
+                knowledge_base.index_status = "INDEXING"
+                knowledge_base_id = knowledge_base.id
+            with pytest.raises(DocumentProcessingAdmissionError) as indexing:
+                await admit_document_processing_attempt(
+                    session_factory, user_id=1, document_version_id=version_id
+                )
+            assert indexing.value.code == "KNOWLEDGE_BASE_INDEXING"
+
+            async with session_factory() as session, session.begin():
+                knowledge_base = await session.get(
+                    KnowledgeBase, knowledge_base_id, with_for_update=True
+                )
+                assert knowledge_base is not None
+                knowledge_base.index_status = "CHUNKED"
+            await admit_document_processing_attempt(
+                session_factory, user_id=1, document_version_id=version_id
+            )
+            with pytest.raises(IndexBuildAdmissionError) as processing:
+                await admit_index_build(
+                    session_factory,
+                    user_id=1,
+                    knowledge_base_id=knowledge_base_id,
+                    settings=Settings(),
+                )
+            assert processing.value.code == "KNOWLEDGE_BASE_DOCUMENTS_PROCESSING"
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(run())
+
+
+def test_restart_repair_preserves_pending_and_interrupts_running(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        storage = LocalFileStorage(tmp_path / "restart-storage")
         try:
             pending_version, running_version, terminal_version = await _seed_versions(
                 session_factory, 3
@@ -328,6 +394,13 @@ def test_restart_repair_interrupts_only_active_attempts_and_retains_stage(
                 job_id=running.job_id,
                 stage=DocumentProcessingStage.PARSING,
             )
+            stale_result = await storage.prepare_processing_result_path(
+                running.job_id, running.attempt_no
+            )
+            stale_result.write_text("stale", encoding="ascii")
+            stale_result.with_suffix(".json.tmp").write_text(
+                "partial", encoding="ascii"
+            )
             terminal = await admit_document_processing_attempt(
                 session_factory,
                 user_id=1,
@@ -348,13 +421,19 @@ def test_restart_repair_interrupts_only_active_attempts_and_retains_stage(
             repaired = await reconcile_interrupted_document_processing_jobs(
                 session_factory
             )
-            assert repaired == (pending.job_id, running.job_id)
-            retry = await admit_document_processing_attempt(
-                session_factory,
-                user_id=1,
-                document_version_id=pending_version,
-            )
-            assert retry.attempt_no == 2
+            await storage.confirm_no_processing_worker()
+            await storage.cleanup_stale_processing_artifacts()
+            assert repaired == (running.job_id,)
+            assert not stale_result.exists()
+            assert not stale_result.with_suffix(".json.tmp").exists()
+            assert not stale_result.parent.exists()
+            with pytest.raises(DocumentProcessingAdmissionError) as pending_active:
+                await admit_document_processing_attempt(
+                    session_factory,
+                    user_id=1,
+                    document_version_id=pending_version,
+                )
+            assert pending_active.value.code == "DOCUMENT_PROCESSING_ACTIVE"
             async with session_factory() as session:
                 rows = {
                     job.id: job
@@ -370,7 +449,9 @@ def test_restart_repair_interrupts_only_active_attempts_and_retains_stage(
                     rows[pending.job_id].status,
                     rows[pending.job_id].stage,
                     rows[pending.job_id].started_at,
-                ) == ("INTERRUPTED", None, None)
+                ) == ("PENDING", None, None)
+                assert rows[pending.job_id].finished_at is None
+                assert rows[pending.job_id].error_code is None
                 assert (
                     rows[running.job_id].status,
                     rows[running.job_id].stage,
@@ -379,6 +460,271 @@ def test_restart_repair_interrupts_only_active_attempts_and_retains_stage(
                 assert rows[running.job_id].finished_at is not None
                 assert rows[running.job_id].error_code == "PROCESS_INTERRUPTED"
                 assert rows[terminal.job_id].status == "SUCCEEDED"
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(run())
+
+
+def test_pdf_admission_atomically_persists_version_and_pending_job(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        storage = LocalFileStorage(tmp_path / "sources")
+        try:
+            async with session_factory() as session, session.begin():
+                now = utc_now()
+                session.add(User(id=1, created_at=now))
+                await session.flush()
+                knowledge_base = KnowledgeBase(
+                    user_id=1, name="PDF admission", created_at=now
+                )
+                session.add(knowledge_base)
+                await session.flush()
+                knowledge_base_id = knowledge_base.id
+            admission = await create_initial_pdf_document(
+                session_factory,
+                storage,
+                user_id=1,
+                knowledge_base_id=knowledge_base_id,
+                name="fixture",
+                source_filename="fixture.pdf",
+                source_media_type="application/pdf",
+                source_bytes=b"%PDF-1.4 controlled fixture",
+            )
+            async with session_factory() as session:
+                version = await session.get(DocumentVersion, admission.version.id)
+                job = await session.get(
+                    DocumentProcessingJob, admission.processing.job_id
+                )
+                assert version is not None and job is not None
+                assert version.source_media_type == "application/pdf"
+                assert (
+                    job.document_version_id,
+                    job.attempt_no,
+                    job.status,
+                    job.stage,
+                    job.recipe_id,
+                ) == (
+                    version.id,
+                    1,
+                    "PENDING",
+                    None,
+                    PDF_PROCESSING_RECIPE_ID,
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(run())
+
+
+def test_oldest_pending_claim_is_short_and_enters_verifying_source(
+    migrated_database: str,
+) -> None:
+    async def run() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            first_version, second_version = await _seed_versions(session_factory, 2)
+            first = await admit_document_processing_attempt(
+                session_factory, user_id=1, document_version_id=first_version
+            )
+            await admit_document_processing_attempt(
+                session_factory, user_id=1, document_version_id=second_version
+            )
+            claim = await claim_next_document_processing_attempt(session_factory)
+            assert claim is not None and claim.job_id == first.job_id
+            async with session_factory() as session:
+                job = await session.get(DocumentProcessingJob, claim.job_id)
+                assert job is not None
+                assert (job.status, job.stage) == ("RUNNING", "VERIFYING_SOURCE")
+                assert job.started_at is not None
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(run())
+
+
+def test_worker_traceback_is_logged_while_database_error_remains_safe(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    async def run() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        storage = LocalFileStorage(tmp_path / "diagnostic-storage")
+        try:
+            async with session_factory() as session, session.begin():
+                now = utc_now()
+                session.add(User(id=1, created_at=now))
+                await session.flush()
+                knowledge_base = KnowledgeBase(
+                    user_id=1, name="diagnostic", created_at=now
+                )
+                session.add(knowledge_base)
+                await session.flush()
+                knowledge_base_id = knowledge_base.id
+            admission = await create_initial_pdf_document(
+                session_factory,
+                storage,
+                user_id=1,
+                knowledge_base_id=knowledge_base_id,
+                name="controlled",
+                source_filename="controlled.pdf",
+                source_media_type="application/pdf",
+                source_bytes=b"%PDF-1.4 controlled technical failure",
+            )
+            claim = await claim_next_document_processing_attempt(session_factory)
+            assert claim is not None and claim.job_id == admission.processing.job_id
+            behavior_path = tmp_path / "behavior"
+            pid_log_path = tmp_path / "pids"
+            done_path = tmp_path / "done"
+            behavior_path.write_text("failure", encoding="ascii")
+            worker = PersistentPdfWorker(
+                tokenizer_id="unused",
+                tokenizer_revision="unused",
+                worker_marker_path=storage.processing_worker_marker_path(),
+                command=(
+                    sys.executable,
+                    str(Path("tests/fixtures/pdf_persistent_fake_worker.py").resolve()),
+                    "--behavior-path",
+                    str(behavior_path),
+                    "--pid-log-path",
+                    str(pid_log_path),
+                    "--done-path",
+                    str(done_path),
+                ),
+            )
+            runtime = DocumentProcessingRuntime(
+                session_factory,
+                storage,
+                timeout_seconds=2,
+                worker=worker,
+            )
+            with capture_logs() as logs:
+                await runtime.execute(claim)
+            await runtime.stop()
+            async with session_factory() as session:
+                job = await session.get(DocumentProcessingJob, claim.job_id)
+                assert job is not None
+                assert (job.status, job.stage, job.error_code) == (
+                    "FAILED",
+                    "PARSING",
+                    "PDF_PARSE_FAILED",
+                )
+                assert job.error_message == "PDF 结构无法解析。"
+                assert "controlled failure" not in job.error_message
+                assert "Traceback" not in job.error_message
+            diagnostics = "\n".join(str(entry.get("diagnostic", "")) for entry in logs)
+            assert "RuntimeError: controlled failure" in diagnostics
+            assert any(entry.get("job_id") == claim.job_id for entry in logs)
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(run())
+
+
+def test_atomic_pdf_publication_replaces_all_or_preserves_old_chunks(
+    migrated_database: str,
+) -> None:
+    async def run() -> None:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            (version_id,) = await _seed_versions(session_factory, 1)
+            async with session_factory() as session, session.begin():
+                session.add(
+                    KnowledgeChunk(
+                        document_version_id=version_id,
+                        ordinal=1,
+                        content="old usable chunk",
+                        heading_path=[],
+                        source_regions=[
+                            {"kind": "pdf_page", "page_start": 1, "page_end": 1}
+                        ],
+                        created_at=utc_now(),
+                    )
+                )
+            first = await admit_document_processing_attempt(
+                session_factory, user_id=1, document_version_id=version_id
+            )
+            claim = await claim_next_document_processing_attempt(session_factory)
+            assert claim is not None and claim.job_id == first.job_id
+            await advance_document_processing_attempt_stage(
+                session_factory,
+                job_id=claim.job_id,
+                stage=DocumentProcessingStage.PUBLISHING,
+            )
+            result = PdfProcessingResult(
+                page_count=2,
+                candidates=(
+                    CandidateChunk(1, "new one", ("A",), (PdfPageRegion(1, 1),)),
+                    CandidateChunk(2, "new two", ("B",), (PdfPageRegion(2, 2),)),
+                ),
+            )
+            await publish_pdf_processing_result(
+                session_factory, claim=claim, result=result
+            )
+            async with session_factory() as session:
+                chunks = (
+                    await session.scalars(
+                        select(KnowledgeChunk)
+                        .where(KnowledgeChunk.document_version_id == version_id)
+                        .order_by(KnowledgeChunk.ordinal)
+                    )
+                ).all()
+                job = await session.get(DocumentProcessingJob, claim.job_id)
+                assert [chunk.content for chunk in chunks] == ["new one", "new two"]
+                assert job is not None and job.status == "SUCCEEDED"
+                assert (
+                    await session.scalar(
+                        select(func.count()).select_from(KnowledgeIndexJob)
+                    )
+                ) == 0
+
+            second = await admit_document_processing_attempt(
+                session_factory, user_id=1, document_version_id=version_id
+            )
+            failed_claim = await claim_next_document_processing_attempt(session_factory)
+            assert failed_claim is not None and failed_claim.job_id == second.job_id
+            await advance_document_processing_attempt_stage(
+                session_factory,
+                job_id=failed_claim.job_id,
+                stage=DocumentProcessingStage.PUBLISHING,
+            )
+            duplicate_ordinals = PdfProcessingResult(
+                page_count=1,
+                candidates=(
+                    CandidateChunk(1, "bad one", (), (PdfPageRegion(1, 1),)),
+                    CandidateChunk(1, "bad two", (), (PdfPageRegion(1, 1),)),
+                ),
+            )
+            with pytest.raises(IntegrityError):
+                await publish_pdf_processing_result(
+                    session_factory,
+                    claim=failed_claim,
+                    result=duplicate_ordinals,
+                )
+            await fail_document_processing_attempt(
+                session_factory,
+                job_id=failed_claim.job_id,
+                error_code=DocumentProcessingErrorCode.PUBLICATION_FAILED,
+            )
+            async with session_factory() as session:
+                chunks = (
+                    await session.scalars(
+                        select(KnowledgeChunk)
+                        .where(KnowledgeChunk.document_version_id == version_id)
+                        .order_by(KnowledgeChunk.ordinal)
+                    )
+                ).all()
+                job = await session.get(DocumentProcessingJob, failed_claim.job_id)
+                assert [chunk.content for chunk in chunks] == ["new one", "new two"]
+                assert job is not None and (
+                    job.status,
+                    job.error_code,
+                ) == ("FAILED", "PUBLICATION_FAILED")
         finally:
             await dispose_database_engine(engine)
 

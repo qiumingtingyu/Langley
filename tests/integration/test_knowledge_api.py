@@ -16,7 +16,11 @@ from langley.infrastructure.database import (
     create_session_factory,
     dispose_database_engine,
 )
-from langley.infrastructure.models import Document, DocumentVersion
+from langley.infrastructure.models import (
+    Document,
+    DocumentProcessingJob,
+    DocumentVersion,
+)
 from langley.main import create_app
 from langley.settings import Settings
 
@@ -43,6 +47,73 @@ def _bootstrap(database_url: str, storage_root: Path, user_id: int) -> None:
     assert asyncio.run(
         bootstrap_local_user(_settings(database_url, storage_root, user_id))
     )
+
+
+class _PassiveDocumentProcessingDispatcher:
+    def __init__(self) -> None:
+        self.wake_count = 0
+
+    def start(self) -> None:
+        pass
+
+    def wake(self) -> None:
+        self.wake_count += 1
+
+    async def stop(self) -> None:
+        pass
+
+
+def test_pdf_upload_returns_durable_pending_attempt(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    storage_root = tmp_path / "knowledge"
+    _bootstrap(migrated_database, storage_root, 1)
+    app = create_app(_settings(migrated_database, storage_root))
+    dispatcher = _PassiveDocumentProcessingDispatcher()
+    app.state.document_processing_dispatcher = dispatcher
+    with TestClient(app) as client:
+        knowledge_base = client.post(
+            "/api/knowledge-bases", json={"name": "PDF"}
+        ).json()
+        uploaded = client.post(
+            f"/api/knowledge-bases/{knowledge_base['id']}/documents",
+            files={
+                "file": (
+                    "source.pdf",
+                    b"%PDF-1.4 controlled admission bytes",
+                    "application/pdf",
+                )
+            },
+        )
+    assert uploaded.status_code == 202
+    body = uploaded.json()
+    assert body["source"]["media_type"] == "application/pdf"
+    assert body["processing_job"] | {"job_id": 0} == {
+        "job_id": 0,
+        "attempt_no": 1,
+        "status": "PENDING",
+        "recipe_id": "pdf_docling_hybrid512_v1",
+    }
+    assert dispatcher.wake_count == 1
+
+    async def inspect() -> None:
+        engine = create_database_engine(migrated_database)
+        try:
+            factory = create_session_factory(engine)
+            async with factory() as session:
+                version = await session.get(
+                    DocumentVersion, body["source"]["document_version_id"]
+                )
+                job = await session.get(
+                    DocumentProcessingJob, body["processing_job"]["job_id"]
+                )
+                assert version is not None and job is not None
+                assert job.document_version_id == version.id
+                assert (job.status, job.stage) == ("PENDING", None)
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(inspect())
 
 
 def test_knowledge_api_vertical_slice(migrated_database: str, tmp_path: Path) -> None:

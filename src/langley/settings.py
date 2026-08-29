@@ -35,6 +35,7 @@ class Settings(BaseSettings):
         "content_only"
     )
     knowledge_index_build_concurrency: int = Field(default=1, ge=1, le=4)
+    document_processing_timeout_seconds: float = Field(default=900.0, gt=0)
     knowledge_reranking_enabled: bool = False
     knowledge_reranker_model_path: Path | None = None
     knowledge_reranker_device: str = "cuda:0"

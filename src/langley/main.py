@@ -48,6 +48,10 @@ from langley.knowledge.index_build import (
     reconcile_interrupted_index_builds,
     reconcile_stale_ready_index_configurations,
 )
+from langley.knowledge.pdf_processing import (
+    DocumentProcessingDispatcher,
+    DocumentProcessingRuntime,
+)
 from langley.knowledge.reranking import LocalBGEReranker, Reranker
 from langley.knowledge.retrieval_service import KnowledgeRetrievalService
 from langley.memory.events import MemoryEventSubscribers
@@ -289,6 +293,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     session_factory = None
     execution_manager = None
+    document_processing_dispatcher = None
     logger.info("application.started")
     try:
         local_file_storage = getattr(app.state, "local_file_storage", None)
@@ -296,16 +301,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await local_file_storage.cleanup_partial_sources()
         session_factory = getattr(app.state, "session_factory", None)
         execution_manager = getattr(app.state, "execution_manager", None)
+        document_processing_dispatcher = getattr(
+            app.state, "document_processing_dispatcher", None
+        )
         if session_factory is not None:
             await interrupt_active_runs(session_factory)
             await reconcile_interrupted_document_processing_jobs(session_factory)
+            if local_file_storage is not None:
+                await local_file_storage.confirm_no_processing_worker()
+                await local_file_storage.cleanup_stale_processing_artifacts()
             await reconcile_interrupted_index_builds(session_factory)
             await reconcile_stale_ready_index_configurations(
                 session_factory, settings=app.state.settings
             )
+            if document_processing_dispatcher is not None:
+                document_processing_dispatcher.start()
         yield
     finally:
         if session_factory is not None:
+            if document_processing_dispatcher is not None:
+                await document_processing_dispatcher.stop()
+            await reconcile_interrupted_document_processing_jobs(session_factory)
             repaired_run_ids = await interrupt_active_runs(session_factory)
             if execution_manager is not None:
                 await execution_manager.stop_interrupted_runs(repaired_run_ids)
@@ -386,6 +402,14 @@ def create_app(
             else KnowledgeIndexBuildRuntime(
                 app.state.session_factory, resolved_settings
             )
+        )
+        document_processing_runtime = DocumentProcessingRuntime(
+            app.state.session_factory,
+            app.state.local_file_storage,
+            timeout_seconds=resolved_settings.document_processing_timeout_seconds,
+        )
+        app.state.document_processing_dispatcher = DocumentProcessingDispatcher(
+            app.state.session_factory, document_processing_runtime
         )
         app.state.execution_manager = AnswerExecutionManager(
             app.state.session_factory,

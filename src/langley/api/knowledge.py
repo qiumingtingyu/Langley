@@ -9,6 +9,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Response,
     UploadFile,
     status,
 )
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.api.dependencies import (
     get_current_user_id,
+    get_document_processing_dispatcher,
     get_knowledge_index_runtime,
     get_local_file_storage,
     get_session,
@@ -33,11 +35,13 @@ from langley.knowledge.commands import (
     KnowledgeBaseNotFoundError,
     SourceIntegrityError,
     create_initial_document,
+    create_initial_pdf_document,
     create_knowledge_base,
     load_document_source_ref,
     read_verified_source,
     rebuild_document_version_chunks,
 )
+from langley.knowledge.document_processing import PDF_PROCESSING_RECIPE_ID
 from langley.knowledge.index_build import (
     IndexBuildAdmissionError,
     IndexJobRead,
@@ -46,6 +50,7 @@ from langley.knowledge.index_build import (
     admit_index_build,
     read_index_status,
 )
+from langley.knowledge.pdf_processing import DocumentProcessingDispatcher
 from langley.knowledge.reads import (
     DocumentRead,
     DocumentSourceRead,
@@ -72,6 +77,7 @@ from langley.knowledge.retrieval import (
 router = APIRouter(tags=["knowledge"])
 
 MAX_MARKDOWN_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_PDF_UPLOAD_BYTES = 64 * 1024 * 1024
 _UPLOAD_READ_CHUNK_BYTES = 64 * 1024
 _MAX_DOCUMENT_TEXT_LENGTH = 255
 _MAX_CHUNKS_PAGE_SIZE = 100
@@ -104,6 +110,17 @@ class DocumentResponse(BaseModel):
     name: str
     created_at: str
     source: DocumentSourceResponse
+
+
+class DocumentProcessingAcceptedResponse(BaseModel):
+    job_id: int
+    attempt_no: int
+    status: str
+    recipe_id: str
+
+
+class PdfDocumentAcceptedResponse(DocumentResponse):
+    processing_job: DocumentProcessingAcceptedResponse
 
 
 class VerifySourceResponse(BaseModel):
@@ -313,7 +330,7 @@ def _upload_document_name(document_name: str | None, filename: str) -> str:
     return Path(leaf).stem
 
 
-async def _read_markdown_upload(file: UploadFile) -> bytes:
+async def _read_bounded_upload(file: UploadFile, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
     size = 0
     while True:
@@ -321,9 +338,13 @@ async def _read_markdown_upload(file: UploadFile) -> bytes:
         if not chunk:
             return b"".join(chunks)
         size += len(chunk)
-        if size > MAX_MARKDOWN_UPLOAD_BYTES:
+        if size > max_bytes:
             raise HTTPException(status_code=413, detail={"code": "UPLOAD_TOO_LARGE"})
         chunks.append(chunk)
+
+
+async def _read_markdown_upload(file: UploadFile) -> bytes:
+    return await _read_bounded_upload(file, MAX_MARKDOWN_UPLOAD_BYTES)
 
 
 def _raise_upload_error(error: Exception) -> None:
@@ -426,19 +447,28 @@ async def get_documents(
 
 @router.post(
     "/api/knowledge-bases/{knowledge_base_id}/documents",
-    response_model=DocumentResponse,
+    response_model=DocumentResponse | PdfDocumentAcceptedResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def post_document(
     knowledge_base_id: int,
+    response: Response,
     file: UploadFile = File(...),
     document_name: str | None = Form(default=None),
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
     file_storage: LocalFileStorage = Depends(get_local_file_storage),
+    document_processing_dispatcher: DocumentProcessingDispatcher = Depends(
+        get_document_processing_dispatcher
+    ),
     current_user_id: int = Depends(get_current_user_id),
-) -> DocumentResponse:
-    source_bytes = await _read_markdown_upload(file)
+) -> DocumentResponse | PdfDocumentAcceptedResponse:
     filename = PurePosixPath((file.filename or "").replace("\\", "/")).name
+    pdf_upload = Path(filename).suffix.lower() == ".pdf"
+    if pdf_upload and file.content_type != "application/pdf":
+        raise HTTPException(status_code=415, detail={"code": "UNSUPPORTED_MEDIA_TYPE"})
+    source_bytes = await _read_bounded_upload(
+        file, MAX_PDF_UPLOAD_BYTES if pdf_upload else MAX_MARKDOWN_UPLOAD_BYTES
+    )
     name = _upload_document_name(document_name, filename)
     if (
         not name.strip()
@@ -448,6 +478,39 @@ async def post_document(
     ):
         raise _validation_error()
     try:
+        if pdf_upload:
+            admission = await create_initial_pdf_document(
+                session_factory,
+                file_storage,
+                user_id=current_user_id,
+                knowledge_base_id=knowledge_base_id,
+                name=name,
+                source_filename=filename,
+                source_media_type="application/pdf",
+                source_bytes=source_bytes,
+            )
+            document_processing_dispatcher.wake()
+            response.status_code = status.HTTP_202_ACCEPTED
+            version = admission.version
+            return PdfDocumentAcceptedResponse(
+                id=version.document_id,
+                name=name,
+                created_at=as_utc(version.created_at),
+                source=DocumentSourceResponse(
+                    document_version_id=version.id,
+                    filename=version.source_filename,
+                    media_type=version.source_media_type,
+                    size_bytes=version.source_size_bytes,
+                    sha256=version.source_sha256,
+                    created_at=as_utc(version.created_at),
+                ),
+                processing_job=DocumentProcessingAcceptedResponse(
+                    job_id=admission.processing.job_id,
+                    attempt_no=admission.processing.attempt_no,
+                    status="PENDING",
+                    recipe_id=PDF_PROCESSING_RECIPE_ID,
+                ),
+            )
         version = await create_initial_document(
             session_factory,
             file_storage,

@@ -14,8 +14,11 @@ from langley.infrastructure.models import (
     DocumentVersion,
     KnowledgeBase,
 )
+from langley.knowledge.contracts import DocumentSourceRef
 
 PDF_PROCESSING_RECIPE_ID = "pdf_docling_hybrid512_v1"
+PDF_PROCESSING_TOKENIZER_ID = "BAAI/bge-m3"
+PDF_PROCESSING_TOKENIZER_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 _INTERRUPTED_MESSAGE = "应用重启时中断了尚未完成的文档处理。"
 
 
@@ -40,6 +43,8 @@ class DocumentProcessingErrorCode(StrEnum):
     SOURCE_INTEGRITY_MISMATCH = "SOURCE_INTEGRITY_MISMATCH"
     PDF_PROCESS_TIMEOUT = "PDF_PROCESS_TIMEOUT"
     PDF_PROCESS_RESOURCE_LIMIT = "PDF_PROCESS_RESOURCE_LIMIT"
+    PDF_PROCESS_LAUNCH_FAILED = "PDF_PROCESS_LAUNCH_FAILED"
+    PDF_PROCESS_WORKER_EXITED = "PDF_PROCESS_WORKER_EXITED"
     PDF_PARSE_FAILED = "PDF_PARSE_FAILED"
     PDF_CHUNKING_FAILED = "PDF_CHUNKING_FAILED"
     PDF_OUTPUT_INVALID = "PDF_OUTPUT_INVALID"
@@ -68,6 +73,17 @@ class DocumentProcessingAdmission:
     job_id: int
     document_version_id: int
     attempt_no: int
+
+
+@dataclass(frozen=True)
+class DocumentProcessingClaim:
+    job_id: int
+    document_version_id: int
+    knowledge_base_id: int
+    user_id: int
+    attempt_no: int
+    recipe_id: str
+    source_ref: DocumentSourceRef
 
 
 def _require_status(
@@ -148,11 +164,8 @@ def mark_document_processing_interrupted(
 ) -> None:
     """Repair one active attempt without inventing an automatic retry."""
 
-    if job.status not in {
-        DocumentProcessingStatus.PENDING,
-        DocumentProcessingStatus.RUNNING,
-    }:
-        raise DocumentProcessingStateError("only active attempts can be interrupted")
+    if job.status != DocumentProcessingStatus.RUNNING:
+        raise DocumentProcessingStateError("only running attempts can be interrupted")
     job.status = DocumentProcessingStatus.INTERRUPTED
     job.error_code = DocumentProcessingErrorCode.PROCESS_INTERRUPTED
     job.error_message = _INTERRUPTED_MESSAGE
@@ -168,18 +181,23 @@ async def admit_document_processing_attempt(
     """Atomically admit one active attempt for an owned immutable version."""
 
     async with session_factory() as session, session.begin():
-        version = await session.scalar(
-            select(DocumentVersion)
-            .join(Document, Document.id == DocumentVersion.document_id)
-            .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
-            .where(
-                DocumentVersion.id == document_version_id,
-                KnowledgeBase.user_id == user_id,
+        row = (
+            await session.execute(
+                select(DocumentVersion, KnowledgeBase)
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+                .where(
+                    DocumentVersion.id == document_version_id,
+                    KnowledgeBase.user_id == user_id,
+                )
+                .with_for_update()
             )
-            .with_for_update()
-        )
-        if version is None:
+        ).first()
+        if row is None:
             raise DocumentProcessingAdmissionError("DOCUMENT_VERSION_NOT_FOUND")
+        version, knowledge_base = row
+        if knowledge_base.index_status == "INDEXING":
+            raise DocumentProcessingAdmissionError("KNOWLEDGE_BASE_INDEXING")
         if version.source_media_type != "application/pdf":
             raise DocumentProcessingAdmissionError("DOCUMENT_SOURCE_TYPE_UNSUPPORTED")
         latest = await session.scalar(
@@ -239,6 +257,61 @@ async def start_document_processing_attempt(
         )
 
 
+async def claim_next_document_processing_attempt(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> DocumentProcessingClaim | None:
+    """Claim the oldest eligible durable PDF attempt in one short transaction."""
+
+    async with session_factory() as session, session.begin():
+        row = (
+            await session.execute(
+                select(
+                    DocumentProcessingJob,
+                    DocumentVersion,
+                    KnowledgeBase.id,
+                    KnowledgeBase.user_id,
+                )
+                .join(
+                    DocumentVersion,
+                    DocumentVersion.id == DocumentProcessingJob.document_version_id,
+                )
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+                .where(
+                    DocumentProcessingJob.status == DocumentProcessingStatus.PENDING,
+                    DocumentProcessingJob.recipe_id == PDF_PROCESSING_RECIPE_ID,
+                    DocumentVersion.source_media_type == "application/pdf",
+                )
+                .order_by(
+                    DocumentProcessingJob.created_at.asc(),
+                    DocumentProcessingJob.id.asc(),
+                )
+                .limit(1)
+                .with_for_update()
+            )
+        ).first()
+        if row is None:
+            return None
+        job, version, knowledge_base_id, user_id = row
+        mark_document_processing_running(job, now=utc_now())
+        await session.flush()
+        return DocumentProcessingClaim(
+            job_id=job.id,
+            document_version_id=version.id,
+            knowledge_base_id=knowledge_base_id,
+            user_id=user_id,
+            attempt_no=job.attempt_no,
+            recipe_id=job.recipe_id,
+            source_ref=DocumentSourceRef(
+                document_version_id=version.id,
+                storage_key=version.storage_key,
+                source_media_type=version.source_media_type,
+                source_sha256=version.source_sha256,
+                source_size_bytes=version.source_size_bytes,
+            ),
+        )
+
+
 async def advance_document_processing_attempt_stage(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -277,7 +350,7 @@ async def fail_document_processing_attempt(
 async def reconcile_interrupted_document_processing_jobs(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[int, ...]:
-    """Mark pre-restart active attempts interrupted; never retry automatically."""
+    """Interrupt orphaned RUNNING attempts while preserving durable PENDING work."""
 
     async with session_factory() as session, session.begin():
         jobs = tuple(
@@ -285,12 +358,7 @@ async def reconcile_interrupted_document_processing_jobs(
                 await session.scalars(
                     select(DocumentProcessingJob)
                     .where(
-                        DocumentProcessingJob.status.in_(
-                            (
-                                DocumentProcessingStatus.PENDING,
-                                DocumentProcessingStatus.RUNNING,
-                            )
-                        )
+                        DocumentProcessingJob.status == DocumentProcessingStatus.RUNNING
                     )
                     .order_by(DocumentProcessingJob.id.asc())
                     .with_for_update()
