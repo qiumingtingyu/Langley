@@ -3,11 +3,12 @@
 from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.infrastructure.models import (
     Document,
+    DocumentProcessingJob,
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
@@ -55,6 +56,27 @@ class DocumentVersionChunksRead:
     suggested_chunk_max_chars: int
     chunk_count: int
     chunks: tuple[ChunkRead, ...]
+
+
+@dataclass(frozen=True)
+class DocumentProcessingJobRead:
+    id: int
+    attempt_no: int
+    status: str
+    stage: str | None
+    recipe_id: str
+    error_code: str | None
+    error_message: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+@dataclass(frozen=True)
+class DocumentProcessingRead:
+    document_version_id: int
+    latest_attempt: DocumentProcessingJobRead | None
+    published_chunks_exist: bool
 
 
 async def list_knowledge_bases(
@@ -181,4 +203,56 @@ async def read_document_version_chunks(
             )
             for row in rows
         ),
+    )
+
+
+async def read_document_processing_status(
+    session: AsyncSession, *, user_id: int, document_version_id: int
+) -> DocumentProcessingRead | None:
+    """Read latest-attempt state separately from authoritative published chunks."""
+
+    owned_version_id = await session.scalar(
+        select(DocumentVersion.id)
+        .join(Document, Document.id == DocumentVersion.document_id)
+        .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+        .where(
+            DocumentVersion.id == document_version_id,
+            KnowledgeBase.user_id == user_id,
+        )
+    )
+    if owned_version_id is None:
+        return None
+    latest = await session.scalar(
+        select(DocumentProcessingJob)
+        .where(DocumentProcessingJob.document_version_id == document_version_id)
+        .order_by(
+            DocumentProcessingJob.attempt_no.desc(),
+            DocumentProcessingJob.id.desc(),
+        )
+        .limit(1)
+    )
+    published_chunks_exist = await session.scalar(
+        select(
+            exists().where(KnowledgeChunk.document_version_id == document_version_id)
+        )
+    )
+    return DocumentProcessingRead(
+        document_version_id=document_version_id,
+        latest_attempt=(
+            None
+            if latest is None
+            else DocumentProcessingJobRead(
+                id=latest.id,
+                attempt_no=latest.attempt_no,
+                status=latest.status,
+                stage=latest.stage,
+                recipe_id=latest.recipe_id,
+                error_code=latest.error_code,
+                error_message=latest.error_message,
+                created_at=latest.created_at,
+                started_at=latest.started_at,
+                finished_at=latest.finished_at,
+            )
+        ),
+        published_chunks_exist=bool(published_chunks_exist),
     )

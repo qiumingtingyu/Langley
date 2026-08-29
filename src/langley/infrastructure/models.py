@@ -228,6 +228,97 @@ class DocumentVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
+class DocumentProcessingJob(Base):
+    """One durable processing attempt for an immutable DocumentVersion."""
+
+    __tablename__ = "document_processing_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id",
+            "attempt_no",
+            name="uq_doc_processing_version_attempt",
+        ),
+        Index("ix_doc_processing_status_id", "status", "id"),
+        CheckConstraint("attempt_no > 0", name="ck_doc_processing_attempt_positive"),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'INTERRUPTED')",
+            name="ck_doc_processing_status_valid",
+        ),
+        CheckConstraint(
+            "stage IS NULL OR stage IN ('VERIFYING_SOURCE', 'PARSING', 'CHUNKING', "
+            "'VALIDATING', 'PUBLISHING')",
+            name="ck_doc_processing_stage_valid",
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(recipe_id)) > 0",
+            name="ck_doc_processing_recipe_nonblank",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'SOURCE_MISSING', 'SOURCE_INTEGRITY_MISMATCH', 'PDF_PROCESS_TIMEOUT', "
+            "'PDF_PROCESS_RESOURCE_LIMIT', 'PDF_PARSE_FAILED', "
+            "'PDF_CHUNKING_FAILED', 'PDF_OUTPUT_INVALID', "
+            "'SOURCE_CHANGED_DURING_PROCESSING', 'PUBLICATION_FAILED', "
+            "'PROCESS_INTERRUPTED')",
+            name="ck_doc_processing_error_valid",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND stage IS NULL AND started_at IS NULL "
+            "AND finished_at IS NULL AND error_code IS NULL "
+            "AND error_message IS NULL) OR "
+            "(status = 'RUNNING' AND stage IS NOT NULL AND started_at IS NOT NULL "
+            "AND finished_at IS NULL AND error_code IS NULL "
+            "AND error_message IS NULL) OR "
+            "(status = 'SUCCEEDED' AND stage = 'PUBLISHING' "
+            "AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND error_code IS NULL AND error_message IS NULL) OR "
+            "(status = 'FAILED' AND stage IS NOT NULL AND started_at IS NOT NULL "
+            "AND finished_at IS NOT NULL AND error_code IS NOT NULL "
+            "AND error_code <> 'PROCESS_INTERRUPTED') OR "
+            "(status = 'INTERRUPTED' AND finished_at IS NOT NULL "
+            "AND error_code = 'PROCESS_INTERRUPTED' "
+            "AND ((stage IS NULL AND started_at IS NULL) "
+            "OR (stage IS NOT NULL AND started_at IS NOT NULL)))",
+            name="ck_doc_processing_lifecycle_valid",
+        ),
+        CheckConstraint(
+            "(started_at IS NULL OR started_at >= created_at) AND "
+            "(finished_at IS NULL OR finished_at >= created_at) AND "
+            "(started_at IS NULL OR finished_at IS NULL "
+            "OR finished_at >= started_at)",
+            name="ck_doc_processing_timestamp_order",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "document_versions.id",
+            name="fk_doc_processing_document_version",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    attempt_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    stage: Mapped[str | None] = mapped_column(
+        String(32, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    recipe_id: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+
+
 class KnowledgeChunk(Base):
     """One current authoritative chunk with typed JSON provenance."""
 

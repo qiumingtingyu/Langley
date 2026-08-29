@@ -49,24 +49,53 @@ class TextSpanRegion:
             raise ValueError("invalid text span region")
 
 
-SourceRegion: TypeAlias = TextSpanRegion
+@dataclass(frozen=True)
+class PdfPageRegion:
+    page_start: int
+    page_end: int
+    kind: str = "pdf_page"
+
+    def __post_init__(self) -> None:
+        if (
+            self.kind != "pdf_page"
+            or type(self.page_start) is not int
+            or type(self.page_end) is not int
+            or self.page_start < 1
+            or self.page_end < self.page_start
+        ):
+            raise ValueError("invalid PDF page region")
+
+
+SourceRegion: TypeAlias = TextSpanRegion | PdfPageRegion
 
 
 def encode_source_region(region: SourceRegion) -> dict[str, object]:
+    if isinstance(region, TextSpanRegion):
+        return {
+            "kind": region.kind,
+            "start_byte": region.start_byte,
+            "end_byte": region.end_byte,
+        }
     return {
         "kind": region.kind,
-        "start_byte": region.start_byte,
-        "end_byte": region.end_byte,
+        "page_start": region.page_start,
+        "page_end": region.page_end,
     }
 
 
 def decode_source_region(value: object) -> SourceRegion:
-    if not isinstance(value, dict) or set(value) != {"kind", "start_byte", "end_byte"}:
+    if not isinstance(value, dict):
         raise ValueError("invalid source region")
-    kind, start, end = value["kind"], value["start_byte"], value["end_byte"]
-    if type(start) is not int or type(end) is not int or not isinstance(kind, str):
-        raise ValueError("invalid source region")
-    return TextSpanRegion(start_byte=start, end_byte=end, kind=kind)
+    kind = value.get("kind")
+    if kind == "text_span" and set(value) == {"kind", "start_byte", "end_byte"}:
+        start, end = value["start_byte"], value["end_byte"]
+        if type(start) is int and type(end) is int:
+            return TextSpanRegion(start_byte=start, end_byte=end)
+    if kind == "pdf_page" and set(value) == {"kind", "page_start", "page_end"}:
+        start, end = value["page_start"], value["page_end"]
+        if type(start) is int and type(end) is int:
+            return PdfPageRegion(page_start=start, page_end=end)
+    raise ValueError("invalid source region")
 
 
 def validate_heading_path(value: object) -> list[str]:
@@ -81,9 +110,25 @@ def validate_source_regions(value: object) -> list[SourceRegion]:
     if not isinstance(value, list) or not value:
         raise ValueError("invalid source regions")
     regions = [decode_source_region(item) for item in value]
-    if any(
-        current.start_byte < previous.start_byte
-        for previous, current in zip(regions, regions[1:])
-    ):
-        raise ValueError("source regions must be source-ordered")
+    region_type = type(regions[0])
+    if any(type(region) is not region_type for region in regions[1:]):
+        raise ValueError("source regions must be homogeneous")
+    if region_type is TextSpanRegion:
+        text_regions = [
+            region for region in regions if isinstance(region, TextSpanRegion)
+        ]
+        if any(
+            current.start_byte < previous.start_byte
+            for previous, current in zip(text_regions, text_regions[1:])
+        ):
+            raise ValueError("source regions must be source-ordered")
+    else:
+        pdf_regions = [
+            region for region in regions if isinstance(region, PdfPageRegion)
+        ]
+        if any(
+            current.page_start <= previous.page_end
+            for previous, current in zip(pdf_regions, pdf_regions[1:])
+        ):
+            raise ValueError("PDF page regions must be ordered and non-overlapping")
     return regions

@@ -22,12 +22,20 @@ from langley.knowledge.chunking import (
     ChunkingConfig,
     build_candidate_chunks,
 )
-from langley.knowledge.contracts import TextSpanRegion
+from langley.knowledge.contracts import SourceRegion, TextSpanRegion
 from langley.knowledge.markdown import parse_markdown
 
 
 class RetrievalEvalError(RuntimeError):
     """Raised when a Golden Eval fact or its mechanics is malformed."""
+
+
+def _require_text_span_region(region: SourceRegion) -> TextSpanRegion:
+    """Keep the frozen Markdown Golden Eval byte-span-only."""
+
+    if not isinstance(region, TextSpanRegion):
+        raise RetrievalEvalError("retrieval eval requires text span regions")
+    return region
 
 
 @dataclass(frozen=True)
@@ -309,17 +317,18 @@ def candidate_is_golden_hit(
         raise RetrievalEvalError(
             f"candidate {candidate.identity!r} has no source regions"
         )
-    for region in candidate.chunk.source_regions:
-        if not isinstance(region, TextSpanRegion) or not (
-            0 <= region.start_byte < region.end_byte <= source_length
-        ):
+    text_regions = tuple(
+        _require_text_span_region(region) for region in candidate.chunk.source_regions
+    )
+    for region in text_regions:
+        if not (0 <= region.start_byte < region.end_byte <= source_length):
             raise RetrievalEvalError(
                 f"candidate {candidate.identity!r} has malformed source region"
             )
     return candidate.document_key == case.document_key and any(
         region.start_byte <= case.evidence.start_byte
         and region.end_byte >= case.evidence.end_byte
-        for region in candidate.chunk.source_regions
+        for region in text_regions
     )
 
 
@@ -511,7 +520,8 @@ def corpus_preflight(corpus: LoadedGoldenCorpus) -> CorpusPreflight:
     )
 
 
-def _region_dict(region: TextSpanRegion) -> dict[str, int | str]:
+def _region_dict(region: SourceRegion) -> dict[str, int | str]:
+    region = _require_text_span_region(region)
     return {
         "kind": region.kind,
         "start_byte": region.start_byte,
@@ -725,8 +735,9 @@ def render_result_markdown(result: EvalResult) -> str:
             )
         for item in highlighted:
             regions = ", ".join(
-                f"[{region.start_byte},{region.end_byte})"
+                f"[{text_region.start_byte},{text_region.end_byte})"
                 for region in item.candidate.chunk.source_regions
+                for text_region in (_require_text_span_region(region),)
             )
             lines.append(
                 (

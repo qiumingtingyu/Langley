@@ -40,6 +40,9 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.qwen_provider import QwenProvider
+from langley.knowledge.document_processing import (
+    reconcile_interrupted_document_processing_jobs,
+)
 from langley.knowledge.index_build import (
     KnowledgeIndexBuildRuntime,
     reconcile_interrupted_index_builds,
@@ -295,6 +298,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         execution_manager = getattr(app.state, "execution_manager", None)
         if session_factory is not None:
             await interrupt_active_runs(session_factory)
+            await reconcile_interrupted_document_processing_jobs(session_factory)
             await reconcile_interrupted_index_builds(session_factory)
             await reconcile_stale_ready_index_configurations(
                 session_factory, settings=app.state.settings
