@@ -205,6 +205,23 @@ class DocumentVersion(Base):
             "chunk_max_chars IS NULL OR chunk_max_chars > 0",
             name="ck_document_versions_chunk_max_chars_positive",
         ),
+        CheckConstraint(
+            "chunk_revision >= 0",
+            name="ck_document_versions_chunk_revision_nonnegative",
+        ),
+        CheckConstraint(
+            "(chunk_revision = 0 AND chunk_set_sha256 IS NULL) OR "
+            "(chunk_revision > 0 AND "
+            "chunk_set_sha256 IS NOT NULL AND "
+            "chunk_set_sha256 REGEXP '^[0-9a-f]{64}$')",
+            name="ck_document_versions_chunk_set_state",
+        ),
+        CheckConstraint(
+            "indexed_chunk_revision IS NULL OR "
+            "(indexed_chunk_revision >= 1 "
+            "AND indexed_chunk_revision <= chunk_revision)",
+            name="ck_document_versions_indexed_revision_valid",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -225,6 +242,15 @@ class DocumentVersion(Base):
         String(512, collation="utf8mb4_0900_bin"), nullable=False
     )
     chunk_max_chars: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    chunk_revision: Mapped[int] = mapped_column(
+        BigInteger, default=0, server_default="0", nullable=False
+    )
+    chunk_set_sha256: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    indexed_chunk_revision: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
@@ -309,6 +335,110 @@ class DocumentProcessingJob(Base):
         String(32, collation="utf8mb4_0900_bin"), nullable=True
     )
     recipe_id: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    error_code: Mapped[str | None] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    error_message: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DATETIME(fsp=6), nullable=True)
+
+
+class DocumentIndexJob(Base):
+    """One durable dense-index attempt for one authoritative chunk revision."""
+
+    __tablename__ = "document_index_jobs"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_version_id",
+            "attempt_no",
+            name="uq_doc_index_version_attempt",
+        ),
+        Index("ix_doc_index_status_id", "status", "id"),
+        CheckConstraint("attempt_no > 0", name="ck_doc_index_attempt_positive"),
+        CheckConstraint(
+            "target_chunk_revision > 0",
+            name="ck_doc_index_target_revision_positive",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED', 'INTERRUPTED')",
+            name="ck_doc_index_status_valid",
+        ),
+        CheckConstraint(
+            "stage IS NULL OR stage IN ('EMBEDDING', 'PUBLISHING', 'VERIFYING')",
+            name="ck_doc_index_stage_valid",
+        ),
+        CheckConstraint(
+            "CHAR_LENGTH(TRIM(embedding_model)) > 0 AND "
+            "CHAR_LENGTH(TRIM(embedding_revision)) > 0 AND "
+            "embedding_dimension > 0 AND "
+            "CHAR_LENGTH(TRIM(embedding_representation)) > 0",
+            name="ck_doc_index_embedding_config_valid",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'SOURCE_CHUNKS_CHANGED', 'INDEX_CONFIGURATION_CHANGED', "
+            "'EMBEDDING_FAILED', 'INVALID_EMBEDDING', "
+            "'INDEX_PUBLICATION_FAILED', 'INDEX_VERIFICATION_FAILED', "
+            "'INDEX_INTERRUPTED')",
+            name="ck_doc_index_error_valid",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND stage IS NULL AND started_at IS NULL "
+            "AND finished_at IS NULL AND error_code IS NULL "
+            "AND error_message IS NULL) OR "
+            "(status = 'RUNNING' AND stage IS NOT NULL AND started_at IS NOT NULL "
+            "AND finished_at IS NULL AND error_code IS NULL "
+            "AND error_message IS NULL) OR "
+            "(status = 'SUCCEEDED' AND stage = 'VERIFYING' "
+            "AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND error_code IS NULL AND error_message IS NULL) OR "
+            "(status = 'FAILED' AND stage IS NOT NULL AND started_at IS NOT NULL "
+            "AND finished_at IS NOT NULL AND error_code IS NOT NULL "
+            "AND error_code <> 'INDEX_INTERRUPTED') OR "
+            "(status = 'INTERRUPTED' AND finished_at IS NOT NULL "
+            "AND error_code = 'INDEX_INTERRUPTED' "
+            "AND ((stage IS NULL AND started_at IS NULL) "
+            "OR (stage IS NOT NULL AND started_at IS NOT NULL)))",
+            name="ck_doc_index_lifecycle_valid",
+        ),
+        CheckConstraint(
+            "(started_at IS NULL OR started_at >= created_at) AND "
+            "(finished_at IS NULL OR finished_at >= created_at) AND "
+            "(started_at IS NULL OR finished_at IS NULL "
+            "OR finished_at >= started_at)",
+            name="ck_doc_index_timestamp_order",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_version_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "document_versions.id",
+            name="fk_doc_index_document_version",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    attempt_no: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_chunk_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    stage: Mapped[str | None] = mapped_column(
+        String(16, collation="utf8mb4_0900_bin"), nullable=True
+    )
+    embedding_model: Mapped[str] = mapped_column(
+        String(255, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    embedding_revision: Mapped[str] = mapped_column(
+        String(64, collation="utf8mb4_0900_bin"), nullable=False
+    )
+    embedding_dimension: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    embedding_representation: Mapped[str] = mapped_column(
         String(64, collation="utf8mb4_0900_bin"), nullable=False
     )
     error_code: Mapped[str | None] = mapped_column(
