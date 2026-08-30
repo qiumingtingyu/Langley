@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from langley.answer_execution import AnswerExecutionManager
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.models import User
+from langley.knowledge.document_indexing import DocumentIndexDispatcher
 from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
 from langley.knowledge.pdf_processing import DocumentProcessingDispatcher
 from langley.memory.events import MemoryEventSubscribers
@@ -95,6 +96,13 @@ def get_document_processing_dispatcher(
     request: Request,
 ) -> DocumentProcessingDispatcher:
     dispatcher = getattr(request.app.state, "document_processing_dispatcher", None)
+    if dispatcher is None:
+        raise HTTPException(status_code=500, detail={"code": "DATABASE_NOT_CONFIGURED"})
+    return dispatcher
+
+
+def get_document_index_dispatcher(request: Request) -> DocumentIndexDispatcher:
+    dispatcher = getattr(request.app.state, "document_index_dispatcher", None)
     if dispatcher is None:
         raise HTTPException(status_code=500, detail={"code": "DATABASE_NOT_CONFIGURED"})
     return dispatcher

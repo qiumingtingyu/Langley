@@ -40,9 +40,16 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.qwen_provider import QwenProvider
+from langley.knowledge.document_indexing import (
+    DocumentIndexConfiguration,
+    DocumentIndexDispatcher,
+    DocumentIndexRuntime,
+    reconcile_interrupted_document_index_jobs,
+)
 from langley.knowledge.document_processing import (
     reconcile_interrupted_document_processing_jobs,
 )
+from langley.knowledge.embedding_runtime import KnowledgeEmbeddingRuntime
 from langley.knowledge.index_build import (
     KnowledgeIndexBuildRuntime,
     reconcile_interrupted_index_builds,
@@ -294,6 +301,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     session_factory = None
     execution_manager = None
     document_processing_dispatcher = None
+    document_index_dispatcher = None
     logger.info("application.started")
     try:
         local_file_storage = getattr(app.state, "local_file_storage", None)
@@ -304,6 +312,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         document_processing_dispatcher = getattr(
             app.state, "document_processing_dispatcher", None
         )
+        document_index_dispatcher = getattr(
+            app.state, "document_index_dispatcher", None
+        )
         if session_factory is not None:
             await interrupt_active_runs(session_factory)
             await reconcile_interrupted_document_processing_jobs(session_factory)
@@ -311,17 +322,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await local_file_storage.confirm_no_processing_worker()
                 await local_file_storage.cleanup_stale_processing_artifacts()
             await reconcile_interrupted_index_builds(session_factory)
+            await reconcile_interrupted_document_index_jobs(session_factory)
             await reconcile_stale_ready_index_configurations(
                 session_factory, settings=app.state.settings
             )
             if document_processing_dispatcher is not None:
                 document_processing_dispatcher.start()
+            if document_index_dispatcher is not None:
+                document_index_dispatcher.start()
         yield
     finally:
         if session_factory is not None:
             if document_processing_dispatcher is not None:
                 await document_processing_dispatcher.stop()
+            if document_index_dispatcher is not None:
+                await document_index_dispatcher.stop()
             await reconcile_interrupted_document_processing_jobs(session_factory)
+            await reconcile_interrupted_document_index_jobs(session_factory)
             repaired_run_ids = await interrupt_active_runs(session_factory)
             if execution_manager is not None:
                 await execution_manager.stop_interrupted_runs(repaired_run_ids)
@@ -396,17 +413,41 @@ def create_app(
                 app.state.memory_lane,
                 app.state.memory_subscribers.publish,
             )
+        embedding_runtime = KnowledgeEmbeddingRuntime(
+            device=resolved_settings.knowledge_embedding_device
+        )
         app.state.knowledge_index_runtime = (
             knowledge_index_runtime
             if knowledge_index_runtime is not None
             else KnowledgeIndexBuildRuntime(
-                app.state.session_factory, resolved_settings
+                app.state.session_factory,
+                resolved_settings,
+                embedding_runtime=embedding_runtime,
             )
+        )
+        if knowledge_index_runtime is not None:
+            embedding_runtime = getattr(
+                knowledge_index_runtime, "embedding_runtime", embedding_runtime
+            )
+        document_index_configuration = DocumentIndexConfiguration.from_settings(
+            resolved_settings
+        )
+        document_index_runtime = DocumentIndexRuntime(
+            app.state.session_factory,
+            document_index_configuration,
+            embedding_runtime,
+        )
+        app.state.document_index_dispatcher = DocumentIndexDispatcher(
+            app.state.session_factory,
+            document_index_runtime,
+            document_index_configuration,
         )
         document_processing_runtime = DocumentProcessingRuntime(
             app.state.session_factory,
             app.state.local_file_storage,
             timeout_seconds=resolved_settings.document_processing_timeout_seconds,
+            index_configuration=document_index_configuration,
+            index_wake=app.state.document_index_dispatcher.wake,
         )
         app.state.document_processing_dispatcher = DocumentProcessingDispatcher(
             app.state.session_factory, document_processing_runtime

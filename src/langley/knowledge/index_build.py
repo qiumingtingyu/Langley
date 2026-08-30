@@ -1,12 +1,11 @@
 """Narrow durable lifecycle for manual Knowledge dense-index builds."""
 
 import asyncio
-import threading
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from math import isfinite
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -20,6 +19,12 @@ from langley.infrastructure.models import (
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeIndexJob,
+)
+from langley.knowledge.embedding_runtime import (
+    KnowledgeEmbeddingError,
+    KnowledgeEmbeddingRuntime,
+    normalize_embedding_rows,
+    normalize_query_embedding,
 )
 
 if TYPE_CHECKING:
@@ -109,37 +114,21 @@ def _normalize_embedding_rows(
 ) -> list[list[float]]:
     """Reject malformed document embeddings before any Qdrant write."""
 
-    import numpy as np
-
-    matrix = np.asarray(values, dtype=np.float32)
-    if matrix.ndim != 2 or matrix.shape != (row_count, dimension):
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入维度不符合索引配置。")
-    if not np.isfinite(matrix).all():
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入包含无效数值。")
-    norms = np.linalg.norm(matrix, axis=1)
-    if not np.isfinite(norms).all() or (norms <= 0).any():
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入向量不能为空。")
-    matrix /= norms[:, None]
-    return matrix.tolist()
+    try:
+        return normalize_embedding_rows(
+            values, row_count=row_count, dimension=dimension
+        )
+    except KnowledgeEmbeddingError as error:
+        raise IndexBuildFailure(error.code, error.message) from error
 
 
 def _normalize_query_embedding(values: object, *, dimension: int) -> list[float]:
     """Reject a malformed production query vector before Qdrant search."""
 
-    import numpy as np
-
-    matrix = np.asarray(values)
-    if matrix.dtype != np.float32 or matrix.shape != (1, dimension):
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入维度不符合索引配置。")
-    if not np.isfinite(matrix).all():
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入包含无效数值。")
-    norm = float(np.linalg.norm(matrix[0]))
-    if not np.isfinite(norm) or norm <= 0:
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入向量不能为空。")
-    normalized = np.asarray(matrix[0] / norm, dtype=np.float32)
-    if not np.isfinite(normalized).all():
-        raise IndexBuildFailure("INVALID_EMBEDDING", "嵌入包含无效数值。")
-    return normalized.tolist()
+    try:
+        return normalize_query_embedding(values, dimension=dimension)
+    except KnowledgeEmbeddingError as error:
+        raise IndexBuildFailure(error.code, error.message) from error
 
 
 async def _current_chunks(
@@ -359,19 +348,27 @@ class KnowledgeIndexBuildRuntime:
     """One application-local, bounded executor for Task 5.1 index builds."""
 
     def __init__(
-        self, session_factory: async_sessionmaker[AsyncSession], settings: "Settings"
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        settings: "Settings",
+        *,
+        embedding_runtime: KnowledgeEmbeddingRuntime | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._settings = settings
         self._capacity = asyncio.Semaphore(settings.knowledge_index_build_concurrency)
         self._tasks: set[asyncio.Task[None]] = set()
-        self._embedding_lock = threading.Lock()
-        self._embedding_identity: tuple[str, str, str] | None = None
-        self._embedding_model: Any | None = None
+        self._embedding_runtime = embedding_runtime or KnowledgeEmbeddingRuntime(
+            device=settings.knowledge_embedding_device
+        )
 
     @property
     def settings(self) -> "Settings":
         return self._settings
+
+    @property
+    def embedding_runtime(self) -> KnowledgeEmbeddingRuntime:
+        return self._embedding_runtime
 
     def schedule(self, job_id: int) -> None:
         task = asyncio.create_task(self.run(job_id))
@@ -447,16 +444,18 @@ class KnowledgeIndexBuildRuntime:
     ) -> list[list[float]]:
         """Perform heavy local BGE-M3 document encoding outside the event loop."""
 
-        with self._embedding_lock:
-            model = self._embedding_model_for(
-                job.embedding_model, job.embedding_revision
+        try:
+            self._embedding_runtime.set_device(
+                self._settings.knowledge_embedding_device
             )
-            values = model.encode_document(
-                contents, convert_to_numpy=True, show_progress_bar=False
+            return self._embedding_runtime.encode_documents(
+                contents,
+                model=job.embedding_model,
+                revision=job.embedding_revision,
+                dimension=job.embedding_dimension,
             )
-        return _normalize_embedding_rows(
-            values, row_count=len(contents), dimension=job.embedding_dimension
-        )
+        except KnowledgeEmbeddingError as error:
+            raise IndexBuildFailure(error.code, error.message) from error
 
     async def encode_query(
         self,
@@ -486,32 +485,18 @@ class KnowledgeIndexBuildRuntime:
     ) -> list[float]:
         """Perform heavy local BGE-M3 query encoding outside the event loop."""
 
-        with self._embedding_lock:
-            embedding_model = self._embedding_model_for(model, revision)
-            values = embedding_model.encode_query(
-                [query], convert_to_numpy=True, show_progress_bar=False
+        try:
+            self._embedding_runtime.set_device(
+                self._settings.knowledge_embedding_device
             )
-        return _normalize_query_embedding(values, dimension=dimension)
-
-    def _embedding_model_for(self, model: str, revision: str) -> Any:
-        """Load or reuse the one runtime-local BGE instance while the lock is held."""
-
-        configured_device = self._settings.knowledge_embedding_device
-        identity = (model, revision, configured_device)
-        if self._embedding_identity == identity and self._embedding_model is not None:
-            return self._embedding_model
-        from sentence_transformers import SentenceTransformer
-
-        embedding_model = SentenceTransformer(
-            model, revision=revision, device=configured_device
-        )
-        if str(embedding_model.device) != configured_device:
-            raise IndexBuildFailure(
-                "EMBEDDING_DEVICE_UNAVAILABLE", "配置的嵌入设备不可用。"
+            return self._embedding_runtime.encode_query(
+                query,
+                model=model,
+                revision=revision,
+                dimension=dimension,
             )
-        self._embedding_identity = identity
-        self._embedding_model = embedding_model
-        return embedding_model
+        except KnowledgeEmbeddingError as error:
+            raise IndexBuildFailure(error.code, error.message) from error
 
     async def _qdrant_client(self):
         from qdrant_client import AsyncQdrantClient

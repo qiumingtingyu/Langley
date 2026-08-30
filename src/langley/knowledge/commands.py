@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from hashlib import sha256
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.business_time import utc_now
@@ -25,6 +25,10 @@ from langley.knowledge.contracts import (
     DocumentSourceRef,
     FileStorage,
     encode_source_region,
+)
+from langley.knowledge.document_indexing import (
+    DocumentIndexConfiguration,
+    publish_document_chunks,
 )
 from langley.knowledge.document_processing import (
     PDF_PROCESSING_RECIPE_ID,
@@ -60,11 +64,17 @@ class DocumentRebuildResult:
     """The small durable result of one successful chunk replacement."""
 
     def __init__(
-        self, *, document_version_id: int, chunk_count: int, index_status: str
+        self,
+        *,
+        document_version_id: int,
+        chunk_count: int,
+        index_status: str,
+        index_job_created: bool,
     ) -> None:
         self.document_version_id = document_version_id
         self.chunk_count = chunk_count
         self.index_status = index_status
+        self.index_job_created = index_job_created
 
 
 @dataclass(frozen=True)
@@ -304,6 +314,7 @@ async def rebuild_document_version_chunks(
     user_id: int,
     document_version_id: int,
     config: ChunkingConfig,
+    index_configuration: DocumentIndexConfiguration | None = None,
 ) -> DocumentRebuildResult:
     """Atomically replace current chunks from one verified immutable source."""
 
@@ -319,6 +330,9 @@ async def rebuild_document_version_chunks(
         source_ref=source_ref,
         prepared_rows=prepared_rows,
         successful_chunk_max_chars=config.max_chunk_chars,
+        index_configuration=(
+            index_configuration or _configured_document_index_defaults()
+        ),
     )
 
 
@@ -348,6 +362,7 @@ async def _replace_document_version_chunks(
     source_ref: DocumentSourceRef,
     prepared_rows: list[KnowledgeChunk],
     successful_chunk_max_chars: int | None = None,
+    index_configuration: DocumentIndexConfiguration | None = None,
 ) -> DocumentRebuildResult:
     async with session_factory() as session:
         async with session.begin():
@@ -374,20 +389,22 @@ async def _replace_document_version_chunks(
                 raise DocumentVersionNotFoundError
             if not _document_version_matches_source_ref(version, source_ref):
                 raise RuntimeError("document source identity changed during rebuild")
-            await session.execute(
-                delete(KnowledgeChunk).where(
-                    KnowledgeChunk.document_version_id == version.id
-                )
-            )
-            session.add_all(prepared_rows)
             if successful_chunk_max_chars is not None:
                 version.chunk_max_chars = successful_chunk_max_chars
-            _invalidate_knowledge_base_index(knowledge_base)
-            await session.flush()
+            publication = await publish_document_chunks(
+                session,
+                knowledge_base=knowledge_base,
+                version=version,
+                prepared_rows=prepared_rows,
+                configuration=(
+                    index_configuration or _configured_document_index_defaults()
+                ),
+            )
             return DocumentRebuildResult(
                 document_version_id=version.id,
                 chunk_count=len(prepared_rows),
                 index_status=knowledge_base.index_status,
+                index_job_created=publication.job_created,
             )
 
 
@@ -445,3 +462,11 @@ def _validate_markdown_source(source_bytes: bytes) -> None:
     if not source_bytes:
         raise ValueError("source_bytes must not be empty")
     source_bytes.decode("utf-8", errors="strict")
+
+
+def _configured_document_index_defaults() -> DocumentIndexConfiguration:
+    """Resolve direct command calls from the same environment-backed settings."""
+
+    from langley.settings import Settings
+
+    return DocumentIndexConfiguration.from_settings(Settings())

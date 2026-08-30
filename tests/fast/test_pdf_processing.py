@@ -14,6 +14,7 @@ import langley.knowledge.pdf_processing as processing_module
 from langley.infrastructure.local_file_storage import LocalFileStorage, process_is_alive
 from langley.knowledge.chunking import CandidateChunk
 from langley.knowledge.contracts import DocumentSourceRef, PdfPageRegion
+from langley.knowledge.document_indexing import DocumentIndexConfiguration
 from langley.knowledge.document_processing import (
     PDF_PROCESSING_RECIPE_ID,
     PDF_PROCESSING_TOKENIZER_ID,
@@ -197,6 +198,8 @@ def test_document_processing_runtime_uses_frozen_recipe_tokenizer(
         object(),
         LocalFileStorage(tmp_path / "storage"),
         timeout_seconds=1,
+        index_configuration=DocumentIndexConfiguration.from_settings(mutable_settings),
+        index_wake=lambda: None,
     )
 
     assert PDF_PROCESSING_TOKENIZER_ID == "BAAI/bge-m3"

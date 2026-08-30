@@ -18,10 +18,17 @@ SOURCE_CONTEXT_V1 = "source_context_v1"
 class ChunkSetFingerprintMember(Protocol):
     """Only semantic chunk facts participate in the chunk-set fingerprint."""
 
-    ordinal: int
-    content: str
-    heading_path: object
-    source_regions: object
+    @property
+    def ordinal(self) -> int: ...
+
+    @property
+    def content(self) -> str: ...
+
+    @property
+    def heading_path(self) -> object: ...
+
+    @property
+    def source_regions(self) -> object: ...
 
 
 def build_source_context_v1(content: str, heading_path: Sequence[str]) -> str:

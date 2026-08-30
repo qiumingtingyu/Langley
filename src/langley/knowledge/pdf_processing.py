@@ -13,7 +13,7 @@ from pathlib import Path
 from time import perf_counter
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.business_time import utc_now
@@ -28,6 +28,10 @@ from langley.infrastructure.models import (
     KnowledgeChunk,
 )
 from langley.knowledge.contracts import DocumentSourceRef, encode_source_region
+from langley.knowledge.document_indexing import (
+    DocumentIndexConfiguration,
+    publish_document_chunks,
+)
 from langley.knowledge.document_processing import (
     PDF_PROCESSING_TOKENIZER_ID,
     PDF_PROCESSING_TOKENIZER_REVISION,
@@ -648,7 +652,8 @@ async def publish_pdf_processing_result(
     *,
     claim: DocumentProcessingClaim,
     result: PdfProcessingResult,
-) -> None:
+    index_configuration: DocumentIndexConfiguration | None = None,
+) -> bool:
     """Atomically replace all PDF chunks and complete the exact RUNNING attempt."""
     rows = [
         KnowledgeChunk(
@@ -697,17 +702,16 @@ async def publish_pdf_processing_result(
             or job.recipe_id != claim.recipe_id
         ):
             raise PdfPublicationFailure(DocumentProcessingErrorCode.PUBLICATION_FAILED)
-        await session.execute(
-            delete(KnowledgeChunk).where(
-                KnowledgeChunk.document_version_id == claim.document_version_id
-            )
-        )
-        session.add_all(rows)
-        knowledge_base.index_status = (
-            "STALE" if knowledge_base.active_generation_id is not None else "CHUNKED"
+        publication = await publish_document_chunks(
+            session,
+            knowledge_base=knowledge_base,
+            version=version,
+            prepared_rows=rows,
+            configuration=(index_configuration or _configured_index_defaults()),
         )
         mark_document_processing_succeeded(job, now=utc_now())
         await session.flush()
+        return publication.job_created
 
 
 class DocumentProcessingRuntime:
@@ -719,11 +723,15 @@ class DocumentProcessingRuntime:
         file_storage: LocalFileStorage,
         *,
         timeout_seconds: float,
+        index_configuration: DocumentIndexConfiguration | None = None,
+        index_wake: Callable[[], None] | None = None,
         worker: PersistentPdfWorker | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._file_storage = file_storage
         self._timeout_seconds = timeout_seconds
+        self._index_configuration = index_configuration or _configured_index_defaults()
+        self._index_wake = index_wake or _do_not_wake
         self._worker = worker or PersistentPdfWorker(
             tokenizer_id=PDF_PROCESSING_TOKENIZER_ID,
             tokenizer_revision=PDF_PROCESSING_TOKENIZER_REVISION,
@@ -834,9 +842,14 @@ class DocumentProcessingRuntime:
                     DocumentProcessingErrorCode.SOURCE_CHANGED_DURING_PROCESSING
                 ) from error
             await advance(DocumentProcessingStage.PUBLISHING)
-            await publish_pdf_processing_result(
-                self._session_factory, claim=claim, result=result
+            index_job_created = await publish_pdf_processing_result(
+                self._session_factory,
+                claim=claim,
+                result=result,
+                index_configuration=self._index_configuration,
             )
+            if index_job_created:
+                self._index_wake()
             finished = perf_counter()
             logger.info(
                 "knowledge.document_processing.stage_completed",
@@ -1001,3 +1014,15 @@ class DocumentProcessingDispatcher:
             except Exception:
                 logger.exception("knowledge.document_processing.dispatch_failed")
                 await asyncio.sleep(2.0)
+
+
+def _configured_index_defaults() -> DocumentIndexConfiguration:
+    """Resolve direct runtime calls from the environment-backed settings."""
+
+    from langley.settings import Settings
+
+    return DocumentIndexConfiguration.from_settings(Settings())
+
+
+def _do_not_wake() -> None:
+    return None

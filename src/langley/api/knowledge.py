@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.api.dependencies import (
     get_current_user_id,
+    get_document_index_dispatcher,
     get_document_processing_dispatcher,
     get_knowledge_index_runtime,
     get_local_file_storage,
@@ -41,6 +42,7 @@ from langley.knowledge.commands import (
     read_verified_source,
     rebuild_document_version_chunks,
 )
+from langley.knowledge.document_indexing import DocumentIndexDispatcher
 from langley.knowledge.document_processing import PDF_PROCESSING_RECIPE_ID
 from langley.knowledge.index_build import (
     IndexBuildAdmissionError,
@@ -598,6 +600,9 @@ async def post_document_version_chunks_rebuild(
     body: ChunkRebuildRequest,
     session_factory: async_sessionmaker[AsyncSession] = Depends(get_session_factory),
     file_storage: LocalFileStorage = Depends(get_local_file_storage),
+    document_index_dispatcher: DocumentIndexDispatcher = Depends(
+        get_document_index_dispatcher
+    ),
     current_user_id: int = Depends(get_current_user_id),
 ) -> ChunkRebuildResponse:
     try:
@@ -607,6 +612,7 @@ async def post_document_version_chunks_rebuild(
             user_id=current_user_id,
             document_version_id=document_version_id,
             config=ChunkingConfig(max_chunk_chars=body.max_chunk_chars),
+            index_configuration=document_index_dispatcher.configuration,
         )
     except DocumentVersionNotFoundError as error:
         raise HTTPException(
@@ -616,6 +622,8 @@ async def post_document_version_chunks_rebuild(
         raise HTTPException(status_code=409, detail={"code": str(error)}) from error
     except (SourceIntegrityError, OSError) as error:
         _raise_verify_error(error)
+    if result.index_job_created:
+        document_index_dispatcher.wake()
     return ChunkRebuildResponse(
         document_version_id=result.document_version_id,
         successful_chunk_max_chars=body.max_chunk_chars,
