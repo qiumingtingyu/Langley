@@ -54,12 +54,15 @@ from langley.knowledge.index_build import (
 )
 from langley.knowledge.pdf_processing import DocumentProcessingDispatcher
 from langley.knowledge.reads import (
+    DocumentProcessingJobRead,
+    DocumentProcessingRead,
     DocumentRead,
     DocumentSourceRead,
     DocumentVersionChunksRead,
     KnowledgeBaseRead,
     list_documents_for_knowledge_base,
     list_knowledge_bases,
+    read_document_processing_status,
     read_document_version_chunks,
 )
 from langley.knowledge.retrieval import (
@@ -123,6 +126,25 @@ class DocumentProcessingAcceptedResponse(BaseModel):
 
 class PdfDocumentAcceptedResponse(DocumentResponse):
     processing_job: DocumentProcessingAcceptedResponse
+
+
+class DocumentProcessingJobResponse(BaseModel):
+    id: int
+    attempt_no: int
+    status: str
+    stage: str | None
+    recipe_id: str
+    error_code: str | None
+    error_message: str | None
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+
+
+class DocumentProcessingStatusResponse(BaseModel):
+    document_version_id: int
+    latest_attempt: DocumentProcessingJobResponse | None
+    published_chunks_exist: bool
 
 
 class VerifySourceResponse(BaseModel):
@@ -238,6 +260,35 @@ def _document_response(value: DocumentRead) -> DocumentResponse:
         name=value.name,
         created_at=as_utc(value.created_at),
         source=_source_response(value.source),
+    )
+
+
+def _document_processing_job_response(
+    value: DocumentProcessingJobRead,
+) -> DocumentProcessingJobResponse:
+    return DocumentProcessingJobResponse(
+        id=value.id,
+        attempt_no=value.attempt_no,
+        status=value.status,
+        stage=value.stage,
+        recipe_id=value.recipe_id,
+        error_code=value.error_code,
+        error_message=value.error_message,
+        created_at=as_utc(value.created_at),
+        started_at=None if value.started_at is None else as_utc(value.started_at),
+        finished_at=None if value.finished_at is None else as_utc(value.finished_at),
+    )
+
+
+def _document_processing_status_response(
+    value: DocumentProcessingRead,
+) -> DocumentProcessingStatusResponse:
+    return DocumentProcessingStatusResponse(
+        document_version_id=value.document_version_id,
+        latest_attempt=None
+        if value.latest_attempt is None
+        else _document_processing_job_response(value.latest_attempt),
+        published_chunks_exist=value.published_chunks_exist,
     )
 
 
@@ -563,6 +614,27 @@ async def verify_source(
         verified=True,
         verified_at=as_utc(utc_now()),
     )
+
+
+@router.get(
+    "/api/document-versions/{document_version_id}/processing-status",
+    response_model=DocumentProcessingStatusResponse,
+)
+async def get_document_processing_status(
+    document_version_id: int,
+    session: AsyncSession = Depends(get_session),
+    current_user_id: int = Depends(get_current_user_id),
+) -> DocumentProcessingStatusResponse:
+    value = await read_document_processing_status(
+        session,
+        user_id=current_user_id,
+        document_version_id=document_version_id,
+    )
+    if value is None:
+        raise HTTPException(
+            status_code=404, detail={"code": "DOCUMENT_VERSION_NOT_FOUND"}
+        )
+    return _document_processing_status_response(value)
 
 
 @router.get(

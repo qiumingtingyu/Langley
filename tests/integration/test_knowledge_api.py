@@ -116,6 +116,84 @@ def test_pdf_upload_returns_durable_pending_attempt(
     asyncio.run(inspect())
 
 
+def test_pdf_processing_status_reads_durable_attempt(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    storage_root = tmp_path / "knowledge"
+    _bootstrap(migrated_database, storage_root, 1)
+    app = create_app(_settings(migrated_database, storage_root))
+    app.state.document_processing_dispatcher = _PassiveDocumentProcessingDispatcher()
+    with TestClient(app) as client:
+        knowledge_base = client.post(
+            "/api/knowledge-bases", json={"name": "PDF status"}
+        ).json()
+        uploaded = client.post(
+            f"/api/knowledge-bases/{knowledge_base['id']}/documents",
+            files={
+                "file": (
+                    "status.pdf",
+                    b"%PDF-1.4 controlled status bytes",
+                    "application/pdf",
+                )
+            },
+        ).json()
+        response = client.get(
+            f"/api/document-versions/{uploaded['source']['document_version_id']}/processing-status"
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    latest_attempt = body.pop("latest_attempt")
+    assert latest_attempt is not None
+    assert latest_attempt | {"id": 0, "created_at": "present"} == {
+        "id": 0,
+        "attempt_no": 1,
+        "status": "PENDING",
+        "stage": None,
+        "recipe_id": "pdf_docling_hybrid512_v1",
+        "error_code": None,
+        "error_message": None,
+        "created_at": "present",
+        "started_at": None,
+        "finished_at": None,
+    }
+    assert body == {
+        "document_version_id": uploaded["source"]["document_version_id"],
+        "published_chunks_exist": False,
+    }
+
+
+def test_pdf_processing_status_hides_unowned_version(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    storage_root = tmp_path / "knowledge"
+    _bootstrap(migrated_database, storage_root, 1)
+    _bootstrap(migrated_database, storage_root, 2)
+    app = create_app(_settings(migrated_database, storage_root))
+    app.state.document_processing_dispatcher = _PassiveDocumentProcessingDispatcher()
+    with TestClient(app) as owner:
+        knowledge_base = owner.post(
+            "/api/knowledge-bases", json={"name": "Private PDF"}
+        ).json()
+        uploaded = owner.post(
+            f"/api/knowledge-bases/{knowledge_base['id']}/documents",
+            files={
+                "file": (
+                    "private.pdf",
+                    b"%PDF-1.4 controlled private bytes",
+                    "application/pdf",
+                )
+            },
+        ).json()
+    with TestClient(create_app(_settings(migrated_database, storage_root, 2))) as other:
+        response = other.get(
+            f"/api/document-versions/{uploaded['source']['document_version_id']}/processing-status"
+        )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": {"code": "DOCUMENT_VERSION_NOT_FOUND"}}
+
+
 def test_knowledge_api_vertical_slice(migrated_database: str, tmp_path: Path) -> None:
     """The frozen endpoints preserve ownership, persistence, and integrity facts."""
 
