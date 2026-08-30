@@ -277,24 +277,45 @@ describe("App user behavior", () => {
     wrapper.unmount();
   });
 
-  it("renames and deletes a selected conversation through the Chinese controls", async () => {
-    vi.stubGlobal("prompt", () => "重命名后的会话");
-    vi.stubGlobal("confirm", () => true);
+  it("renames and deletes a selected conversation through custom dialogs", async () => {
+    const prompt = vi.fn();
+    const confirm = vi.fn();
+    vi.stubGlobal("prompt", prompt);
+    vi.stubGlobal("confirm", confirm);
     const wrapper = await mountInitial();
     enqueue(response(conversation(1, "重命名后的会话")));
     await wrapper.get('button[aria-label="重命名会话"]').trigger("click");
     await settle();
+    const renameInput = document.querySelector<HTMLInputElement>("#rename-conversation-title")!;
+    expect(renameInput.value).toBe("A");
+    renameInput.value = "重命名后的会话";
+    renameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    document.querySelector<HTMLFormElement>('[role="dialog"] form')!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle();
+    const rename = fetchMock.mock.calls.find(([path, init]) => path === "/api/conversations/1" && init?.method === "PATCH");
+    expect(JSON.parse(String(rename?.[1]?.body))).toEqual({ title: "重命名后的会话" });
     expect(wrapper.find("header").text()).toContain("重命名后的会话");
+
+    await wrapper.get('button[aria-label="删除会话"]').trigger("click");
+    await settle();
+    expect(document.body.textContent).toContain("删除会话？");
+    Array.from(document.querySelectorAll("button")).find((item) => item.textContent?.includes("取消"))!.click();
+    await settle();
+    expect(fetchMock.mock.calls.some(([path, init]) => path === "/api/conversations/1" && init?.method === "DELETE")).toBe(false);
+
     enqueue(response({}));
     enqueue(response({ messages: [], latest_run: null }));
     await wrapper.get('button[aria-label="删除会话"]').trigger("click");
     await settle();
+    Array.from(document.querySelectorAll("button")).find((item) => item.textContent?.includes("删除"))!.click();
+    await settle();
+    expect(prompt).not.toHaveBeenCalled();
+    expect(confirm).not.toHaveBeenCalled();
     expect(wrapper.find("header").text()).toContain("B");
     wrapper.unmount();
   });
 
   it("selects a newly created conversation after the last conversation was deleted", async () => {
-    vi.stubGlobal("confirm", () => true);
     let hasInitialConversation = true;
     let createdConversation = false;
     fetchMock.mockImplementation((path: string, init?: RequestInit) => {
@@ -320,6 +341,8 @@ describe("App user behavior", () => {
     await settle();
 
     await wrapper.get('button[aria-label="删除会话"]').trigger("click");
+    await settle();
+    Array.from(document.querySelectorAll("button")).find((item) => item.textContent?.includes("删除"))!.click();
     await settle();
     expect(wrapper.find("header").text()).toContain("Langley");
 

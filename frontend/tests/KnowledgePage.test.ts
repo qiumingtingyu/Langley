@@ -398,7 +398,7 @@ describe("KnowledgePage processing bridge", () => {
     resolveRebuild!(response({ document_version_id: 17, successful_chunk_max_chars: 800, chunk_count: 1, resulting_index_status: "STALE" }));
     await settle();
     expect(wrapper.text()).toContain("当前分块配置：800");
-    expect(fetchMock.mock.calls.some(([path]) => path === "/api/document-versions/17/chunks?offset=0&limit=50")).toBe(true);
+    expect(fetchMock.mock.calls.some(([path]) => path === "/api/document-versions/17/chunks?offset=0&limit=10")).toBe(true);
     expect(wrapper.text()).toContain("需要重建");
     wrapper.unmount();
   });
@@ -459,12 +459,12 @@ describe("KnowledgePage processing bridge", () => {
   });
 
   it("paginates within the bounded range", async () => {
-    const second = { ...chunk, ordinal: 51 };
+    const second = { ...chunk, ordinal: 11 };
     const fetchMock = vi.fn(async (path: string) => {
       if (path === "/api/knowledge-bases") return response(knowledgeBase);
       if (path === "/api/knowledge-bases/4/documents") return response([document]);
-      if (path.endsWith("offset=0&limit=50")) return response({ ...chunksPage(1200, 51), chunks: [chunk] });
-      if (path.endsWith("offset=50&limit=50")) return response({ ...chunksPage(1200, 51, 50), chunks: [second] });
+      if (path.endsWith("offset=0&limit=10")) return response({ ...chunksPage(1200, 11), chunks: [chunk] });
+      if (path.endsWith("offset=10&limit=10")) return response({ ...chunksPage(1200, 11, 10), chunks: [second] });
       if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("CHUNKED"));
       throw new Error(`unexpected request: ${path}`);
     });
@@ -476,8 +476,8 @@ describe("KnowledgePage processing bridge", () => {
     expect(next.attributes("disabled")).toBeUndefined();
     await next.trigger("click");
     await settle();
-    expect(wrapper.text()).toContain("显示 51–51");
-    expect(wrapper.text()).toContain("#51");
+    expect(wrapper.text()).toContain("显示 11–11");
+    expect(wrapper.text()).toContain("#11");
     expect(next.attributes("disabled")).toBeDefined();
     wrapper.unmount();
   });
@@ -486,8 +486,8 @@ describe("KnowledgePage processing bridge", () => {
     const fetchMock = vi.fn(async (path: string) => {
       if (path === "/api/knowledge-bases") return response(knowledgeBase);
       if (path === "/api/knowledge-bases/4/documents") return response([document]);
-      if (path.endsWith("offset=0&limit=50")) return response({ ...chunksPage(1200, 51), chunks: [chunk] });
-      if (path.endsWith("offset=50&limit=50")) return response({ ...chunksPage(1200, 51, 50), chunks: [{ ...chunk, ordinal: 51 }] });
+      if (path.endsWith("offset=0&limit=10")) return response({ ...chunksPage(1200, 11), chunks: [chunk] });
+      if (path.endsWith("offset=10&limit=10")) return response({ ...chunksPage(1200, 11, 10), chunks: [{ ...chunk, ordinal: 11 }] });
       if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("CHUNKED"));
       throw new Error(`unexpected request: ${path}`);
     });

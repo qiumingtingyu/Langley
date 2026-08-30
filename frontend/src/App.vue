@@ -80,10 +80,6 @@ const hasCurrentStream = computed(
     streamState.value.runId === latestRun.value?.id,
 );
 
-function conversationTitle(conversation: Conversation): string {
-  return conversation.title ?? "未命名会话";
-}
-
 function isActive(run: Run): boolean {
   return run.status === "PENDING" || run.status === "RUNNING";
 }
@@ -489,13 +485,12 @@ async function createConversation(): Promise<void> {
   }
 }
 
-async function renameConversation(): Promise<void> {
+async function renameConversation(title: string): Promise<void> {
   const conversation = selectedConversation.value;
   if (conversation === undefined) return;
-  const title = window.prompt("请输入新的会话名称", conversationTitle(conversation));
-  if (title === null) return;
 
   const revision = viewRevision;
+  busyAction.value = "正在重命名…";
   try {
     const response = await fetch(`/api/conversations/${conversation.id}`, {
       method: "PATCH",
@@ -512,17 +507,17 @@ async function renameConversation(): Promise<void> {
     if (isCurrentView(conversation.id, revision)) {
       requestError.value = error instanceof Error ? error.message : "网络或服务暂时不可用，请稍后重试。";
     }
+  } finally {
+    if (busyAction.value === "正在重命名…") busyAction.value = null;
   }
 }
 
 async function deleteSelectedConversation(): Promise<void> {
   const conversation = selectedConversation.value;
-  if (
-    conversation === undefined ||
-    !window.confirm(`确定删除“${conversationTitle(conversation)}”吗？历史消息将保留，但不会再显示此会话。`)
-  ) return;
+  if (conversation === undefined) return;
 
   const revision = viewRevision;
+  busyAction.value = "正在删除…";
   try {
     const response = await fetch(`/api/conversations/${conversation.id}`, { method: "DELETE" });
     if (!response.ok) throw new Error(errorMessage(await response.json()));
@@ -536,6 +531,8 @@ async function deleteSelectedConversation(): Promise<void> {
     if (isCurrentView(conversation.id, revision)) {
       requestError.value = error instanceof Error ? error.message : "网络或服务暂时不可用，请稍后重试。";
     }
+  } finally {
+    if (busyAction.value === "正在删除…") busyAction.value = null;
   }
 }
 
@@ -570,7 +567,7 @@ onBeforeUnmount(() => {
     <p
       v-if="memoryNotice"
       role="status"
-      class="absolute right-5 top-5 z-10 max-w-sm rounded-md border border-strong-border bg-surface px-3 py-2 text-sm text-body shadow-lg"
+      class="absolute right-5 top-16 z-10 max-w-sm rounded-md border border-strong-border bg-surface px-3 py-2 text-sm text-body shadow-lg md:top-5"
     >
       {{ memoryNotice }}
     </p>
@@ -616,7 +613,7 @@ onBeforeUnmount(() => {
     </section>
     <section
       v-else
-      class="min-w-0 flex-1 overflow-y-auto bg-workspace"
+      class="min-h-0 min-w-0 flex-1 overflow-y-auto bg-workspace lg:overflow-hidden"
     >
       <KnowledgePage @notice="showMemoryNotice" />
     </section>

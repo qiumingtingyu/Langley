@@ -14,7 +14,7 @@ type Chunk = { ordinal: number; content: string; heading_path: string[]; source_
 type ChunksResponse = { document_version_id: number; successful_chunk_max_chars: number | null; suggested_chunk_max_chars: number; chunk_count: number; offset: number; limit: number; chunks: Chunk[] };
 type RebuildResponse = { document_version_id: number; successful_chunk_max_chars: number; chunk_count: number; resulting_index_status: string };
 
-const CHUNK_PAGE_SIZE = 50;
+const CHUNK_PAGE_SIZE = 10;
 const INDEX_POLL_INTERVAL_MS = 5000;
 
 const emit = defineEmits<{ notice: [message: string] }>();
@@ -349,8 +349,8 @@ onBeforeUnmount(stopIndexPolling);
 </script>
 
 <template>
-  <section class="grid min-h-0 w-full grid-cols-1 bg-workspace lg:grid-cols-[15rem_minmax(0,1fr)]">
-    <aside class="flex min-h-0 flex-col border-b border-border bg-sidebar px-4 py-5 lg:border-b-0 lg:border-r">
+  <section class="min-h-0 w-full bg-workspace lg:grid lg:h-full lg:grid-cols-[15rem_minmax(0,1fr)]">
+    <aside class="flex min-h-0 flex-col border-b border-border bg-sidebar px-4 py-5 lg:overflow-y-auto lg:border-b-0 lg:border-r">
       <div class="mb-5 px-1">
         <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
           KNOWLEDGE
@@ -399,9 +399,9 @@ onBeforeUnmount(stopIndexPolling);
     </aside>
     <main
       v-if="selectedKnowledgeBaseId !== null"
-      class="min-w-0 space-y-6 px-5 py-7 sm:px-8 lg:px-10"
+      class="min-w-0 bg-workspace lg:min-h-0 lg:overflow-y-auto"
     >
-      <header class="border-b border-border pb-5">
+      <header class="border-b border-border px-5 py-7 sm:px-8 lg:sticky lg:top-0 lg:z-10 lg:bg-workspace lg:px-10">
         <div class="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
@@ -434,212 +434,273 @@ onBeforeUnmount(stopIndexPolling);
           </p>
         </div>
       </header>
-      <form
-        class="space-y-3 border-b border-border pb-6"
-        @submit.prevent="upload"
-      >
-        <h3 class="text-sm font-semibold text-foreground">
-          添加资料
-        </h3>
-        <p class="text-sm text-muted-foreground">
-          当前支持 Markdown 文件。
-        </p>
-        <label class="inline-flex cursor-pointer items-center rounded-sm border border-strong-border bg-surface px-3 py-2 text-sm font-medium text-body hover:bg-subtle focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring">选择文件<input
-          class="sr-only"
-          type="file"
-          accept=".md,text/markdown"
-          :disabled="uploading"
-          @change="chooseFile"
-        ></label>
-        <p class="break-all text-sm text-muted-foreground">
-          {{ selectedFile === null ? "未选择文件" : `已选择：${selectedFile.name}` }}
-        </p>
-        <label class="block text-sm text-body">文档名称（可编辑）<input
-          v-model="documentName"
-          class="mt-1 w-full rounded-sm border border-strong-border bg-surface px-2 py-1.5 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
-          maxlength="255"
-          :disabled="uploading"
-        ></label>
-        <Button
-          type="submit"
-          :disabled="uploading || selectedFile === null"
+      <div class="space-y-6 px-5 py-7 sm:px-8 lg:px-10">
+        <form
+          class="space-y-3 border-b border-border pb-6"
+          @submit.prevent="upload"
         >
-          {{ uploading ? "正在上传…" : "上传资料" }}
-        </Button>
-      </form>
-      <p
-        v-if="documents.length === 0 && !loading"
-        class="border border-dashed border-strong-border px-5 py-10 text-center text-sm text-muted-foreground"
-      >
-        这个知识库还没有文档。
-      </p>
-      <div
-        v-else
-        class="grid gap-6 lg:grid-cols-[minmax(12rem,0.75fr)_minmax(0,1.5fr)]"
-      >
-        <section class="min-w-0 space-y-1 border-b border-border pb-5 lg:border-b-0 lg:border-r lg:pb-0 lg:pr-5">
-          <h3 class="mb-3 font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-            DOCUMENTS
+          <h3 class="text-sm font-semibold text-foreground">
+            添加资料
           </h3>
-          <button
-            v-for="document in documents"
-            :key="document.id"
-            class="block w-full border-l-2 px-3 py-2.5 text-left"
-            :class="document.id === selectedDocumentId ? 'border-primary bg-subtle text-foreground' : 'border-transparent text-body hover:bg-subtle'"
-            @click="selectDocument(document.id); verifiedVersionId = null; verifiedAt = null"
-          >
-            <span class="block break-words font-medium">{{ document.name }}</span><span class="mt-1 block break-all text-xs text-muted-foreground">{{ document.source.filename }}</span>
-          </button>
-        </section>
-        <article
-          v-if="selectedDocument"
-          class="min-w-0 text-sm"
-        >
-          <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-            SELECTED DOCUMENT
+          <p class="text-sm text-muted-foreground">
+            当前支持 Markdown 文件。
           </p>
-          <h3 class="mt-1 break-words text-lg font-semibold text-foreground">
-            {{ selectedDocument.name }}
-          </h3>
-          <dl class="mt-4 grid gap-x-6 gap-y-2 text-sm text-body sm:grid-cols-2">
-            <div>
-              <dt class="inline">
-                上传时间：
-              </dt><dd class="inline">
-                {{ selectedDocument.source.created_at }}
-              </dd>
-            </div><div>
-              <dt class="inline">
-                文件：
-              </dt><dd class="inline">
-                {{ selectedDocument.source.filename }}
-              </dd>
-            </div><div>
-              <dt class="inline">
-                格式：
-              </dt><dd class="inline">
-                {{ sourceFormat(selectedDocument.source.media_type) }}
-              </dd>
-            </div><div>
-              <dt class="inline">
-                大小：
-              </dt><dd class="inline">
-                {{ selectedDocument.source.size_bytes }} bytes
-              </dd>
-            </div>
-          </dl>
-          <details class="mt-5 border-t border-border pt-3 text-body">
-            <summary class="cursor-pointer text-sm font-medium text-foreground">
-              来源与完整性
-            </summary>
-            <div class="mt-3 space-y-3">
-              <p class="break-all font-mono text-xs text-muted-foreground">
-                SHA-256 · {{ selectedDocument.source.sha256 }}
-              </p>
-              <Button
-                :disabled="verifying"
-                @click="verifySource"
+          <label class="inline-flex cursor-pointer items-center rounded-sm border border-strong-border bg-surface px-3 py-2 text-sm font-medium text-body hover:bg-subtle focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring">选择文件<input
+            class="sr-only"
+            type="file"
+            accept=".md,text/markdown"
+            :disabled="uploading"
+            @change="chooseFile"
+          ></label>
+          <p class="break-all text-sm text-muted-foreground">
+            {{ selectedFile === null ? "未选择文件" : `已选择：${selectedFile.name}` }}
+          </p>
+          <label class="block text-sm text-body">文档名称（可编辑）<input
+            v-model="documentName"
+            class="mt-1 w-full rounded-sm border border-strong-border bg-surface px-2 py-1.5 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
+            maxlength="255"
+            :disabled="uploading"
+          ></label>
+          <Button
+            type="submit"
+            :disabled="uploading || selectedFile === null"
+          >
+            {{ uploading ? "正在上传…" : "上传资料" }}
+          </Button>
+        </form>
+        <p
+          v-if="documents.length === 0 && !loading"
+          class="border border-dashed border-strong-border px-5 py-10 text-center text-sm text-muted-foreground"
+        >
+          这个知识库还没有文档。
+        </p>
+        <div
+          v-else
+          class="grid gap-6 lg:grid-cols-[minmax(12rem,0.75fr)_minmax(0,1.5fr)]"
+        >
+          <section class="min-w-0 space-y-1 border-b border-border pb-5 lg:border-b-0 lg:border-r lg:pb-0 lg:pr-5">
+            <h3 class="mb-3 font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
+              DOCUMENTS
+            </h3>
+            <button
+              v-for="document in documents"
+              :key="document.id"
+              class="block w-full border-l-2 px-3 py-2.5 text-left"
+              :class="document.id === selectedDocumentId ? 'border-primary bg-subtle text-foreground' : 'border-transparent text-body hover:bg-subtle'"
+              @click="selectDocument(document.id); verifiedVersionId = null; verifiedAt = null"
+            >
+              <span class="block break-words font-medium">{{ document.name }}</span><span class="mt-1 block break-all text-xs text-muted-foreground">{{ document.source.filename }}</span>
+            </button>
+          </section>
+          <article
+            v-if="selectedDocument"
+            class="min-w-0 text-sm"
+          >
+            <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
+              SELECTED DOCUMENT
+            </p>
+            <h3 class="mt-1 break-words text-lg font-semibold text-foreground">
+              {{ selectedDocument.name }}
+            </h3>
+            <dl class="mt-4 grid gap-x-6 gap-y-2 text-sm text-body sm:grid-cols-2">
+              <div>
+                <dt class="inline">
+                  上传时间：
+                </dt><dd class="inline">
+                  {{ selectedDocument.source.created_at }}
+                </dd>
+              </div><div>
+                <dt class="inline">
+                  文件：
+                </dt><dd class="inline">
+                  {{ selectedDocument.source.filename }}
+                </dd>
+              </div><div>
+                <dt class="inline">
+                  格式：
+                </dt><dd class="inline">
+                  {{ sourceFormat(selectedDocument.source.media_type) }}
+                </dd>
+              </div><div>
+                <dt class="inline">
+                  大小：
+                </dt><dd class="inline">
+                  {{ selectedDocument.source.size_bytes }} bytes
+                </dd>
+              </div>
+            </dl>
+            <details class="mt-5 border-t border-border pt-3 text-body">
+              <summary class="cursor-pointer text-sm font-medium text-foreground">
+                来源与完整性
+              </summary>
+              <div class="mt-3 space-y-3">
+                <p class="break-all font-mono text-xs text-muted-foreground">
+                  SHA-256 · {{ selectedDocument.source.sha256 }}
+                </p>
+                <Button
+                  :disabled="verifying"
+                  @click="verifySource"
+                >
+                  {{ verifying ? "正在验证…" : "验证原始文件" }}
+                </Button>
+                <p class="text-sm text-muted-foreground">
+                  原文件完整性：{{ verifiedVersionId === selectedDocument.source.document_version_id ? "刚刚验证通过" : "尚未验证" }}
+                </p>
+                <p
+                  v-if="verifiedAt && verifiedVersionId === selectedDocument.source.document_version_id"
+                  class="font-mono text-xs text-muted-foreground"
+                >
+                  {{ verifiedAt }}
+                </p>
+              </div>
+            </details>
+            <section class="mt-6 border-t border-border pt-5">
+              <h4 class="font-semibold text-foreground">
+                文档处理
+              </h4>
+              <p
+                v-if="successfulChunkMaxChars !== null"
+                class="mt-2 text-muted-foreground"
               >
-                {{ verifying ? "正在验证…" : "验证原始文件" }}
-              </Button>
-              <p class="text-sm text-muted-foreground">
-                原文件完整性：{{ verifiedVersionId === selectedDocument.source.document_version_id ? "刚刚验证通过" : "尚未验证" }}
+                当前分块配置：{{ successfulChunkMaxChars }}
               </p>
               <p
-                v-if="verifiedAt && verifiedVersionId === selectedDocument.source.document_version_id"
-                class="font-mono text-xs text-muted-foreground"
+                v-else-if="chunkCount === 0 && !chunksLoading"
+                class="mt-2 text-muted-foreground"
               >
-                {{ verifiedAt }}
+                尚未处理
               </p>
-            </div>
-          </details>
-          <section class="mt-6 border-t border-border pt-5">
-            <h4 class="font-semibold text-foreground">
-              文档处理
-            </h4>
-            <p
-              v-if="successfulChunkMaxChars !== null"
-              class="mt-2 text-muted-foreground"
-            >
-              当前分块配置：{{ successfulChunkMaxChars }}
-            </p>
-            <p
-              v-else-if="chunkCount === 0 && !chunksLoading"
-              class="mt-2 text-muted-foreground"
-            >
-              尚未处理
-            </p>
-            <p
-              v-else-if="!chunksLoading"
-              class="mt-2 text-warning-foreground"
-            >
-              当前切片配置未知，请重新处理文档。
-            </p>
-            <p
-              v-if="processingBlockedByIndex"
-              class="mt-2 text-warning-foreground"
-            >
-              正在建立索引，请等待完成后再重新处理文档。
-            </p>
-            <p
-              v-if="processingError"
-              role="alert"
-              class="mt-2 text-danger-foreground"
-            >
-              {{ processingError }}
-            </p>
-            <form
-              class="mt-3 flex flex-wrap items-end gap-3"
-              @submit.prevent="rebuildChunks"
-            >
-              <label class="block text-sm">
-                单个分块最大字符数
-                <span class="ml-1 font-mono text-[10px] text-muted-light">max_chunk_chars</span>
-                <input
-                  v-model="draftMaxChunkChars"
-                  class="mt-1 block w-40 rounded-sm border border-strong-border bg-surface p-2 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
-                  inputmode="numeric"
+              <p
+                v-else-if="!chunksLoading"
+                class="mt-2 text-warning-foreground"
+              >
+                当前切片配置未知，请重新处理文档。
+              </p>
+              <p
+                v-if="processingBlockedByIndex"
+                class="mt-2 text-warning-foreground"
+              >
+                正在建立索引，请等待完成后再重新处理文档。
+              </p>
+              <p
+                v-if="processingError"
+                role="alert"
+                class="mt-2 text-danger-foreground"
+              >
+                {{ processingError }}
+              </p>
+              <form
+                class="mt-3 flex flex-wrap items-end gap-3"
+                @submit.prevent="rebuildChunks"
+              >
+                <label class="block text-sm">
+                  单个分块最大字符数
+                  <span class="ml-1 font-mono text-[10px] text-muted-light">max_chunk_chars</span>
+                  <input
+                    v-model="draftMaxChunkChars"
+                    class="mt-1 block w-40 rounded-sm border border-strong-border bg-surface p-2 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
+                    inputmode="numeric"
+                    :disabled="processingPending || processingBlockedByIndex"
+                  >
+                </label>
+                <Button
+                  type="submit"
                   :disabled="processingPending || processingBlockedByIndex"
                 >
-              </label>
-              <Button
-                type="submit"
-                :disabled="processingPending || processingBlockedByIndex"
+                  {{ processingPending ? "处理中…" : successfulChunkMaxChars === null ? "处理文档" : "重新切片" }}
+                </Button>
+              </form>
+            </section>
+            <section class="mt-6 border-t border-border pt-5">
+              <div class="flex items-baseline justify-between gap-3">
+                <h4 class="font-semibold text-foreground">
+                  分块预览
+                </h4>
+              </div>
+              <p
+                v-if="chunksLoading"
+                class="mt-3 text-muted-foreground"
               >
-                {{ processingPending ? "处理中…" : successfulChunkMaxChars === null ? "处理文档" : "重新切片" }}
-              </Button>
-            </form>
-          </section>
-          <section class="mt-6 border-t border-border pt-5">
-            <div class="flex items-baseline justify-between gap-3">
-              <h4 class="font-semibold text-foreground">
-                分块预览
-              </h4>
-            </div>
-            <p
-              v-if="chunksLoading"
-              class="mt-3 text-muted-foreground"
-            >
-              正在读取分块…
-            </p>
-            <p
-              v-if="chunkLoadError"
-              role="alert"
-              class="mt-3 text-danger-foreground"
-            >
-              {{ chunkLoadError }}
-            </p>
-            <p
-              v-else-if="chunkCount === 0"
-              class="mt-3 text-muted-foreground"
-            >
-              暂无分块。
-            </p>
-            <div
-              v-else
-              class="mt-3 space-y-3"
-            >
-              <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
+                正在读取分块…
+              </p>
+              <p
+                v-if="chunkLoadError"
+                role="alert"
+                class="mt-3 text-danger-foreground"
+              >
+                {{ chunkLoadError }}
+              </p>
+              <p
+                v-else-if="chunkCount === 0"
+                class="mt-3 text-muted-foreground"
+              >
+                暂无分块。
+              </p>
+              <div
+                v-else
+                class="mt-3 space-y-3"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
+                  <p>共 {{ chunkCount }} 个分块 · {{ chunksRange }}</p>
+                  <div class="flex items-center gap-3">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="small"
+                      :disabled="chunksLoading || chunkOffset === 0"
+                      @click="previousChunkPage"
+                    >
+                      上一页
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="small"
+                      :disabled="chunksLoading || chunkOffset + chunks.length >= chunkCount"
+                      @click="nextChunkPage"
+                    >
+                      下一页
+                    </Button>
+                  </div>
+                </div>
+                <article
+                  v-for="chunk in chunks"
+                  :key="chunk.ordinal"
+                  class="border border-border bg-subtle p-3"
+                >
+                  <p class="font-medium text-foreground">
+                    #{{ chunk.ordinal }}
+                  </p>
+                  <p
+                    v-if="chunk.heading_path.length > 0"
+                    class="mt-1 text-xs text-muted-foreground"
+                  >
+                    当前位置：{{ chunk.heading_path.join(" › ") }}
+                  </p>
+                  <p class="mt-2 break-words whitespace-pre-wrap text-body">
+                    {{ expandedChunkOrdinals.includes(chunk.ordinal) ? chunk.content : `${chunk.content.slice(0, 240)}${chunk.content.length > 240 ? "…" : ""}` }}
+                  </p>
+                  <button
+                    class="mt-2 text-sm text-primary-deep underline underline-offset-2"
+                    type="button"
+                    @click="toggleChunk(chunk.ordinal)"
+                  >
+                    {{ expandedChunkOrdinals.includes(chunk.ordinal) ? "收起" : "展开" }}
+                  </button>
+                  <details class="mt-3 text-xs text-muted-foreground">
+                    <summary class="cursor-pointer">
+                      位置详情
+                    </summary>
+                    <p class="mt-1 break-all font-mono">
+                      {{ chunk.source_regions.map(sourceRegionText).join("；") }}
+                    </p>
+                  </details>
+                </article>
+              </div>
+              <div
+                v-if="chunkCount > 0"
+                class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"
+              >
                 <p>共 {{ chunkCount }} 个分块 · {{ chunksRange }}</p>
                 <div class="flex items-center gap-3">
                   <Button
@@ -662,68 +723,9 @@ onBeforeUnmount(stopIndexPolling);
                   </Button>
                 </div>
               </div>
-              <article
-                v-for="chunk in chunks"
-                :key="chunk.ordinal"
-                class="border border-border bg-subtle p-3"
-              >
-                <p class="font-medium text-foreground">
-                  #{{ chunk.ordinal }}
-                </p>
-                <p
-                  v-if="chunk.heading_path.length > 0"
-                  class="mt-1 text-xs text-muted-foreground"
-                >
-                  当前位置：{{ chunk.heading_path.join(" › ") }}
-                </p>
-                <p class="mt-2 break-words whitespace-pre-wrap text-body">
-                  {{ expandedChunkOrdinals.includes(chunk.ordinal) ? chunk.content : `${chunk.content.slice(0, 240)}${chunk.content.length > 240 ? "…" : ""}` }}
-                </p>
-                <button
-                  class="mt-2 text-sm text-primary-deep underline underline-offset-2"
-                  type="button"
-                  @click="toggleChunk(chunk.ordinal)"
-                >
-                  {{ expandedChunkOrdinals.includes(chunk.ordinal) ? "收起" : "展开" }}
-                </button>
-                <details class="mt-3 text-xs text-muted-foreground">
-                  <summary class="cursor-pointer">
-                    位置详情
-                  </summary>
-                  <p class="mt-1 break-all font-mono">
-                    {{ chunk.source_regions.map(sourceRegionText).join("；") }}
-                  </p>
-                </details>
-              </article>
-            </div>
-            <div
-              v-if="chunkCount > 0"
-              class="mt-4 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"
-            >
-              <p>共 {{ chunkCount }} 个分块 · {{ chunksRange }}</p>
-              <div class="flex items-center gap-3">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="small"
-                  :disabled="chunksLoading || chunkOffset === 0"
-                  @click="previousChunkPage"
-                >
-                  上一页
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="small"
-                  :disabled="chunksLoading || chunkOffset + chunks.length >= chunkCount"
-                  @click="nextChunkPage"
-                >
-                  下一页
-                </Button>
-              </div>
-            </div>
-          </section>
-        </article>
+            </section>
+          </article>
+        </div>
       </div>
     </main>
     <main
