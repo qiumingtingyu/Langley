@@ -50,11 +50,18 @@ class EmbeddingBaseline:
     representation: str
 
 
-_FROZEN_EMBEDDING_BASELINE = EmbeddingBaseline(
+_FROZEN_REFERENCE_EMBEDDING_BASELINE = EmbeddingBaseline(
     model="BAAI/bge-m3",
     revision="5617a9f61b028005a4858fdac845db406aefb181",
     dimension=1024,
     representation="content_only",
+)
+
+_FROZEN_PRODUCTION_EMBEDDING_BASELINE = EmbeddingBaseline(
+    model="BAAI/bge-m3",
+    revision="5617a9f61b028005a4858fdac845db406aefb181",
+    dimension=1024,
+    representation="source_context_v1",
 )
 
 
@@ -140,8 +147,6 @@ class PersistedDocument:
 
 @dataclass(frozen=True)
 class ReadyIndexFacts:
-    active_generation_id: str
-    active_chunk_snapshot_sha256: str
     active_embedding_model: str
     active_embedding_revision: str
     active_embedding_dimension: int
@@ -256,7 +261,7 @@ def _reference_embedding_baseline(payload: dict[str, Any]) -> EmbeddingBaseline:
             embedding.get("representation"), "reference embedding representation"
         ),
     )
-    if baseline != _FROZEN_EMBEDDING_BASELINE:
+    if baseline != _FROZEN_REFERENCE_EMBEDDING_BASELINE:
         raise ExperimentSetupError("reference embedding baseline mismatch")
     return baseline
 
@@ -600,7 +605,7 @@ def validate_ready_embedding_baseline(facts: ReadyIndexFacts) -> None:
         dimension=facts.active_embedding_dimension,
         representation=facts.active_embedding_representation,
     )
-    if observed != _FROZEN_EMBEDDING_BASELINE:
+    if observed != _FROZEN_PRODUCTION_EMBEDDING_BASELINE:
         raise ExperimentSetupError("READY embedding baseline mismatch")
 
 
@@ -632,8 +637,6 @@ async def read_ready_index_facts(
     if knowledge_base is None or knowledge_base.index_status != "READY":
         raise ExperimentExecutionError("READY facts unavailable")
     values = (
-        knowledge_base.active_generation_id,
-        knowledge_base.active_chunk_snapshot_sha256,
         knowledge_base.active_embedding_model,
         knowledge_base.active_embedding_revision,
         knowledge_base.active_embedding_dimension,
@@ -641,15 +644,11 @@ async def read_ready_index_facts(
     )
     if any(value is None for value in values):
         raise ExperimentExecutionError("READY facts incomplete")
-    assert isinstance(knowledge_base.active_generation_id, str)
-    assert isinstance(knowledge_base.active_chunk_snapshot_sha256, str)
     assert isinstance(knowledge_base.active_embedding_model, str)
     assert isinstance(knowledge_base.active_embedding_revision, str)
     assert isinstance(knowledge_base.active_embedding_dimension, int)
     assert isinstance(knowledge_base.active_embedding_representation, str)
     return ReadyIndexFacts(
-        active_generation_id=knowledge_base.active_generation_id,
-        active_chunk_snapshot_sha256=knowledge_base.active_chunk_snapshot_sha256,
         active_embedding_model=knowledge_base.active_embedding_model,
         active_embedding_revision=knowledge_base.active_embedding_revision,
         active_embedding_dimension=knowledge_base.active_embedding_dimension,
@@ -825,7 +824,6 @@ def run_production_parity(
         raise ExperimentExecutionError("READY facts reader is unavailable")
     validate_ready_embedding_baseline(ready_facts)
     production: dict[str, CaseTop5] = {}
-    generation_id: str | None = None
     for case in corpus.cases:
         response = client.post(
             f"/api/knowledge-bases/{knowledge_base_id}/retrieval",
@@ -834,22 +832,6 @@ def run_production_parity(
         if response.status_code != 200:
             raise ExperimentExecutionError("Task 5.2 retrieval route failed")
         payload = _execution_object(response.json(), "retrieval response")
-        observed_generation = _execution_string(
-            payload.get("generation_id"), "retrieval generation_id"
-        )
-        if generation_id is None:
-            generation_id = observed_generation
-        elif generation_id != observed_generation:
-            raise ExperimentExecutionError(
-                "retrieval generation changed during experiment"
-            )
-        if (
-            ready_facts is not None
-            and observed_generation != ready_facts.active_generation_id
-        ):
-            raise ExperimentExecutionError(
-                "retrieval generation differs from READY facts"
-            )
         hits = payload.get("hits")
         if not isinstance(hits, list) or not 1 <= len(hits) <= _TOP_K:
             raise ExperimentExecutionError("retrieval hit count invalid")
@@ -882,7 +864,6 @@ def run_production_parity(
         "eval_kb_id": knowledge_base_id,
         "index_job_id": job_id,
         "index_status": status.get("index_status"),
-        "active_generation_id": generation_id,
         "ready_index_facts": None if ready_facts is None else asdict(ready_facts),
         "embedding": (
             None
@@ -960,7 +941,7 @@ def render_result_markdown(result: dict[str, Any]) -> str:
     )
     embedding = _require_object(result.get("embedding"), "result embedding")
     qdrant = _require_object(result.get("qdrant"), "result qdrant")
-    ready = _require_object(result.get("ready_index_facts"), "result ready_index_facts")
+    _require_object(result.get("ready_index_facts"), "result ready_index_facts")
     lines = ["# Experiment #1 Production Dense Retrieval Regression / Parity", ""]
     lines.extend(
         [
@@ -982,8 +963,7 @@ def render_result_markdown(result: dict[str, Any]) -> str:
             "",
             f"- Source Parity: `{result['setup_parity']['source']}`",
             f"- Candidate Parity: `{result['setup_parity']['candidate']}`",
-            f"- READY generation: `{result['active_generation_id']}`",
-            f"- Active snapshot: `{ready['active_chunk_snapshot_sha256']}`",
+            "- READY projection: `dense_v2 / source_context_v1`",
             (
                 "- BGE model / revision / dimension / representation / device: "
                 f"`{embedding['model']}` / `{embedding['revision']}` / "

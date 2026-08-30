@@ -24,6 +24,7 @@ from langley.infrastructure.models import (
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
+    KnowledgeIndexJob,
     User,
 )
 from langley.knowledge.chunking import CandidateChunk, ChunkingConfig
@@ -41,10 +42,13 @@ from langley.knowledge.document_indexing import (
     DocumentIndexRuntime,
     claim_next_document_index_job,
     reconcile_interrupted_document_index_jobs,
+    seed_document_index_backlog,
 )
 from langley.knowledge.embedding_runtime import KnowledgeEmbeddingRuntime
+from langley.knowledge.index_build import IndexBuildAdmissionError, admit_index_build
 from langley.knowledge.pdf_processing import publish_pdf_processing_result
 from langley.knowledge.pdf_processing_result import PdfProcessingResult
+from langley.settings import Settings
 
 
 @pytest.fixture
@@ -71,11 +75,35 @@ async def _create_factory(database_url: str):
     return engine, create_session_factory(engine)
 
 
-async def _seed_user_and_base(factory) -> KnowledgeBase:
+async def _seed_user_and_fresh_base(factory) -> KnowledgeBase:
     async with factory() as session, session.begin():
         session.add(User(id=1, created_at=utc_now()))
     async with factory() as session:
-        return await create_knowledge_base(session, user_id=1, name="Task 3B")
+        base = await create_knowledge_base(session, user_id=1, name="Task 3C")
+    async with factory() as session:
+        stored = await session.get(KnowledgeBase, base.id)
+        assert stored is not None
+        assert stored.index_status == "CHUNKED"
+        assert (
+            stored.active_embedding_model,
+            stored.active_embedding_revision,
+            stored.active_embedding_dimension,
+            stored.active_embedding_representation,
+        ) == (None, None, None, None)
+    return base
+
+
+async def _seed_user_and_base(factory) -> KnowledgeBase:
+    base = await _seed_user_and_fresh_base(factory)
+    async with factory() as session, session.begin():
+        stored = await session.get(KnowledgeBase, base.id)
+        assert stored is not None
+        configuration = _configuration()
+        stored.active_embedding_model = configuration.model
+        stored.active_embedding_revision = configuration.revision
+        stored.active_embedding_dimension = configuration.dimension
+        stored.active_embedding_representation = configuration.representation
+    return base
 
 
 def test_markdown_publication_is_incremental_and_admission_is_revision_scoped(
@@ -122,8 +150,6 @@ def test_markdown_publication_is_incremental_and_admission_is_revision_scoped(
                         )
                     ).all()
                 )
-                knowledge_base.index_status = "READY"
-                knowledge_base.active_generation_id = "legacy-generation"
 
             same = await rebuild_document_version_chunks(
                 session_factory=factory,
@@ -161,7 +187,7 @@ def test_markdown_publication_is_incremental_and_admission_is_revision_scoped(
                     original_hash,
                 )
                 assert ids == original_ids
-                assert knowledge_base.index_status == "READY"
+                assert knowledge_base.index_status == "CHUNKED"
                 assert [(job.target_chunk_revision, job.status) for job in jobs] == [
                     (1, "PENDING")
                 ]
@@ -291,8 +317,6 @@ def test_pdf_publication_has_the_same_fingerprint_noop_semantics(
                         )
                     ).all()
                 )
-                knowledge_base.index_status = "READY"
-                knowledge_base.active_generation_id = "legacy-generation"
                 second = DocumentProcessingJob(
                     document_version_id=version.id,
                     attempt_no=2,
@@ -334,7 +358,7 @@ def test_pdf_publication_has_the_same_fingerprint_noop_semantics(
                 assert version.chunk_revision == 1
                 assert version.chunk_set_sha256 == original_hash
                 assert ids == original_ids
-                assert knowledge_base.index_status == "READY"
+                assert knowledge_base.index_status == "CHUNKED"
         finally:
             await dispose_database_engine(engine)
 
@@ -393,13 +417,13 @@ class _Runtime(DocumentIndexRuntime):
         return self.qdrant
 
 
-def test_success_sets_indexed_revision_and_revision_mismatch_fails_before_qdrant(
+def test_fresh_kb_first_index_initializes_contract_and_handles_revision_mismatch(
     migrated_database: str, tmp_path: Path
 ) -> None:
     async def scenario() -> None:
         engine, factory = await _create_factory(migrated_database)
         try:
-            base = await _seed_user_and_base(factory)
+            base = await _seed_user_and_fresh_base(factory)
             storage = LocalFileStorage(tmp_path / "runtime")
             version = await create_initial_document(
                 factory,
@@ -419,7 +443,7 @@ def test_success_sets_indexed_revision_and_revision_mismatch_fails_before_qdrant
                 config=ChunkingConfig(max_chunk_chars=64),
                 index_configuration=_configuration(),
             )
-            claim = await claim_next_document_index_job(factory)
+            claim = await claim_next_document_index_job(factory, _configuration())
             assert claim is not None
             qdrant = _FakeQdrant()
             runtime = _Runtime(factory, qdrant)
@@ -430,6 +454,21 @@ def test_success_sets_indexed_revision_and_revision_mismatch_fails_before_qdrant
                 assert stored is not None and job is not None
                 assert stored.indexed_chunk_revision == 1
                 assert (job.status, job.stage) == ("SUCCEEDED", "VERIFYING")
+                knowledge_base = await session.get(KnowledgeBase, base.id)
+                assert knowledge_base is not None
+                assert knowledge_base.index_status == "READY"
+                configuration = _configuration()
+                assert (
+                    knowledge_base.active_embedding_model,
+                    knowledge_base.active_embedding_revision,
+                    knowledge_base.active_embedding_dimension,
+                    knowledge_base.active_embedding_representation,
+                ) == (
+                    configuration.model,
+                    configuration.revision,
+                    configuration.dimension,
+                    configuration.representation,
+                )
             assert qdrant.upsert_count == 1
 
             already_indexed = await rebuild_document_version_chunks(
@@ -458,7 +497,7 @@ def test_success_sets_indexed_revision_and_revision_mismatch_fails_before_qdrant
                 config=ChunkingConfig(max_chunk_chars=20),
                 index_configuration=_configuration(),
             )
-            stale_claim = await claim_next_document_index_job(factory)
+            stale_claim = await claim_next_document_index_job(factory, _configuration())
             assert stale_claim is not None
             await rebuild_document_version_chunks(
                 session_factory=factory,
@@ -490,7 +529,9 @@ def test_success_sets_indexed_revision_and_revision_mismatch_fails_before_qdrant
                 assert any(job.target_chunk_revision == 3 for job in pending)
             assert qdrant.upsert_count == upserts_before
 
-            interrupted_claim = await claim_next_document_index_job(factory)
+            interrupted_claim = await claim_next_document_index_job(
+                factory, _configuration()
+            )
             assert interrupted_claim is not None
             repaired = await reconcile_interrupted_document_index_jobs(factory)
             assert interrupted_claim.job_id in repaired
@@ -503,6 +544,116 @@ def test_success_sets_indexed_revision_and_revision_mismatch_fails_before_qdrant
                     "INTERRUPTED",
                     "INDEX_INTERRUPTED",
                 )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(scenario())
+
+
+def test_startup_backlog_stale_claim_and_full_build_admission_are_serialized(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    async def scenario() -> None:
+        engine, factory = await _create_factory(migrated_database)
+        try:
+            base = await _seed_user_and_base(factory)
+            storage = LocalFileStorage(tmp_path / "backlog")
+            version = await create_initial_document(
+                factory,
+                storage,
+                user_id=1,
+                knowledge_base_id=base.id,
+                name="Backlog",
+                source_filename="backlog.md",
+                source_media_type="text/markdown",
+                source_bytes=b"# Backlog\ncurrent chunks\n",
+            )
+            await rebuild_document_version_chunks(
+                session_factory=factory,
+                file_storage=storage,
+                user_id=1,
+                document_version_id=version.id,
+                config=ChunkingConfig(max_chunk_chars=64),
+                index_configuration=_configuration(),
+            )
+            async with factory() as session, session.begin():
+                job = await session.scalar(select(DocumentIndexJob))
+                assert job is not None
+                job.embedding_model = "old-incompatible-model"
+
+            created = await seed_document_index_backlog(factory, _configuration())
+            assert len(created) == 1
+
+            async with factory() as session, session.begin():
+                knowledge_base = await session.get(KnowledgeBase, base.id)
+                assert knowledge_base is not None
+                knowledge_base.index_status = "STALE"
+            assert (
+                await claim_next_document_index_job(factory, _configuration()) is None
+            )
+
+            async with factory() as session, session.begin():
+                knowledge_base = await session.get(KnowledgeBase, base.id)
+                assert knowledge_base is not None
+                knowledge_base.index_status = "CHUNKED"
+            settings = Settings(
+                knowledge_embedding_model=_configuration().model,
+                knowledge_embedding_revision=_configuration().revision,
+                knowledge_embedding_dimension=_configuration().dimension,
+                qdrant_url=_configuration().qdrant_url,
+            )
+
+            async def admit() -> tuple[str, int | None]:
+                try:
+                    admitted = await admit_index_build(
+                        factory,
+                        user_id=1,
+                        knowledge_base_id=base.id,
+                        settings=settings,
+                    )
+                except IndexBuildAdmissionError as error:
+                    return error.code, None
+                return "ADMITTED", admitted.job_id
+
+            admission, claim = await asyncio.gather(
+                admit(), claim_next_document_index_job(factory, _configuration())
+            )
+            async with factory() as session:
+                document_jobs = tuple(
+                    (
+                        await session.scalars(
+                            select(DocumentIndexJob).order_by(DocumentIndexJob.id)
+                        )
+                    ).all()
+                )
+                full_jobs = tuple(
+                    (await session.scalars(select(KnowledgeIndexJob))).all()
+                )
+                knowledge_base = await session.get(KnowledgeBase, base.id)
+                assert knowledge_base is not None
+            if admission[0] == "ADMITTED":
+                assert admission[1] is not None
+                assert claim is None
+                assert all(job.status == "INTERRUPTED" for job in document_jobs)
+                assert all(
+                    job.error_code == "INDEX_INTERRUPTED" for job in document_jobs
+                )
+                assert len(full_jobs) == 1
+                assert full_jobs[0].status == "PENDING"
+                assert knowledge_base.index_status == "INDEXING"
+            else:
+                assert admission == ("KNOWLEDGE_BASE_DOCUMENTS_INDEXING", None)
+                assert claim is not None
+                assert any(
+                    job.id == claim.job_id and job.status == "RUNNING"
+                    for job in document_jobs
+                )
+                assert full_jobs == ()
+                assert knowledge_base.index_status == "CHUNKED"
+            assert not (
+                any(job.status == "RUNNING" for job in document_jobs)
+                and bool(full_jobs)
+            )
         finally:
             await dispose_database_engine(engine)
 

@@ -45,6 +45,7 @@ from langley.knowledge.document_indexing import (
     DocumentIndexDispatcher,
     DocumentIndexRuntime,
     reconcile_interrupted_document_index_jobs,
+    seed_document_index_backlog,
 )
 from langley.knowledge.document_processing import (
     reconcile_interrupted_document_processing_jobs,
@@ -326,6 +327,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await reconcile_stale_ready_index_configurations(
                 session_factory, settings=app.state.settings
             )
+            if document_index_dispatcher is not None:
+                await seed_document_index_backlog(
+                    session_factory, document_index_dispatcher.configuration
+                )
             if document_processing_dispatcher is not None:
                 document_processing_dispatcher.start()
             if document_index_dispatcher is not None:

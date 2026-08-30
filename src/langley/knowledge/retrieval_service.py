@@ -16,7 +16,7 @@ from langley.knowledge.retrieval import (
     IndexNotReadyError,
     KnowledgeBaseRetrievalNotFoundError,
     RetrievalError,
-    RetrievalGenerationChangedError,
+    RetrievalIndexChangedError,
     RetrievalResult,
     retrieve_dense,
     retrieve_reranked,
@@ -119,7 +119,7 @@ def _knowledge_search_error(error: RetrievalError) -> KnowledgeSearchError:
         return KnowledgeSearchError("KNOWLEDGE_SCOPE_UNAVAILABLE", retryable=False)
     if isinstance(error, IndexNotReadyError):
         return KnowledgeSearchError("KNOWLEDGE_INDEX_NOT_READY", retryable=False)
-    if isinstance(error, RetrievalGenerationChangedError):
+    if isinstance(error, RetrievalIndexChangedError):
         return KnowledgeSearchError("KNOWLEDGE_SEARCH_CHANGED", retryable=True)
     return KnowledgeSearchError("KNOWLEDGE_SEARCH_UNAVAILABLE", retryable=False)
 

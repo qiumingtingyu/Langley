@@ -9,7 +9,6 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 
 from langley.bootstrap import bootstrap_local_user
 from langley.infrastructure.database import (
@@ -177,20 +176,18 @@ def test_zero_chunk_success_and_index_status_transitions(
                 source_bytes=b"# Empty\n\n   \n",
             )
             expected = (
-                ("CHUNKED", None, "CHUNKED"),
-                ("READY", "generation-ready", "STALE"),
-                ("STALE", "generation-stale", "STALE"),
-                ("FAILED", None, "CHUNKED"),
-                ("FAILED", "generation-failed", "STALE"),
+                ("CHUNKED", "CHUNKED"),
+                ("READY", "CHUNKED"),
+                ("STALE", "STALE"),
+                ("FAILED", "FAILED"),
             )
-            for status, generation, resulting_status in expected:
+            for status, resulting_status in expected:
                 async with factory() as session, session.begin():
                     current = await session.get(
                         KnowledgeBase, base.id, with_for_update=True
                     )
                     assert current is not None
                     current.index_status = status
-                    current.active_generation_id = generation
                 result = await rebuild_document_version_chunks(
                     session_factory=factory,
                     file_storage=storage,
@@ -220,20 +217,18 @@ def test_zero_chunk_success_and_index_status_transitions(
 
 
 @pytest.mark.parametrize(
-    ("status", "active_generation_id", "expected_status"),
+    ("status", "expected_status"),
     [
-        ("READY", "active-ready", "STALE"),
-        ("STALE", "active-stale", "STALE"),
-        ("CHUNKED", None, "CHUNKED"),
-        ("FAILED", "active-failed", "STALE"),
-        ("FAILED", None, "CHUNKED"),
+        ("READY", "READY"),
+        ("STALE", "STALE"),
+        ("CHUNKED", "CHUNKED"),
+        ("FAILED", "FAILED"),
     ],
 )
 def test_upload_invalidates_current_index_readiness(
     migrated_database: str,
     tmp_path: Path,
     status: str,
-    active_generation_id: str | None,
     expected_status: str,
 ) -> None:
     async def scenario() -> None:
@@ -249,7 +244,6 @@ def test_upload_invalidates_current_index_readiness(
                 )
                 assert current is not None
                 current.index_status = status
-                current.active_generation_id = active_generation_id
             version = await create_initial_document(
                 factory,
                 storage,
@@ -267,7 +261,6 @@ def test_upload_invalidates_current_index_readiness(
                 assert persisted is not None
                 assert persisted.chunk_max_chars is None
                 assert current.index_status == expected_status
-                assert current.active_generation_id == active_generation_id
         finally:
             await dispose_database_engine(engine)
 
@@ -291,7 +284,6 @@ def test_indexing_rejects_upload_publication_without_document_facts(
                 )
                 assert current is not None
                 current.index_status = "INDEXING"
-                current.building_generation_id = "building"
             with pytest.raises(
                 DocumentAdmissionConflictError, match="KNOWLEDGE_BASE_INDEXING"
             ):
@@ -309,7 +301,6 @@ def test_indexing_rejects_upload_publication_without_document_facts(
                 current = await session.get(KnowledgeBase, base.id)
                 assert current is not None
                 assert current.index_status == "INDEXING"
-                assert current.building_generation_id == "building"
                 assert (await session.scalar(select(Document.id))) is None
                 assert (await session.scalar(select(DocumentVersion.id))) is None
         finally:
@@ -355,7 +346,6 @@ def test_indexing_and_failed_replacement_preserve_current_facts(
                 )
                 assert current is not None
                 current.index_status = "INDEXING"
-                current.building_generation_id = "building"
             with pytest.raises(DocumentRebuildConflictError):
                 await rebuild_document_version_chunks(
                     session_factory=factory,
@@ -383,7 +373,6 @@ def test_indexing_and_failed_replacement_preserve_current_facts(
                 )
                 assert current is not None
                 current.index_status = "CHUNKED"
-                current.building_generation_id = None
             duplicate_rows = _materialize_chunk_rows(
                 version.id,
                 (
@@ -391,7 +380,7 @@ def test_indexing_and_failed_replacement_preserve_current_facts(
                     CandidateChunk(1, "duplicate", (), (TextSpanRegion(1, 4),)),
                 ),
             )
-            with pytest.raises(IntegrityError):
+            with pytest.raises(ValueError, match="invalid chunk ordinal"):
                 await _replace_document_version_chunks(
                     session_factory=factory,
                     user_id=1,

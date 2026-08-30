@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import structlog
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.business_time import utc_now
@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 DOCUMENT_INDEX_COLLECTION = "langley_knowledge_dense_v2"
-# Migration-only dual representation: legacy v1 remains content_only until Task 3C.
 DOCUMENT_INDEX_REPRESENTATION = SOURCE_CONTEXT_V1
 _BATCH_SIZE = 64
 _ACTIVE_JOB_STATUSES = ("PENDING", "RUNNING")
@@ -117,6 +116,27 @@ async def publish_document_chunks(
 ) -> DocumentChunkPublicationResult:
     """Publish one candidate chunk set and admit only the necessary index work."""
 
+    if not prepared_rows:
+        changed = version.chunk_revision != 0 or version.chunk_set_sha256 is not None
+        if changed:
+            await session.execute(
+                delete(KnowledgeChunk).where(
+                    KnowledgeChunk.document_version_id == version.id
+                )
+            )
+            version.chunk_revision = 0
+            version.chunk_set_sha256 = None
+            version.indexed_chunk_revision = None
+        await refresh_knowledge_base_readiness(session, knowledge_base)
+        await session.flush()
+        return DocumentChunkPublicationResult(
+            document_version_id=version.id,
+            chunk_count=0,
+            index_status=knowledge_base.index_status,
+            changed=changed,
+            job_created=False,
+        )
+
     fingerprint = chunk_set_sha256(prepared_rows)
     changed = version.chunk_set_sha256 != fingerprint
     if changed:
@@ -128,9 +148,7 @@ async def publish_document_chunks(
         session.add_all(prepared_rows)
         version.chunk_revision += 1
         version.chunk_set_sha256 = fingerprint
-        knowledge_base.index_status = (
-            "STALE" if knowledge_base.active_generation_id is not None else "CHUNKED"
-        )
+        await refresh_knowledge_base_readiness(session, knowledge_base)
 
     job_created = False
     if version.indexed_chunk_revision != version.chunk_revision:
@@ -161,6 +179,10 @@ async def _ensure_document_index_job(
             DocumentIndexJob.document_version_id == version.id,
             DocumentIndexJob.target_chunk_revision == version.chunk_revision,
             DocumentIndexJob.status.in_(_ACTIVE_JOB_STATUSES),
+            DocumentIndexJob.embedding_model == configuration.model,
+            DocumentIndexJob.embedding_revision == configuration.revision,
+            DocumentIndexJob.embedding_dimension == configuration.dimension,
+            DocumentIndexJob.embedding_representation == configuration.representation,
         )
         .limit(1)
     )
@@ -194,40 +216,131 @@ async def _ensure_document_index_job(
 
 async def claim_next_document_index_job(
     session_factory: async_sessionmaker[AsyncSession],
+    configuration: DocumentIndexConfiguration | None = None,
 ) -> DocumentIndexClaim | None:
-    """Claim the oldest PENDING attempt in one short MySQL transaction."""
+    """Claim with KnowledgeBase-first locking against full-build admission."""
 
     async with session_factory() as session, session.begin():
-        job = await session.scalar(
-            select(DocumentIndexJob)
-            .where(DocumentIndexJob.status == "PENDING")
+        statement = (
+            select(
+                DocumentIndexJob.id,
+                KnowledgeBase.id.label("knowledge_base_id"),
+                KnowledgeBase.user_id,
+            )
+            .join(
+                DocumentVersion,
+                DocumentVersion.id == DocumentIndexJob.document_version_id,
+            )
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+            .where(
+                DocumentIndexJob.status == "PENDING",
+                KnowledgeBase.index_status.in_(("CHUNKED", "READY")),
+            )
             .order_by(DocumentIndexJob.id.asc())
             .limit(1)
-            .with_for_update(skip_locked=True)
         )
-        if job is None:
-            return None
-        ownership = (
-            await session.execute(
-                select(KnowledgeBase.id, KnowledgeBase.user_id)
-                .join(Document, Document.knowledge_base_id == KnowledgeBase.id)
-                .join(DocumentVersion, DocumentVersion.document_id == Document.id)
-                .where(DocumentVersion.id == job.document_version_id)
+        if configuration is not None:
+            statement = statement.where(
+                DocumentIndexJob.embedding_model == configuration.model,
+                DocumentIndexJob.embedding_revision == configuration.revision,
+                DocumentIndexJob.embedding_dimension == configuration.dimension,
+                DocumentIndexJob.embedding_representation
+                == configuration.representation,
             )
-        ).one()
+        candidate = (await session.execute(statement)).one_or_none()
+        if candidate is None:
+            return None
+        knowledge_base = await session.get(
+            KnowledgeBase, candidate.knowledge_base_id, with_for_update=True
+        )
+        if knowledge_base is None or knowledge_base.index_status not in {
+            "CHUNKED",
+            "READY",
+        }:
+            return None
+        job = await session.get(DocumentIndexJob, candidate.id, with_for_update=True)
+        if job is None or job.status != "PENDING":
+            return None
         mark_document_index_running(job, now=utc_now())
         return DocumentIndexClaim(
             job_id=job.id,
             document_version_id=job.document_version_id,
             attempt_no=job.attempt_no,
             target_chunk_revision=job.target_chunk_revision,
-            knowledge_base_id=ownership.id,
-            user_id=ownership.user_id,
+            knowledge_base_id=knowledge_base.id,
+            user_id=knowledge_base.user_id,
             model=job.embedding_model,
             revision=job.embedding_revision,
             dimension=job.embedding_dimension,
             representation=job.embedding_representation,
         )
+
+
+async def seed_document_index_backlog(
+    session_factory: async_sessionmaker[AsyncSession],
+    configuration: DocumentIndexConfiguration,
+) -> tuple[int, ...]:
+    """Seed current-config work for every non-ready current document revision."""
+
+    async with session_factory() as session, session.begin():
+        versions = tuple(
+            (
+                await session.scalars(
+                    select(DocumentVersion)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+                    .where(
+                        DocumentVersion.chunk_revision > 0,
+                        or_(
+                            DocumentVersion.indexed_chunk_revision.is_(None),
+                            DocumentVersion.indexed_chunk_revision
+                            != DocumentVersion.chunk_revision,
+                        ),
+                        KnowledgeBase.index_status.in_(("CHUNKED", "READY")),
+                    )
+                    .order_by(DocumentVersion.id)
+                )
+            ).all()
+        )
+        created_ids: list[int] = []
+        for version in versions:
+            if await _ensure_document_index_job(
+                session, version=version, configuration=configuration
+            ):
+                await session.flush()
+                job_id = await session.scalar(
+                    select(func.max(DocumentIndexJob.id)).where(
+                        DocumentIndexJob.document_version_id == version.id
+                    )
+                )
+                assert job_id is not None
+                created_ids.append(job_id)
+        return tuple(created_ids)
+
+
+async def refresh_knowledge_base_readiness(
+    session: AsyncSession, knowledge_base: KnowledgeBase
+) -> None:
+    """Adjust only CHUNKED/READY from current document revision authority."""
+
+    if knowledge_base.index_status not in {"CHUNKED", "READY"}:
+        return
+    await session.flush()
+    ready_exists = (
+        await session.scalar(
+            select(DocumentVersion.id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(
+                Document.knowledge_base_id == knowledge_base.id,
+                DocumentVersion.chunk_revision > 0,
+                DocumentVersion.indexed_chunk_revision
+                == DocumentVersion.chunk_revision,
+            )
+            .limit(1)
+        )
+    ) is not None
+    knowledge_base.index_status = "READY" if ready_exists else "CHUNKED"
 
 
 async def reconcile_interrupted_document_index_jobs(
@@ -430,7 +543,11 @@ class DocumentIndexRuntime:
     async def _publication_barrier(
         self, claim: DocumentIndexClaim, expected_chunk_set_sha256: str
     ) -> None:
+        configuration_changed = False
         async with self._session_factory() as session, session.begin():
+            knowledge_base = await session.get(
+                KnowledgeBase, claim.knowledge_base_id, with_for_update=True
+            )
             job = await session.get(
                 DocumentIndexJob, claim.job_id, with_for_update=True
             )
@@ -438,7 +555,9 @@ class DocumentIndexRuntime:
                 DocumentVersion, claim.document_version_id, with_for_update=True
             )
             if (
-                not _job_matches_claim(job, claim, stage="EMBEDDING")
+                knowledge_base is None
+                or knowledge_base.index_status not in {"CHUNKED", "READY"}
+                or not _job_matches_claim(job, claim, stage="EMBEDDING")
                 or version is None
                 or version.chunk_revision != claim.target_chunk_revision
                 or version.chunk_set_sha256 != expected_chunk_set_sha256
@@ -449,8 +568,29 @@ class DocumentIndexRuntime:
                 )
             self._require_configuration(claim)
             assert job is not None
-            version.indexed_chunk_revision = None
-            job.stage = "PUBLISHING"
+            if not _knowledge_base_uses_configuration(
+                knowledge_base, self._configuration
+            ):
+                initialized = await _initialize_fresh_knowledge_base_configuration(
+                    session,
+                    knowledge_base=knowledge_base,
+                    configuration=self._configuration,
+                )
+                if not initialized:
+                    if await _ready_document_version_exists(
+                        session, knowledge_base_id=knowledge_base.id
+                    ):
+                        knowledge_base.index_status = "STALE"
+                    configuration_changed = True
+            if not configuration_changed:
+                version.indexed_chunk_revision = None
+                job.stage = "PUBLISHING"
+                await refresh_knowledge_base_readiness(session, knowledge_base)
+        if configuration_changed:
+            raise DocumentIndexFailure(
+                "INDEX_CONFIGURATION_CHANGED",
+                _safe_error_message("INDEX_CONFIGURATION_CHANGED"),
+            )
 
     async def _advance_to_verifying(
         self, claim: DocumentIndexClaim, expected_chunk_set_sha256: str
@@ -480,6 +620,9 @@ class DocumentIndexRuntime:
         self, claim: DocumentIndexClaim, expected_chunk_set_sha256: str
     ) -> None:
         async with self._session_factory() as session, session.begin():
+            knowledge_base = await session.get(
+                KnowledgeBase, claim.knowledge_base_id, with_for_update=True
+            )
             job = await session.get(
                 DocumentIndexJob, claim.job_id, with_for_update=True
             )
@@ -487,7 +630,12 @@ class DocumentIndexRuntime:
                 DocumentVersion, claim.document_version_id, with_for_update=True
             )
             if (
-                not _job_matches_claim(job, claim, stage="VERIFYING")
+                knowledge_base is None
+                or knowledge_base.index_status not in {"CHUNKED", "READY"}
+                or not _knowledge_base_uses_configuration(
+                    knowledge_base, self._configuration
+                )
+                or not _job_matches_claim(job, claim, stage="VERIFYING")
                 or version is None
                 or version.chunk_revision != claim.target_chunk_revision
                 or version.chunk_set_sha256 != expected_chunk_set_sha256
@@ -501,6 +649,7 @@ class DocumentIndexRuntime:
             version.indexed_chunk_revision = claim.target_chunk_revision
             job.status = "SUCCEEDED"
             job.finished_at = utc_now()
+            await refresh_knowledge_base_readiness(session, knowledge_base)
 
     def _require_configuration(self, claim: DocumentIndexClaim) -> None:
         if (
@@ -687,7 +836,9 @@ class DocumentIndexDispatcher:
     async def _run(self) -> None:
         while True:
             try:
-                claim = await claim_next_document_index_job(self._session_factory)
+                claim = await claim_next_document_index_job(
+                    self._session_factory, self.configuration
+                )
                 if claim is not None:
                     await self._runtime.execute(claim)
                     continue
@@ -730,3 +881,63 @@ def _job_matches_claim(
         and job.embedding_dimension == claim.dimension
         and job.embedding_representation == claim.representation
     )
+
+
+def _knowledge_base_uses_configuration(
+    knowledge_base: KnowledgeBase, configuration: DocumentIndexConfiguration
+) -> bool:
+    return (
+        knowledge_base.active_embedding_model == configuration.model
+        and knowledge_base.active_embedding_revision == configuration.revision
+        and knowledge_base.active_embedding_dimension == configuration.dimension
+        and knowledge_base.active_embedding_representation
+        == configuration.representation
+    )
+
+
+async def _initialize_fresh_knowledge_base_configuration(
+    session: AsyncSession,
+    *,
+    knowledge_base: KnowledgeBase,
+    configuration: DocumentIndexConfiguration,
+) -> bool:
+    if (
+        knowledge_base.index_status != "CHUNKED"
+        or configuration.representation != DOCUMENT_INDEX_REPRESENTATION
+        or any(
+            value is not None
+            for value in (
+                knowledge_base.active_embedding_model,
+                knowledge_base.active_embedding_revision,
+                knowledge_base.active_embedding_dimension,
+                knowledge_base.active_embedding_representation,
+            )
+        )
+        or await _ready_document_version_exists(
+            session, knowledge_base_id=knowledge_base.id
+        )
+    ):
+        return False
+    knowledge_base.active_embedding_model = configuration.model
+    knowledge_base.active_embedding_revision = configuration.revision
+    knowledge_base.active_embedding_dimension = configuration.dimension
+    knowledge_base.active_embedding_representation = configuration.representation
+    return True
+
+
+async def _ready_document_version_exists(
+    session: AsyncSession, *, knowledge_base_id: int
+) -> bool:
+    return (
+        await session.scalar(
+            select(DocumentVersion.id)
+            .join(Document, Document.id == DocumentVersion.document_id)
+            .where(
+                Document.knowledge_base_id == knowledge_base_id,
+                DocumentVersion.chunk_revision > 0,
+                DocumentVersion.indexed_chunk_revision
+                == DocumentVersion.chunk_revision,
+            )
+            .limit(1)
+        )
+    ) is not None

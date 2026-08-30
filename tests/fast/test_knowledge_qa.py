@@ -221,9 +221,7 @@ def test_flow_rejects_provider_tool_completion() -> None:
                 "query": "question",
                 "top_k": 5,
             }
-            return RetrievalResult(
-                knowledge_base_id=1, generation_id="generation", hits=(_hit(1),)
-            )
+            return RetrievalResult(knowledge_base_id=1, hits=(_hit(1),))
 
     provider = FakeProvider(
         [
@@ -257,9 +255,7 @@ def test_flow_keeps_run_local_token_out_of_delta_surface(
 ) -> None:
     class FakeRetrievalService:
         async def search(self, **kwargs: object) -> RetrievalResult:
-            return RetrievalResult(
-                knowledge_base_id=1, generation_id="generation", hits=(_hit(1),)
-            )
+            return RetrievalResult(knowledge_base_id=1, hits=(_hit(1),))
 
     monkeypatch.setattr(
         knowledge_qa, "new_abstention_control_token", lambda: _CURRENT_TOKEN

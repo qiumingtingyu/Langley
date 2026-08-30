@@ -6,7 +6,6 @@ from datetime import datetime
 from hashlib import sha256
 from math import isfinite
 from typing import TYPE_CHECKING
-from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -14,12 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from langley.business_time import utc_now
 from langley.infrastructure.models import (
     Document,
+    DocumentIndexJob,
     DocumentProcessingJob,
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeIndexJob,
 )
+from langley.knowledge.document_index_contract import build_source_context_v1
 from langley.knowledge.embedding_runtime import (
     KnowledgeEmbeddingError,
     KnowledgeEmbeddingRuntime,
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from langley.settings import Settings
 
 
-COLLECTION_NAME = "langley_knowledge_dense_v1"
+COLLECTION_NAME = "langley_knowledge_dense_v2"
 _BATCH_SIZE = 64
 
 
@@ -62,6 +63,9 @@ class IndexChunk:
     id: int
     document_version_id: int
     content: str
+    heading_path: tuple[str, ...]
+    chunk_revision: int
+    chunk_set_sha256: str
 
 
 @dataclass(frozen=True)
@@ -75,7 +79,6 @@ class DenseSearchHit:
 @dataclass(frozen=True)
 class IndexBuildAdmission:
     job_id: int
-    generation_id: str
 
 
 @dataclass(frozen=True)
@@ -100,12 +103,16 @@ class IndexStatusRead:
 
 def _snapshot_sha256(chunks: tuple[IndexChunk, ...]) -> str:
     digest = sha256()
-    for chunk in sorted(
-        chunks, key=lambda value: (value.id, value.document_version_id)
-    ):
-        digest.update(f"{chunk.id}:{chunk.document_version_id}:".encode("ascii"))
-        digest.update(sha256(chunk.content.encode("utf-8")).hexdigest().encode("ascii"))
-        digest.update(b"\n")
+    documents = {
+        (chunk.document_version_id, chunk.chunk_revision, chunk.chunk_set_sha256)
+        for chunk in chunks
+    }
+    for document_version_id, chunk_revision, chunk_set_sha256 in sorted(documents):
+        digest.update(
+            f"{document_version_id}:{chunk_revision}:{chunk_set_sha256}\n".encode(
+                "ascii"
+            )
+        )
     return digest.hexdigest()
 
 
@@ -140,12 +147,20 @@ async def _current_chunks(
                 KnowledgeChunk.id,
                 KnowledgeChunk.document_version_id,
                 KnowledgeChunk.content,
+                KnowledgeChunk.heading_path,
+                DocumentVersion.chunk_revision,
+                DocumentVersion.chunk_set_sha256,
             )
         )
     ).all()
     return tuple(
         IndexChunk(
-            id=row.id, document_version_id=row.document_version_id, content=row.content
+            id=row.id,
+            document_version_id=row.document_version_id,
+            content=row.content,
+            heading_path=tuple(row.heading_path),
+            chunk_revision=row.chunk_revision,
+            chunk_set_sha256=row.chunk_set_sha256,
         )
         for row in rows
     )
@@ -170,7 +185,7 @@ async def admit_index_build(
     knowledge_base_id: int,
     settings: "Settings",
 ) -> IndexBuildAdmission:
-    """Atomically admit one manual generation without doing slow work."""
+    """Serialize full-build admission against processing and document claims."""
 
     async with session_factory() as session:
         async with session.begin():
@@ -186,6 +201,40 @@ async def admit_index_build(
                 raise IndexBuildAdmissionError("KNOWLEDGE_BASE_NOT_FOUND")
             if knowledge_base.index_status == "INDEXING":
                 raise IndexBuildAdmissionError("INDEX_BUILD_IN_PROGRESS")
+            running_document_index_id = await session.scalar(
+                select(DocumentIndexJob.id)
+                .join(
+                    DocumentVersion,
+                    DocumentVersion.id == DocumentIndexJob.document_version_id,
+                )
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    DocumentIndexJob.status == "RUNNING",
+                )
+                .limit(1)
+            )
+            if running_document_index_id is not None:
+                raise IndexBuildAdmissionError("KNOWLEDGE_BASE_DOCUMENTS_INDEXING")
+            pending_document_index_jobs = (
+                await session.scalars(
+                    select(DocumentIndexJob)
+                    .join(
+                        DocumentVersion,
+                        DocumentVersion.id == DocumentIndexJob.document_version_id,
+                    )
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        Document.knowledge_base_id == knowledge_base_id,
+                        DocumentIndexJob.status == "PENDING",
+                    )
+                    .order_by(DocumentIndexJob.id)
+                    .with_for_update()
+                )
+            ).all()
+            superseded_at = utc_now()
+            for pending_job in pending_document_index_jobs:
+                _interrupt_pending_document_index_job(pending_job, now=superseded_at)
             active_processing_id = await session.scalar(
                 select(DocumentProcessingJob.id)
                 .join(
@@ -217,10 +266,8 @@ async def admit_index_build(
             if not chunks:
                 raise IndexBuildAdmissionError("KNOWLEDGE_BASE_NOT_CHUNKED")
             now = utc_now()
-            generation_id = str(uuid4())
             job = KnowledgeIndexJob(
                 knowledge_base_id=knowledge_base_id,
-                generation_id=generation_id,
                 status="PENDING",
                 stage=None,
                 processed_chunk_count=0,
@@ -237,10 +284,9 @@ async def admit_index_build(
                 finished_at=None,
             )
             knowledge_base.index_status = "INDEXING"
-            knowledge_base.building_generation_id = generation_id
             session.add(job)
             await session.flush()
-            return IndexBuildAdmission(job_id=job.id, generation_id=generation_id)
+            return IndexBuildAdmission(job_id=job.id)
 
 
 async def read_index_status(
@@ -306,9 +352,8 @@ async def reconcile_interrupted_index_builds(
                 )
                 if (
                     knowledge_base is not None
-                    and knowledge_base.building_generation_id == job.generation_id
+                    and knowledge_base.index_status == "INDEXING"
                 ):
-                    knowledge_base.building_generation_id = None
                     knowledge_base.index_status = "FAILED"
             return tuple(job.id for job in jobs)
 
@@ -323,25 +368,100 @@ async def reconcile_stale_ready_index_configurations(
             knowledge_bases = (
                 await session.scalars(
                     select(KnowledgeBase)
-                    .where(KnowledgeBase.index_status == "READY")
+                    .where(KnowledgeBase.index_status.in_(("CHUNKED", "READY")))
                     .with_for_update()
                 )
             ).all()
             stale_ids: list[int] = []
+            interrupted_at = utc_now()
             for knowledge_base in knowledge_bases:
-                if (
+                ready_version_id = await session.scalar(
+                    select(DocumentVersion.id)
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        Document.knowledge_base_id == knowledge_base.id,
+                        DocumentVersion.chunk_revision > 0,
+                        DocumentVersion.indexed_chunk_revision
+                        == DocumentVersion.chunk_revision,
+                    )
+                    .limit(1)
+                )
+                configuration_matches = (
                     knowledge_base.active_embedding_model
-                    != settings.knowledge_embedding_model
-                    or knowledge_base.active_embedding_revision
-                    != settings.knowledge_embedding_revision
-                    or knowledge_base.active_embedding_dimension
-                    != settings.knowledge_embedding_dimension
-                    or knowledge_base.active_embedding_representation
-                    != settings.knowledge_embedding_representation
-                ):
+                    == settings.knowledge_embedding_model
+                    and knowledge_base.active_embedding_revision
+                    == settings.knowledge_embedding_revision
+                    and knowledge_base.active_embedding_dimension
+                    == settings.knowledge_embedding_dimension
+                    and knowledge_base.active_embedding_representation
+                    == settings.knowledge_embedding_representation
+                )
+                if ready_version_id is not None and not configuration_matches:
                     knowledge_base.index_status = "STALE"
                     stale_ids.append(knowledge_base.id)
+                    pending_jobs = (
+                        await session.scalars(
+                            select(DocumentIndexJob)
+                            .join(
+                                DocumentVersion,
+                                DocumentVersion.id
+                                == DocumentIndexJob.document_version_id,
+                            )
+                            .join(Document, Document.id == DocumentVersion.document_id)
+                            .where(
+                                Document.knowledge_base_id == knowledge_base.id,
+                                DocumentIndexJob.status == "PENDING",
+                            )
+                            .order_by(DocumentIndexJob.id)
+                            .with_for_update()
+                        )
+                    ).all()
+                    for pending_job in pending_jobs:
+                        if not _document_index_job_uses_settings(
+                            pending_job, settings=settings
+                        ):
+                            _interrupt_pending_document_index_job(
+                                pending_job, now=interrupted_at
+                            )
+                elif ready_version_id is not None:
+                    knowledge_base.index_status = "READY"
+                else:
+                    knowledge_base.index_status = "CHUNKED"
+                    knowledge_base.active_embedding_model = (
+                        settings.knowledge_embedding_model
+                    )
+                    knowledge_base.active_embedding_revision = (
+                        settings.knowledge_embedding_revision
+                    )
+                    knowledge_base.active_embedding_dimension = (
+                        settings.knowledge_embedding_dimension
+                    )
+                    knowledge_base.active_embedding_representation = (
+                        settings.knowledge_embedding_representation
+                    )
             return tuple(stale_ids)
+
+
+def _interrupt_pending_document_index_job(
+    job: DocumentIndexJob, *, now: datetime
+) -> None:
+    if job.status != "PENDING":
+        return
+    job.status = "INTERRUPTED"
+    job.error_code = "INDEX_INTERRUPTED"
+    job.error_message = "整库索引重建取代了尚未开始的文档索引任务。"
+    job.finished_at = now
+
+
+def _document_index_job_uses_settings(
+    job: DocumentIndexJob, *, settings: "Settings"
+) -> bool:
+    return (
+        job.embedding_model == settings.knowledge_embedding_model
+        and job.embedding_revision == settings.knowledge_embedding_revision
+        and job.embedding_dimension == settings.knowledge_embedding_dimension
+        and job.embedding_representation == settings.knowledge_embedding_representation
+    )
 
 
 class KnowledgeIndexBuildRuntime:
@@ -378,23 +498,62 @@ class KnowledgeIndexBuildRuntime:
     async def run(self, job_id: int) -> None:
         """Run an admitted job, always persisting a terminal outcome."""
 
+        barrier_crossed = False
         async with self._capacity:
             try:
                 await self._mark_running(job_id)
                 job, chunks = await self._load_snapshot(job_id)
                 vectors = await self._embed(job, chunks)
                 await self._upload(job, chunks, vectors)
+                barrier_crossed = True
                 await self._verify(job)
                 await self._activate(job)
             except IndexBuildFailure as error:
+                if barrier_crossed:
+                    await self._cleanup_projection(job_id)
                 await self._fail(job_id, error)
             except Exception:
+                if barrier_crossed:
+                    await self._cleanup_projection(job_id)
                 await self._fail(
                     job_id,
                     IndexBuildFailure(
                         "INDEX_BUILD_FAILED", "索引建立失败，请检查本地索引服务后重试。"
                     ),
                 )
+
+    async def _cleanup_projection(self, job_id: int) -> None:
+        client = None
+        try:
+            async with self._session_factory() as session:
+                job = await session.get(KnowledgeIndexJob, job_id)
+                if job is None:
+                    return
+                knowledge_base = await session.get(KnowledgeBase, job.knowledge_base_id)
+                if knowledge_base is None:
+                    return
+                user_id = knowledge_base.user_id
+            from qdrant_client.http import models as qmodels
+
+            client = await self._qdrant_client()
+            await client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=qmodels.FilterSelector(
+                    filter=self._scope_filter(
+                        user_id=user_id,
+                        knowledge_base_id=job.knowledge_base_id,
+                    )
+                ),
+                wait=True,
+            )
+        except Exception:
+            return
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception:
+                    pass
 
     async def _mark_running(self, job_id: int) -> None:
         async with self._session_factory() as session:
@@ -428,12 +587,17 @@ class KnowledgeIndexBuildRuntime:
         self, job: KnowledgeIndexJob, chunks: tuple[IndexChunk, ...]
     ) -> list[list[float]]:
         await self._update_stage(job.id, "EMBEDDING")
-        if job.embedding_representation != "content_only":
+        if job.embedding_representation != "source_context_v1":
             raise IndexBuildFailure(
                 "EMBEDDING_REPRESENTATION_UNSUPPORTED", "嵌入表示配置不受支持。"
             )
         vectors = await asyncio.to_thread(
-            self._encode_documents, [chunk.content for chunk in chunks], job
+            self._encode_documents,
+            [
+                build_source_context_v1(chunk.content, chunk.heading_path)
+                for chunk in chunks
+            ],
+            job,
         )
         if len(vectors) != len(chunks):
             raise IndexBuildFailure("EMBEDDING_COUNT_MISMATCH", "嵌入结果不完整。")
@@ -468,7 +632,7 @@ class KnowledgeIndexBuildRuntime:
     ) -> list[float]:
         """Encode one exact query using the active generation's BGE configuration."""
 
-        if representation != "content_only":
+        if representation != "source_context_v1":
             raise IndexBuildFailure(
                 "EMBEDDING_REPRESENTATION_UNSUPPORTED", "嵌入表示配置不受支持。"
             )
@@ -503,17 +667,32 @@ class KnowledgeIndexBuildRuntime:
 
         return AsyncQdrantClient(url=self._settings.qdrant_url)
 
+    @staticmethod
+    def _scope_filter(*, user_id: int, knowledge_base_id: int):
+        from qdrant_client.http import models as qmodels
+
+        return qmodels.Filter(
+            must=[
+                qmodels.FieldCondition(
+                    key="user_id", match=qmodels.MatchValue(value=user_id)
+                ),
+                qmodels.FieldCondition(
+                    key="knowledge_base_id",
+                    match=qmodels.MatchValue(value=knowledge_base_id),
+                ),
+            ]
+        )
+
     async def search_dense(
         self,
         query_vector: list[float],
         *,
         user_id: int,
         knowledge_base_id: int,
-        generation_id: str,
         top_k: int,
         dimension: int,
     ) -> tuple[DenseSearchHit, ...]:
-        """Search one active dense generation with its complete ownership filter."""
+        """Search dense-v2 candidates using ownership scope only."""
 
         from qdrant_client.http import models as qmodels
 
@@ -531,10 +710,6 @@ class KnowledgeIndexBuildRuntime:
                         qmodels.FieldCondition(
                             key="knowledge_base_id",
                             match=qmodels.MatchValue(value=knowledge_base_id),
-                        ),
-                        qmodels.FieldCondition(
-                            key="generation_id",
-                            match=qmodels.MatchValue(value=generation_id),
                         ),
                     ]
                 ),
@@ -607,15 +782,54 @@ class KnowledgeIndexBuildRuntime:
     ) -> None:
         from qdrant_client.http import models as qmodels
 
-        await self._update_stage(job.id, "UPLOADING_INDEX")
-        async with self._session_factory() as session:
-            knowledge_base = await session.get(KnowledgeBase, job.knowledge_base_id)
-            if knowledge_base is None:
-                raise IndexBuildFailure("KNOWLEDGE_BASE_NOT_FOUND", "知识库不存在。")
+        async with self._session_factory() as session, session.begin():
+            current_job = await session.get(
+                KnowledgeIndexJob, job.id, with_for_update=True
+            )
+            knowledge_base = await session.get(
+                KnowledgeBase, job.knowledge_base_id, with_for_update=True
+            )
+            current_chunks = await _current_chunks(session, job.knowledge_base_id)
+            if (
+                current_job is None
+                or current_job.status != "RUNNING"
+                or knowledge_base is None
+                or knowledge_base.index_status != "INDEXING"
+                or _snapshot_sha256(current_chunks) != current_job.chunk_snapshot_sha256
+            ):
+                raise IndexBuildFailure(
+                    "SOURCE_CHUNKS_CHANGED", "知识分块已变化，请重新建立索引。"
+                )
+            for document_version_id in {
+                chunk.document_version_id for chunk in current_chunks
+            }:
+                version = await session.get(
+                    DocumentVersion, document_version_id, with_for_update=True
+                )
+                assert version is not None
+                version.indexed_chunk_revision = None
+            current_job.stage = "UPLOADING_INDEX"
             user_id = knowledge_base.user_id
         client = await self._qdrant_client()
         try:
             await self._ensure_collection(client, dimension=job.embedding_dimension)
+            await client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=qmodels.FilterSelector(
+                    filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="user_id", match=qmodels.MatchValue(value=user_id)
+                            ),
+                            qmodels.FieldCondition(
+                                key="knowledge_base_id",
+                                match=qmodels.MatchValue(value=job.knowledge_base_id),
+                            ),
+                        ]
+                    )
+                ),
+                wait=True,
+            )
             for offset in range(0, len(chunks), _BATCH_SIZE):
                 selected_chunks = chunks[offset : offset + _BATCH_SIZE]
                 selected_vectors = vectors[offset : offset + _BATCH_SIZE]
@@ -623,14 +837,13 @@ class KnowledgeIndexBuildRuntime:
                     collection_name=COLLECTION_NAME,
                     points=[
                         qmodels.PointStruct(
-                            id=str(uuid4()),
+                            id=chunk.id,
                             vector=vector,
                             payload={
                                 "knowledge_chunk_id": chunk.id,
                                 "knowledge_base_id": job.knowledge_base_id,
                                 "document_version_id": chunk.document_version_id,
                                 "user_id": user_id,
-                                "generation_id": job.generation_id,
                             },
                         )
                         for chunk, vector in zip(
@@ -640,24 +853,47 @@ class KnowledgeIndexBuildRuntime:
                     wait=True,
                 )
                 await self._update_progress(job.id, offset + len(selected_chunks))
+        except Exception:
+            try:
+                await client.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=qmodels.FilterSelector(
+                        filter=qmodels.Filter(
+                            must=[
+                                qmodels.FieldCondition(
+                                    key="user_id",
+                                    match=qmodels.MatchValue(value=user_id),
+                                ),
+                                qmodels.FieldCondition(
+                                    key="knowledge_base_id",
+                                    match=qmodels.MatchValue(
+                                        value=job.knowledge_base_id
+                                    ),
+                                ),
+                            ]
+                        )
+                    ),
+                    wait=True,
+                )
+            except Exception:
+                pass
+            raise
         finally:
             await client.close()
 
     async def _verify(self, job: KnowledgeIndexJob) -> None:
-        from qdrant_client.http import models as qmodels
-
         await self._update_stage(job.id, "VERIFYING")
+        async with self._session_factory() as session:
+            knowledge_base = await session.get(KnowledgeBase, job.knowledge_base_id)
+            if knowledge_base is None:
+                raise IndexBuildFailure("KNOWLEDGE_BASE_NOT_FOUND", "知识库不存在。")
+            user_id = knowledge_base.user_id
         client = await self._qdrant_client()
         try:
             result = await client.count(
                 collection_name=COLLECTION_NAME,
-                count_filter=qmodels.Filter(
-                    must=[
-                        qmodels.FieldCondition(
-                            key="generation_id",
-                            match=qmodels.MatchValue(value=job.generation_id),
-                        )
-                    ]
+                count_filter=self._scope_filter(
+                    user_id=user_id, knowledge_base_id=job.knowledge_base_id
                 ),
                 exact=True,
             )
@@ -668,7 +904,6 @@ class KnowledgeIndexBuildRuntime:
 
     async def _activate(self, job: KnowledgeIndexJob) -> None:
         await self._update_stage(job.id, "ACTIVATING")
-        previous_generation: str | None = None
         async with self._session_factory() as session:
             async with session.begin():
                 current_job = await session.get(
@@ -701,15 +936,17 @@ class KnowledgeIndexBuildRuntime:
                         "索引配置已变化，请重新建立索引。",
                         stale=True,
                     )
-                if knowledge_base.building_generation_id != current_job.generation_id:
-                    raise IndexBuildFailure(
-                        "ACTIVATION_FAILED", "索引生成已不再是当前任务。"
-                    )
-                previous_generation = knowledge_base.active_generation_id
                 now = utc_now()
-                knowledge_base.index_status = "READY"
-                knowledge_base.active_generation_id = current_job.generation_id
-                knowledge_base.building_generation_id = None
+                for document_version_id, chunk_revision in {
+                    (chunk.document_version_id, chunk.chunk_revision)
+                    for chunk in chunks
+                }:
+                    version = await session.get(
+                        DocumentVersion, document_version_id, with_for_update=True
+                    )
+                    assert version is not None
+                    version.indexed_chunk_revision = chunk_revision
+                knowledge_base.index_status = "READY" if chunks else "CHUNKED"
                 knowledge_base.active_embedding_model = current_job.embedding_model
                 knowledge_base.active_embedding_revision = (
                     current_job.embedding_revision
@@ -720,46 +957,10 @@ class KnowledgeIndexBuildRuntime:
                 knowledge_base.active_embedding_representation = (
                     current_job.embedding_representation
                 )
-                knowledge_base.active_chunk_snapshot_sha256 = (
-                    current_job.chunk_snapshot_sha256
-                )
                 current_job.status = "SUCCEEDED"
                 current_job.stage = "ACTIVATING"
                 current_job.processed_chunk_count = current_job.total_chunk_count
                 current_job.finished_at = now
-        if previous_generation is not None and previous_generation != job.generation_id:
-            await self._cleanup_generation(previous_generation)
-
-    async def _cleanup_generation(self, generation_id: str) -> None:
-        """Best-effort cleanup cannot affect an already activated generation."""
-
-        client = None
-        try:
-            from qdrant_client.http import models as qmodels
-
-            client = await self._qdrant_client()
-            await client.delete(
-                collection_name=COLLECTION_NAME,
-                points_selector=qmodels.FilterSelector(
-                    filter=qmodels.Filter(
-                        must=[
-                            qmodels.FieldCondition(
-                                key="generation_id",
-                                match=qmodels.MatchValue(value=generation_id),
-                            )
-                        ]
-                    )
-                ),
-                wait=True,
-            )
-        except Exception:
-            return
-        finally:
-            if client is not None:
-                try:
-                    await client.close()
-                except Exception:
-                    pass
 
     async def _update_stage(self, job_id: int, stage: str) -> None:
         async with self._session_factory() as session:
@@ -796,9 +997,5 @@ class KnowledgeIndexBuildRuntime:
                 job.error_code = failure.code
                 job.error_message = failure.message
                 job.finished_at = now
-                if (
-                    knowledge_base is not None
-                    and knowledge_base.building_generation_id == job.generation_id
-                ):
-                    knowledge_base.building_generation_id = None
-                    knowledge_base.index_status = "STALE" if failure.stale else "FAILED"
+                if knowledge_base is not None:
+                    knowledge_base.index_status = "FAILED"

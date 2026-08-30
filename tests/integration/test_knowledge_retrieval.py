@@ -24,6 +24,7 @@ from langley.infrastructure.models import (
     KnowledgeChunk,
     User,
 )
+from langley.knowledge.contracts import PdfPageRegion, validate_source_regions
 from langley.knowledge.index_build import (
     DenseSearchHit,
     current_knowledge_chunks_statement,
@@ -33,6 +34,82 @@ from langley.knowledge.retrieval import (
     RetrievalIndexInconsistentError,
     retrieve_dense,
 )
+
+
+def test_real_mysql_drops_stale_candidate_but_keeps_ready_pdf_citation(
+    migrated_database: str,
+) -> None:
+    async def scenario() -> None:
+        seed = await _seed(migrated_database)
+        engine = create_database_engine(migrated_database)
+        factory = create_session_factory(engine)
+        try:
+            async with factory() as session, session.begin():
+                stale_chunk = await session.get(KnowledgeChunk, seed.first_chunk_id)
+                assert stale_chunk is not None
+                stale_version = await session.get(
+                    DocumentVersion, stale_chunk.document_version_id
+                )
+                assert stale_version is not None
+                stale_version.indexed_chunk_revision = None
+
+                document = Document(
+                    knowledge_base_id=seed.knowledge_base_id,
+                    name="Ready PDF",
+                    created_at=utc_now(),
+                )
+                session.add(document)
+                await session.flush()
+                version = DocumentVersion(
+                    document_id=document.id,
+                    source_filename="ready.pdf",
+                    source_media_type="application/pdf",
+                    source_sha256="e" * 64,
+                    source_size_bytes=10,
+                    storage_key="fixture/ready.pdf",
+                    chunk_max_chars=100,
+                    chunk_revision=1,
+                    chunk_set_sha256="f" * 64,
+                    indexed_chunk_revision=1,
+                    created_at=utc_now(),
+                )
+                session.add(version)
+                await session.flush()
+                ready_chunk = KnowledgeChunk(
+                    document_version_id=version.id,
+                    ordinal=1,
+                    content="ready pdf evidence",
+                    heading_path=["PDF"],
+                    source_regions=[
+                        {"kind": "pdf_page", "page_start": 2, "page_end": 3}
+                    ],
+                    created_at=utc_now(),
+                )
+                session.add(ready_chunk)
+                await session.flush()
+                ready_chunk_id = ready_chunk.id
+
+            result = await retrieve_dense(
+                factory,
+                _Runtime(
+                    (
+                        DenseSearchHit(seed.first_chunk_id, 0.95),
+                        DenseSearchHit(ready_chunk_id, 0.9),
+                    )
+                ),  # type: ignore[arg-type]
+                user_id=1,
+                knowledge_base_id=seed.knowledge_base_id,
+                query="exact query",
+                top_k=2,
+            )
+            assert [hit.knowledge_chunk_id for hit in result.hits] == [ready_chunk_id]
+            assert validate_source_regions(list(result.hits[0].source_regions)) == [
+                PdfPageRegion(page_start=2, page_end=3)
+            ]
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(scenario())
 
 
 @pytest.fixture
@@ -66,7 +143,7 @@ class _Runtime:
             "model": "BAAI/bge-m3",
             "revision": "a" * 40,
             "dimension": 2,
-            "representation": "content_only",
+            "representation": "source_context_v1",
         }
         return [0.6, 0.8]
 
@@ -76,7 +153,7 @@ class _Runtime:
         self.search_call_count += 1
         assert vector == [0.6, 0.8]
         assert kwargs["user_id"] == 1
-        assert kwargs["generation_id"] == "11111111-1111-4111-8111-111111111111"
+        assert kwargs["knowledge_base_id"] == 1
         return self.hits
 
 
@@ -93,24 +170,20 @@ async def _seed(database_url: str) -> _Seed:
                     user_id=1,
                     name="Retrieval",
                     index_status="READY",
-                    active_generation_id="11111111-1111-4111-8111-111111111111",
                     active_embedding_model="BAAI/bge-m3",
                     active_embedding_revision="a" * 40,
                     active_embedding_dimension=2,
-                    active_embedding_representation="content_only",
-                    active_chunk_snapshot_sha256="a" * 64,
+                    active_embedding_representation="source_context_v1",
                     created_at=now,
                 ),
                 KnowledgeBase(
                     user_id=1,
                     name="Other",
                     index_status="READY",
-                    active_generation_id="22222222-2222-4222-8222-222222222222",
                     active_embedding_model="BAAI/bge-m3",
                     active_embedding_revision="a" * 40,
                     active_embedding_dimension=2,
-                    active_embedding_representation="content_only",
-                    active_chunk_snapshot_sha256="b" * 64,
+                    active_embedding_representation="source_context_v1",
                     created_at=now,
                 ),
             ]
@@ -131,6 +204,9 @@ async def _seed(database_url: str) -> _Seed:
                     source_size_bytes=1,
                     storage_key=f"fixture/{document.id}.md",
                     chunk_max_chars=100,
+                    chunk_revision=1,
+                    chunk_set_sha256="d" * 64,
+                    indexed_chunk_revision=1,
                     created_at=now,
                 )
                 for document in documents
@@ -230,15 +306,15 @@ def test_real_mysql_retrieval_rejects_not_owned_and_other_kb_chunks(
                 )
             assert not_owned_runtime.encode_call_count == 0
             wrong_chunk_runtime = _Runtime((DenseSearchHit(seed.other_chunk_id, 0.9),))
-            with pytest.raises(RetrievalIndexInconsistentError):
-                await retrieve_dense(
-                    factory,
-                    wrong_chunk_runtime,  # type: ignore[arg-type]
-                    user_id=1,
-                    knowledge_base_id=seed.knowledge_base_id,
-                    query="exact query",
-                    top_k=1,
-                )
+            result = await retrieve_dense(
+                factory,
+                wrong_chunk_runtime,  # type: ignore[arg-type]
+                user_id=1,
+                knowledge_base_id=seed.knowledge_base_id,
+                query="exact query",
+                top_k=1,
+            )
+            assert result.hits == ()
             assert (
                 wrong_chunk_runtime.encode_call_count
                 == wrong_chunk_runtime.search_call_count
@@ -253,12 +329,10 @@ def test_real_mysql_retrieval_rejects_not_owned_and_other_kb_chunks(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("active_generation_id", None),
         ("active_embedding_model", None),
         ("active_embedding_revision", "r" * 40),
         ("active_embedding_dimension", 0),
         ("active_embedding_representation", "unsupported"),
-        ("active_chunk_snapshot_sha256", "g" * 64),
     ],
 )
 def test_real_mysql_corrupted_ready_active_facts_fail_closed(

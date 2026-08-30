@@ -168,7 +168,6 @@ async def create_initial_document(
                 created_at=now,
             )
             admission_session.add(version)
-            _invalidate_knowledge_base_index(knowledge_base)
             await admission_session.flush()
     return version
 
@@ -417,13 +416,6 @@ def _document_version_matches_source_ref(
         and version.source_media_type == source_ref.source_media_type
         and version.source_sha256 == source_ref.source_sha256
         and version.source_size_bytes == source_ref.source_size_bytes
-    )
-
-
-def _invalidate_knowledge_base_index(knowledge_base: KnowledgeBase) -> None:
-    """Make an active generation ineligible after its source set changes."""
-    knowledge_base.index_status = (
-        "STALE" if knowledge_base.active_generation_id is not None else "CHUNKED"
     )
 
 

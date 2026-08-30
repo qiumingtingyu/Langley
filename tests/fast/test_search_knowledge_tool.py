@@ -69,7 +69,6 @@ def _service() -> _FakeRetrievalService:
     return _FakeRetrievalService(
         result=RetrievalResult(
             knowledge_base_id=23,
-            generation_id="11111111-1111-4111-8111-111111111111",
             hits=(_hit(),),
         )
     )
@@ -246,7 +245,7 @@ async def test_retrieval_service_maps_retrieval_error_to_stable_boundary(
 async def test_retrieval_service_uses_narrow_explicit_required_trace_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = RetrievalResult(43, "generation", (_hit(),))
+    result = RetrievalResult(43, (_hit(),))
 
     async def retrieve(*args: object, **kwargs: object) -> RetrievalResult:
         del args, kwargs

@@ -22,6 +22,7 @@ from langley.infrastructure.database import (
 )
 from langley.infrastructure.models import (
     Document,
+    DocumentIndexJob,
     DocumentVersion,
     KnowledgeBase,
     KnowledgeChunk,
@@ -89,6 +90,9 @@ async def _seed_chunked_knowledge_base(
                 storage_key=f"fixture/{knowledge_base.id}.md",
                 created_at=now,
                 chunk_max_chars=1200,
+                chunk_revision=1,
+                chunk_set_sha256="b" * 64,
+                indexed_chunk_revision=1,
             )
             session.add(version)
             await session.flush()
@@ -97,7 +101,7 @@ async def _seed_chunked_knowledge_base(
                     document_version_id=version.id,
                     ordinal=1,
                     content="Task 5.1 controlled chunk",
-                    heading_path=[],
+                    heading_path=["Fixture"],
                     source_regions=[{"kind": "text", "start": 0, "end": 27}],
                     created_at=now,
                 )
@@ -147,7 +151,7 @@ class _FakeQdrant:
         self.fail_upload = fail_upload
         self.mismatch = mismatch
         self.collections: set[str] = (
-            {"langley_knowledge_dense_v1"} if existing_dimension is not None else set()
+            {"langley_knowledge_dense_v2"} if existing_dimension is not None else set()
         )
         self.vector_config = (
             None
@@ -187,17 +191,13 @@ class _FakeQdrant:
         self.points.extend(points)
 
     async def count(self, collection_name: str, **kwargs: object) -> SimpleNamespace:
-        del collection_name
-        generation_id = cast(Any, kwargs["count_filter"]).must[0].match.value
-        count = sum(
-            point.payload["generation_id"] == generation_id for point in self.points
-        )
+        del collection_name, kwargs
+        count = len(self.points)
         return SimpleNamespace(count=count - 1 if self.mismatch else count)
 
     async def delete(self, collection_name: str, **kwargs: object) -> None:
         del collection_name, kwargs
-        self.cleanup_failed = True
-        raise RuntimeError("controlled cleanup failure")
+        self.points.clear()
 
     async def close(self) -> None:
         self.close_count += 1
@@ -218,6 +218,7 @@ class _FakeRuntime(KnowledgeIndexBuildRuntime):
     def _encode_documents(
         self, contents: list[str], job: KnowledgeIndexJob
     ) -> list[list[float]]:
+        assert contents == ["Fixture\n\nTask 5.1 controlled chunk"]
         return [[1.0] + [0.0] * (job.embedding_dimension - 1) for _ in contents]
 
     async def _qdrant_client(self) -> _FakeQdrant:
@@ -234,7 +235,10 @@ class _FakeRuntime(KnowledgeIndexBuildRuntime):
                     .where(Document.knowledge_base_id == job.knowledge_base_id)
                 )
                 assert chunk is not None
-                chunk.content = "changed after Qdrant verification"
+                version = await session.get(DocumentVersion, chunk.document_version_id)
+                assert version is not None
+                version.chunk_revision += 1
+                version.chunk_set_sha256 = "c" * 64
 
 
 def test_index_build_http_admission_is_owned_async_and_conflict_safe(
@@ -335,7 +339,7 @@ def test_index_build_rejects_an_unprocessed_current_document(
             async with session_factory() as session:
                 knowledge_base = await session.get(KnowledgeBase, knowledge_base_id)
                 assert knowledge_base is not None
-                assert knowledge_base.index_status == "CHUNKED"
+                assert knowledge_base.index_status == "STALE"
                 assert (
                     await session.scalar(
                         select(KnowledgeIndexJob.id).where(
@@ -417,7 +421,7 @@ def test_index_build_keeps_zero_chunk_processed_document_distinct_from_unprocess
             "INDEX_COLLECTION_CONFIGURATION_MISMATCH",
             "FAILED",
         ),
-        (_FakeQdrant(), True, "SOURCE_CHUNKS_CHANGED", "STALE"),
+        (_FakeQdrant(), True, "SOURCE_CHUNKS_CHANGED", "FAILED"),
     ],
 )
 def test_index_build_failure_paths_never_activate(
@@ -459,12 +463,10 @@ def test_index_build_failure_paths_never_activate(
     assert job.started_at is not None
     assert job.finished_at is not None
     assert knowledge_base.index_status == index_status
-    assert knowledge_base.active_generation_id is None
-    assert knowledge_base.building_generation_id is None
     assert qdrant.close_count >= 1
 
 
-def test_success_activates_after_verify_and_cleanup_failure_is_best_effort(
+def test_success_marks_current_document_revisions_ready(
     migrated_database: str, tmp_path: Path
 ) -> None:
     settings = _settings(migrated_database, tmp_path / "knowledge")
@@ -475,11 +477,6 @@ def test_success_activates_after_verify_and_cleanup_failure_is_best_effort(
         engine = create_database_engine(migrated_database)
         session_factory = create_session_factory(engine)
         try:
-            async with session_factory() as session, session.begin():
-                knowledge_base = await session.get(KnowledgeBase, knowledge_base_id)
-                assert knowledge_base is not None
-                knowledge_base.active_generation_id = "old-generation"
-                knowledge_base.index_status = "READY"
             admitted = await admit_index_build(
                 session_factory,
                 user_id=1,
@@ -500,17 +497,14 @@ def test_success_activates_after_verify_and_cleanup_failure_is_best_effort(
     assert job.stage == "ACTIVATING"
     assert job.processed_chunk_count == job.total_chunk_count == 1
     assert knowledge_base.index_status == "READY"
-    assert knowledge_base.active_generation_id == job.generation_id
-    assert knowledge_base.building_generation_id is None
     assert job.embedding_dimension == settings.knowledge_embedding_dimension
-    assert job.embedding_representation == "content_only"
+    assert job.embedding_representation == "source_context_v1"
     assert (
         knowledge_base.active_embedding_dimension
         == settings.knowledge_embedding_dimension
     )
-    assert knowledge_base.active_embedding_representation == "content_only"
-    assert qdrant.cleanup_failed
-    assert qdrant.close_count == 3
+    assert knowledge_base.active_embedding_representation == "source_context_v1"
+    assert qdrant.close_count == 2
     assert qdrant.created_vectors_config is not None
     assert qdrant.created_vectors_config.size == settings.knowledge_embedding_dimension
     assert qdrant.created_vectors_config.distance == qmodels.Distance.COSINE
@@ -519,7 +513,6 @@ def test_success_activates_after_verify_and_cleanup_failure_is_best_effort(
         "knowledge_base_id",
         "document_version_id",
         "user_id",
-        "generation_id",
     }
 
 
@@ -619,8 +612,6 @@ def test_restart_interrupts_orphaned_job_without_retry_or_activation(
     assert job.status == "INTERRUPTED"
     assert job.error_code == "INDEX_BUILD_INTERRUPTED"
     assert knowledge_base.index_status == "FAILED"
-    assert knowledge_base.active_generation_id is None
-    assert knowledge_base.building_generation_id is None
 
 
 @pytest.mark.parametrize(
@@ -665,4 +656,100 @@ def test_restart_stales_ready_index_when_embedding_configuration_changed(
     assert job.status == "SUCCEEDED"
     assert stale_ids == (knowledge_base_id,)
     assert knowledge_base.index_status == "STALE"
-    assert knowledge_base.active_generation_id == job.generation_id
+
+
+def test_stale_reconciliation_interrupts_incompatible_pending_job_and_allows_rebuild(
+    migrated_database: str, tmp_path: Path
+) -> None:
+    settings = _settings(migrated_database, tmp_path / "knowledge")
+    knowledge_base_id, document_version_id = asyncio.run(
+        _seed_chunked_knowledge_base(migrated_database)
+    )
+    changed_settings = settings.model_copy(
+        update={"knowledge_embedding_model": "different-model"}
+    )
+
+    async def reconcile_and_readmit() -> tuple[int, int, tuple[int, ...]]:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            first_build = await admit_index_build(
+                session_factory,
+                user_id=1,
+                knowledge_base_id=knowledge_base_id,
+                settings=settings,
+            )
+            await _FakeRuntime(session_factory, settings, qdrant=_FakeQdrant()).run(
+                first_build.job_id
+            )
+            async with session_factory() as session, session.begin():
+                pending = DocumentIndexJob(
+                    document_version_id=document_version_id,
+                    attempt_no=1,
+                    target_chunk_revision=1,
+                    status="PENDING",
+                    stage=None,
+                    embedding_model=settings.knowledge_embedding_model,
+                    embedding_revision=settings.knowledge_embedding_revision,
+                    embedding_dimension=settings.knowledge_embedding_dimension,
+                    embedding_representation=(
+                        settings.knowledge_embedding_representation
+                    ),
+                    error_code=None,
+                    error_message=None,
+                    created_at=utc_now(),
+                    started_at=None,
+                    finished_at=None,
+                )
+                session.add(pending)
+                await session.flush()
+                pending_id = pending.id
+
+            stale_ids = await reconcile_stale_ready_index_configurations(
+                session_factory, settings=changed_settings
+            )
+            async with session_factory() as session:
+                knowledge_base = await session.get(KnowledgeBase, knowledge_base_id)
+                old_job = await session.get(DocumentIndexJob, pending_id)
+                assert knowledge_base is not None and old_job is not None
+                assert knowledge_base.index_status == "STALE"
+                assert (old_job.status, old_job.error_code) == (
+                    "INTERRUPTED",
+                    "INDEX_INTERRUPTED",
+                )
+
+            repair = await admit_index_build(
+                session_factory,
+                user_id=1,
+                knowledge_base_id=knowledge_base_id,
+                settings=changed_settings,
+            )
+            return pending_id, repair.job_id, stale_ids
+        finally:
+            await dispose_database_engine(engine)
+
+    pending_id, repair_id, stale_ids = asyncio.run(reconcile_and_readmit())
+    assert stale_ids == (knowledge_base_id,)
+
+    async def read_state() -> tuple[DocumentIndexJob, KnowledgeIndexJob, KnowledgeBase]:
+        engine = create_database_engine(migrated_database)
+        session_factory = create_session_factory(engine)
+        try:
+            async with session_factory() as session:
+                old_job = await session.get(DocumentIndexJob, pending_id)
+                repair = await session.get(KnowledgeIndexJob, repair_id)
+                knowledge_base = await session.get(KnowledgeBase, knowledge_base_id)
+                assert old_job is not None
+                assert repair is not None
+                assert knowledge_base is not None
+                return old_job, repair, knowledge_base
+        finally:
+            await dispose_database_engine(engine)
+
+    old_job, repair, knowledge_base = asyncio.run(read_state())
+    assert (old_job.status, old_job.error_code) == (
+        "INTERRUPTED",
+        "INDEX_INTERRUPTED",
+    )
+    assert repair.status == "PENDING"
+    assert knowledge_base.index_status == "INDEXING"

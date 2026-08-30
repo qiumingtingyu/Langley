@@ -13,16 +13,18 @@ from langley.knowledge.index_build import (
 
 
 def test_chunk_snapshot_is_independent_of_result_order() -> None:
-    first = IndexChunk(id=11, document_version_id=4, content="first")
-    second = IndexChunk(id=12, document_version_id=5, content="second")
+    first = IndexChunk(11, 4, "first", (), 2, "a" * 64)
+    second = IndexChunk(12, 5, "second", (), 3, "b" * 64)
 
     assert _snapshot_sha256((first, second)) == _snapshot_sha256((second, first))
 
 
-def test_chunk_snapshot_changes_when_indexable_content_changes() -> None:
-    original = IndexChunk(id=11, document_version_id=4, content="first")
-    replaced = IndexChunk(id=11, document_version_id=4, content="changed")
+def test_chunk_snapshot_uses_stable_document_revision_facts() -> None:
+    original = IndexChunk(11, 4, "first", (), 2, "a" * 64)
+    same_document_facts = IndexChunk(99, 4, "changed", ("Heading",), 2, "a" * 64)
+    replaced = IndexChunk(11, 4, "first", (), 3, "b" * 64)
 
+    assert _snapshot_sha256((original,)) == _snapshot_sha256((same_document_facts,))
     assert _snapshot_sha256((original,)) != _snapshot_sha256((replaced,))
 
 

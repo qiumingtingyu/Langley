@@ -61,12 +61,6 @@ class KnowledgeBase(Base):
         server_default="CHUNKED",
         nullable=False,
     )
-    active_generation_id: Mapped[str | None] = mapped_column(
-        String(36, collation="utf8mb4_0900_bin"), nullable=True
-    )
-    building_generation_id: Mapped[str | None] = mapped_column(
-        String(36, collation="utf8mb4_0900_bin"), nullable=True
-    )
     active_embedding_model: Mapped[str | None] = mapped_column(
         String(255, collation="utf8mb4_0900_bin"), nullable=True
     )
@@ -79,9 +73,6 @@ class KnowledgeBase(Base):
     active_embedding_representation: Mapped[str | None] = mapped_column(
         String(64, collation="utf8mb4_0900_bin"), nullable=True
     )
-    active_chunk_snapshot_sha256: Mapped[str | None] = mapped_column(
-        String(64, collation="utf8mb4_0900_bin"), nullable=True
-    )
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
@@ -90,7 +81,6 @@ class KnowledgeIndexJob(Base):
 
     __tablename__ = "knowledge_index_jobs"
     __table_args__ = (
-        UniqueConstraint("generation_id", name="uq_knowledge_index_jobs_generation"),
         Index(
             "ix_knowledge_index_jobs_base_created", "knowledge_base_id", "created_at"
         ),
@@ -119,9 +109,6 @@ class KnowledgeIndexJob(Base):
             ondelete="RESTRICT",
         ),
         nullable=False,
-    )
-    generation_id: Mapped[str] = mapped_column(
-        String(36, collation="utf8mb4_0900_bin"), nullable=False
     )
     status: Mapped[str] = mapped_column(
         String(16, collation="utf8mb4_0900_bin"), nullable=False

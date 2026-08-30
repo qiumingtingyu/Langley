@@ -351,7 +351,6 @@ class _FakeRetrievalService:
             search_trace.finish(len(self.hits))
         return RetrievalResult(
             knowledge_base_id=knowledge_base_id,
-            generation_id="generation",
             hits=self.hits,
         )
 

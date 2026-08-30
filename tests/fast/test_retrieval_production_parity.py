@@ -477,12 +477,10 @@ def test_wrong_ready_baseline_prevents_retrieval_queries(
     monkeypatch.setattr(parity, "poll_ready", lambda *_: {"index_status": "READY"})
     client = _ReadyBaselineClient()
     wrong = ReadyIndexFacts(
-        active_generation_id="generation",
-        active_chunk_snapshot_sha256="a" * 64,
         active_embedding_model="wrong-model",
         active_embedding_revision="5617a9f61b028005a4858fdac845db406aefb181",
         active_embedding_dimension=1024,
-        active_embedding_representation="content_only",
+        active_embedding_representation="source_context_v1",
     )
     with pytest.raises(ExperimentSetupError, match="READY embedding baseline"):
         run_production_parity(
@@ -499,25 +497,19 @@ def test_wrong_ready_baseline_prevents_retrieval_queries(
     "facts",
     (
         ReadyIndexFacts(
-            "g",
-            "a" * 64,
             "wrong",
             "5617a9f61b028005a4858fdac845db406aefb181",
             1024,
-            "content_only",
+            "source_context_v1",
         ),
-        ReadyIndexFacts("g", "a" * 64, "BAAI/bge-m3", "0" * 40, 1024, "content_only"),
+        ReadyIndexFacts("BAAI/bge-m3", "0" * 40, 1024, "source_context_v1"),
         ReadyIndexFacts(
-            "g",
-            "a" * 64,
             "BAAI/bge-m3",
             "5617a9f61b028005a4858fdac845db406aefb181",
             768,
-            "content_only",
+            "source_context_v1",
         ),
         ReadyIndexFacts(
-            "g",
-            "a" * 64,
             "BAAI/bge-m3",
             "5617a9f61b028005a4858fdac845db406aefb181",
             1024,
@@ -543,16 +535,15 @@ def test_rendered_report_exposes_computed_human_review_facts() -> None:
             "dataset_manifest_sha256": "a" * 64,
         },
         "setup_parity": {"source": "PASS", "candidate": "PASS"},
-        "active_generation_id": "generation",
-        "ready_index_facts": {"active_chunk_snapshot_sha256": "c" * 64},
+        "ready_index_facts": {},
         "embedding": {
             "model": "BAAI/bge-m3",
             "revision": "d" * 40,
             "dimension": 1024,
-            "representation": "content_only",
+            "representation": "source_context_v1",
             "device": "cuda:0",
         },
-        "qdrant": {"collection": "langley_knowledge_dense_v1", "distance": "COSINE"},
+        "qdrant": {"collection": "langley_knowledge_dense_v2", "distance": "COSINE"},
         "aggregate": {
             "experiment_0": {
                 "hit_at_1": 1.0,
@@ -607,7 +598,7 @@ def test_rendered_report_exposes_computed_human_review_facts() -> None:
         "method-commit",
         "reference.json",
         "Source Parity",
-        "Active snapshot",
+        "READY projection",
         "BGE model",
         "Qdrant collection",
         "REGRESSION_EVENT",

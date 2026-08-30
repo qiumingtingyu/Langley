@@ -1,8 +1,7 @@
-"""Fail-closed production retrieval over one active Knowledge generation."""
+"""Fail-closed production retrieval over authoritative dense-v2 candidates."""
 
 import asyncio
 from dataclasses import dataclass
-from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -45,9 +44,9 @@ class IndexNotReadyError(RetrievalError):
         super().__init__("INDEX_NOT_READY")
 
 
-class RetrievalGenerationChangedError(RetrievalError):
+class RetrievalIndexChangedError(RetrievalError):
     def __init__(self) -> None:
-        super().__init__("RETRIEVAL_GENERATION_CHANGED")
+        super().__init__("RETRIEVAL_INDEX_CHANGED")
 
 
 class RetrievalIndexInconsistentError(RetrievalError):
@@ -72,16 +71,14 @@ class RetrievalQdrantUnavailableError(RetrievalError):
 
 @dataclass(frozen=True)
 class ActiveRetrievalContext:
-    """Detached active-generation facts allowed to cross slow runtime boundaries."""
+    """Detached global embedding facts allowed across slow runtime boundaries."""
 
     knowledge_base_id: int
     user_id: int
-    generation_id: str
     model: str
     revision: str
     dimension: int
     representation: str
-    chunk_snapshot_sha256: str
 
 
 @dataclass(frozen=True)
@@ -104,7 +101,6 @@ class RetrievalHit:
 @dataclass(frozen=True)
 class RetrievalResult:
     knowledge_base_id: int
-    generation_id: str
     hits: tuple[RetrievalHit, ...]
 
 
@@ -142,7 +138,6 @@ async def retrieve_dense(
     )
     return RetrievalResult(
         knowledge_base_id=context.knowledge_base_id,
-        generation_id=context.generation_id,
         hits=hits,
     )
 
@@ -170,6 +165,8 @@ async def retrieve_reranked(
         query=query,
         candidate_k=candidate_k,
     )
+    if not candidates:
+        return RetrievalResult(knowledge_base_id=context.knowledge_base_id, hits=())
     try:
         raw_scores = await reranker.score(
             query=query,
@@ -196,20 +193,23 @@ async def retrieve_reranked(
         ),
     )
     chunks_by_id = {chunk.knowledge_chunk_id: chunk for chunk in final_chunks}
-    hits = tuple(
-        _retrieval_hit(
-            chunk=chunks_by_id[candidate.knowledge_chunk_id],
-            rank=rank,
-            retrieval_rank=candidate.retrieval_rank,
-            score=candidate.score,
-            rerank_score=rerank_score,
+    hits: list[RetrievalHit] = []
+    for candidate, rerank_score in selected:
+        chunk = chunks_by_id.get(candidate.knowledge_chunk_id)
+        if chunk is None:
+            continue
+        hits.append(
+            _retrieval_hit(
+                chunk=chunk,
+                rank=len(hits) + 1,
+                retrieval_rank=candidate.retrieval_rank,
+                score=candidate.score,
+                rerank_score=rerank_score,
+            )
         )
-        for rank, (candidate, rerank_score) in enumerate(selected, start=1)
-    )
     return RetrievalResult(
         knowledge_base_id=context.knowledge_base_id,
-        generation_id=context.generation_id,
-        hits=hits,
+        hits=tuple(hits),
     )
 
 
@@ -242,47 +242,48 @@ async def _retrieve_dense_candidates(
     except Exception as error:
         raise RetrievalEmbeddingUnavailableError() from error
 
+    search_limit = min(max(candidate_k * 2, candidate_k), 100)
     search_hits: tuple[DenseSearchHit, ...] = ()
-    search_error: RetrievalError | None = None
     try:
         search_hits = await runtime.search_dense(
             query_vector,
             user_id=context.user_id,
             knowledge_base_id=context.knowledge_base_id,
-            generation_id=context.generation_id,
-            top_k=candidate_k,
+            top_k=search_limit,
             dimension=context.dimension,
         )
-        _validate_search_hits(search_hits, top_k=candidate_k)
+        _validate_search_hits(search_hits, top_k=search_limit)
     except DenseSearchResultError:
-        search_error = RetrievalIndexInconsistentError()
+        raise RetrievalIndexInconsistentError() from None
     except IndexBuildFailure:
-        search_error = RetrievalIndexInconsistentError()
+        raise RetrievalIndexInconsistentError() from None
     except Exception:
-        search_error = RetrievalQdrantUnavailableError()
+        raise RetrievalQdrantUnavailableError() from None
 
     chunks = await _final_revalidate(
         session_factory,
         context=context,
         returned_chunk_ids=tuple(hit.knowledge_chunk_id for hit in search_hits),
     )
-    if search_error is not None:
-        raise search_error
-    if not search_hits:
-        raise RetrievalIndexInconsistentError()
 
     chunks_by_id = {chunk.knowledge_chunk_id: chunk for chunk in chunks}
-    hits = tuple(
-        _retrieval_hit(
-            chunk=chunks_by_id[search_hit.knowledge_chunk_id],
-            rank=rank,
-            retrieval_rank=rank,
-            score=search_hit.score,
-            rerank_score=None,
+    hits: list[RetrievalHit] = []
+    for retrieval_rank, search_hit in enumerate(search_hits, start=1):
+        chunk = chunks_by_id.get(search_hit.knowledge_chunk_id)
+        if chunk is None:
+            continue
+        hits.append(
+            _retrieval_hit(
+                chunk=chunk,
+                rank=len(hits) + 1,
+                retrieval_rank=retrieval_rank,
+                score=search_hit.score,
+                rerank_score=None,
+            )
         )
-        for rank, search_hit in enumerate(search_hits, start=1)
-    )
-    return context, hits
+        if len(hits) == candidate_k:
+            break
+    return context, tuple(hits)
 
 
 def _retrieval_hit(
@@ -340,43 +341,35 @@ def _context_from_knowledge_base(
 ) -> ActiveRetrievalContext:
     if knowledge_base.index_status != "READY":
         if final_read:
-            raise RetrievalGenerationChangedError()
+            raise RetrievalIndexChangedError()
         raise IndexNotReadyError()
     values = (
-        knowledge_base.active_generation_id,
         knowledge_base.active_embedding_model,
         knowledge_base.active_embedding_revision,
         knowledge_base.active_embedding_dimension,
         knowledge_base.active_embedding_representation,
-        knowledge_base.active_chunk_snapshot_sha256,
     )
     if (
         any(value is None for value in values)
-        or not _is_canonical_uuid(knowledge_base.active_generation_id)
         or not _is_nonblank_string(knowledge_base.active_embedding_model)
         or not _is_pinned_revision(knowledge_base.active_embedding_revision)
         or not isinstance(knowledge_base.active_embedding_dimension, int)
         or isinstance(knowledge_base.active_embedding_dimension, bool)
         or knowledge_base.active_embedding_dimension <= 0
-        or knowledge_base.active_embedding_representation != "content_only"
-        or not _is_sha256(knowledge_base.active_chunk_snapshot_sha256)
+        or knowledge_base.active_embedding_representation != "source_context_v1"
     ):
         raise RetrievalIndexInconsistentError()
-    assert knowledge_base.active_generation_id is not None
     assert knowledge_base.active_embedding_model is not None
     assert knowledge_base.active_embedding_revision is not None
     assert knowledge_base.active_embedding_dimension is not None
     assert knowledge_base.active_embedding_representation is not None
-    assert knowledge_base.active_chunk_snapshot_sha256 is not None
     return ActiveRetrievalContext(
         knowledge_base_id=knowledge_base.id,
         user_id=user_id,
-        generation_id=knowledge_base.active_generation_id,
         model=knowledge_base.active_embedding_model,
         revision=knowledge_base.active_embedding_revision,
         dimension=knowledge_base.active_embedding_dimension,
         representation=knowledge_base.active_embedding_representation,
-        chunk_snapshot_sha256=knowledge_base.active_chunk_snapshot_sha256,
     )
 
 
@@ -397,20 +390,23 @@ async def _final_revalidate(
                 )
             )
             if knowledge_base is None:
-                raise RetrievalGenerationChangedError()
+                raise RetrievalIndexChangedError()
             final_context = _context_from_knowledge_base(
                 knowledge_base, user_id=context.user_id, final_read=True
             )
-            if final_context.generation_id != context.generation_id:
-                raise RetrievalGenerationChangedError()
             if final_context != context:
-                raise RetrievalIndexInconsistentError()
+                raise RetrievalIndexChangedError()
             if not returned_chunk_ids:
                 return ()
             rows = (
                 await session.execute(
                     current_knowledge_chunks_statement(context.knowledge_base_id)
-                    .where(KnowledgeChunk.id.in_(returned_chunk_ids))
+                    .where(
+                        KnowledgeChunk.id.in_(returned_chunk_ids),
+                        DocumentVersion.chunk_revision > 0,
+                        DocumentVersion.indexed_chunk_revision
+                        == DocumentVersion.chunk_revision,
+                    )
                     .with_only_columns(
                         KnowledgeChunk.id,
                         KnowledgeChunk.ordinal,
@@ -424,8 +420,8 @@ async def _final_revalidate(
                     )
                 )
             ).all()
-    chunks = tuple(
-        _AuthoritativeChunk(
+    chunks_by_id = {
+        row[0]: _AuthoritativeChunk(
             knowledge_chunk_id=row[0],
             chunk_ordinal=row[1],
             content=row[2],
@@ -437,19 +433,12 @@ async def _final_revalidate(
             source_sha256=row[8],
         )
         for row in rows
+    }
+    return tuple(
+        chunks_by_id[chunk_id]
+        for chunk_id in returned_chunk_ids
+        if chunk_id in chunks_by_id
     )
-    if len(chunks) != len(returned_chunk_ids):
-        raise RetrievalIndexInconsistentError()
-    return chunks
-
-
-def _is_canonical_uuid(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        return str(UUID(value)) == value
-    except ValueError:
-        return False
 
 
 def _is_nonblank_string(value: object) -> bool:
@@ -460,14 +449,6 @@ def _is_pinned_revision(value: object) -> bool:
     return (
         isinstance(value, str)
         and len(value) == 40
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
-def _is_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and len(value) == 64
         and all(character in "0123456789abcdef" for character in value)
     )
 

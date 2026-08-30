@@ -68,8 +68,8 @@ from langley.knowledge.retrieval import (
     RetrievalEmbeddingInvalidError,
     RetrievalEmbeddingUnavailableError,
     RetrievalError,
-    RetrievalGenerationChangedError,
     RetrievalHit,
+    RetrievalIndexChangedError,
     RetrievalIndexInconsistentError,
     RetrievalQdrantUnavailableError,
     RetrievalResult,
@@ -206,7 +206,6 @@ class RetrievalHitResponse(BaseModel):
 
 class RetrievalResponse(BaseModel):
     knowledge_base_id: int
-    generation_id: str
     hits: list[RetrievalHitResponse]
 
 
@@ -307,7 +306,7 @@ def _retrieval_hit_response(value: RetrievalHit) -> RetrievalHitResponse:
 def _raise_retrieval_error(error: RetrievalError) -> None:
     if isinstance(error, KnowledgeBaseRetrievalNotFoundError):
         raise HTTPException(status_code=404, detail={"code": error.code}) from error
-    if isinstance(error, (IndexNotReadyError, RetrievalGenerationChangedError)):
+    if isinstance(error, (IndexNotReadyError, RetrievalIndexChangedError)):
         raise HTTPException(status_code=409, detail={"code": error.code}) from error
     if isinstance(
         error,
@@ -686,7 +685,6 @@ async def post_knowledge_base_retrieval(
         _raise_retrieval_error(error)
     return RetrievalResponse(
         knowledge_base_id=result.knowledge_base_id,
-        generation_id=result.generation_id,
         hits=[_retrieval_hit_response(hit) for hit in result.hits],
     )
 

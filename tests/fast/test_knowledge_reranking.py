@@ -15,7 +15,7 @@ from langley.knowledge.index_build import DenseSearchHit
 from langley.knowledge.reranking import LocalBGEReranker, RerankerError
 from langley.knowledge.retrieval import (
     ActiveRetrievalContext,
-    RetrievalGenerationChangedError,
+    RetrievalIndexChangedError,
     RetrievalIndexInconsistentError,
     RetrievalResult,
     _AuthoritativeChunk,
@@ -32,12 +32,10 @@ def _context() -> ActiveRetrievalContext:
     return ActiveRetrievalContext(
         knowledge_base_id=4,
         user_id=7,
-        generation_id="11111111-1111-4111-8111-111111111111",
         model="active-model",
         revision="a" * 40,
         dimension=2,
-        representation="content_only",
-        chunk_snapshot_sha256="b" * 64,
+        representation="source_context_v1",
     )
 
 
@@ -140,7 +138,7 @@ def test_rerank_preserves_dense_provenance_and_uses_deterministic_tie_break(
         )
     )
 
-    assert runtime.search_top_ks == [20]
+    assert runtime.search_top_ks == [40]
     assert reranker.calls == [
         ("exact query", tuple(f"content-{chunk_id}" for chunk_id in range(10, 16)))
     ]
@@ -195,9 +193,54 @@ def test_malformed_reranker_output_fails_closed_before_final_selection(
     assert calls == [(10, 11)]
 
 
+def test_reranker_sees_only_mysql_valid_candidates_and_final_stale_hit_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    async def initial(*args: object, **kwargs: object) -> ActiveRetrievalContext:
+        del args, kwargs
+        return _context()
+
+    async def final(
+        *args: object, returned_chunk_ids: tuple[int, ...], **kwargs: object
+    ) -> tuple[_AuthoritativeChunk, ...]:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        if calls == 1:
+            return tuple(
+                _chunk(chunk_id) for chunk_id in returned_chunk_ids if chunk_id != 10
+            )
+        return ()
+
+    monkeypatch.setattr(retrieval, "_read_active_context", initial)
+    monkeypatch.setattr(retrieval, "_final_revalidate", final)
+    runtime = _FakeRuntime(
+        (DenseSearchHit(10, 0.9), DenseSearchHit(11, 0.8), DenseSearchHit(12, 0.7))
+    )
+    reranker = _FakeReranker((2.0, 1.0))
+
+    result = asyncio.run(
+        retrieve_reranked(
+            None,  # type: ignore[arg-type]
+            runtime,  # type: ignore[arg-type]
+            reranker,
+            user_id=7,
+            knowledge_base_id=4,
+            query="query",
+            candidate_k=3,
+            top_k=1,
+        )
+    )
+
+    assert reranker.calls == [("query", ("content-11", "content-12"))]
+    assert result.hits == ()
+
+
 @pytest.mark.parametrize(
     "final_error",
-    [RetrievalGenerationChangedError(), RetrievalIndexInconsistentError()],
+    [RetrievalIndexChangedError(), RetrievalIndexInconsistentError()],
 )
 def test_active_context_change_across_rerank_boundary_returns_no_stale_result(
     monkeypatch: pytest.MonkeyPatch, final_error: Exception
@@ -228,7 +271,7 @@ def test_active_context_change_across_rerank_boundary_returns_no_stale_result(
 async def test_disabled_service_keeps_the_dense_path_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    expected = RetrievalResult(4, "generation", ())
+    expected = RetrievalResult(4, ())
     calls: list[dict[str, object]] = []
 
     async def dense(*args: object, **kwargs: object) -> RetrievalResult:

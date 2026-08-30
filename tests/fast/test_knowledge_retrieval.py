@@ -24,7 +24,7 @@ from langley.knowledge.retrieval import (
     IndexNotReadyError,
     RetrievalEmbeddingInvalidError,
     RetrievalEmbeddingUnavailableError,
-    RetrievalGenerationChangedError,
+    RetrievalIndexChangedError,
     RetrievalIndexInconsistentError,
     RetrievalQdrantUnavailableError,
     _AuthoritativeChunk,
@@ -38,12 +38,10 @@ def _context() -> ActiveRetrievalContext:
     return ActiveRetrievalContext(
         knowledge_base_id=4,
         user_id=7,
-        generation_id="11111111-1111-4111-8111-111111111111",
         model="active-model",
         revision="a" * 40,
         dimension=2,
-        representation="content_only",
-        chunk_snapshot_sha256="a" * 64,
+        representation="source_context_v1",
     )
 
 
@@ -208,7 +206,7 @@ def test_retrieval_preserves_exact_query_active_config_and_qdrant_order(
                 "model": "active-model",
                 "revision": "a" * 40,
                 "dimension": 2,
-                "representation": "content_only",
+                "representation": "source_context_v1",
             },
         )
     ]
@@ -218,8 +216,7 @@ def test_retrieval_preserves_exact_query_active_config_and_qdrant_order(
             {
                 "user_id": 7,
                 "knowledge_base_id": 4,
-                "generation_id": "11111111-1111-4111-8111-111111111111",
-                "top_k": 3,
+                "top_k": 6,
                 "dimension": 2,
             },
         )
@@ -316,10 +313,10 @@ def test_duplicate_qdrant_result_fails_closed_without_retry(
             )
         )
     assert len(runtime.encode_calls) == len(runtime.search_calls) == 1
-    assert final_calls == [(20, 20)]
+    assert final_calls == []
 
 
-def test_qdrant_result_count_above_top_k_fails_closed_without_partial_success(
+def test_bounded_overfetch_returns_first_valid_top_k(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     final_calls = _patch_reads(monkeypatch)
@@ -327,28 +324,28 @@ def test_qdrant_result_count_above_top_k_fails_closed_without_partial_success(
         search_hits=(DenseSearchHit(20, 0.9), DenseSearchHit(8, 0.8))
     )
 
-    with pytest.raises(RetrievalIndexInconsistentError):
-        asyncio.run(
-            retrieve_dense(
-                None,  # type: ignore[arg-type]
-                runtime,  # type: ignore[arg-type]
-                user_id=7,
-                knowledge_base_id=4,
-                query="query",
-                top_k=1,
-            )
+    result = asyncio.run(
+        retrieve_dense(
+            None,  # type: ignore[arg-type]
+            runtime,  # type: ignore[arg-type]
+            user_id=7,
+            knowledge_base_id=4,
+            query="query",
+            top_k=1,
         )
+    )
+    assert [hit.knowledge_chunk_id for hit in result.hits] == []
     assert len(runtime.search_calls) == 1
     assert final_calls == [(20, 8)]
 
 
-def test_zero_qdrant_result_obeys_final_generation_precedence(
+def test_zero_qdrant_result_obeys_final_index_change_precedence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_reads(monkeypatch, final_error=RetrievalGenerationChangedError())
+    _patch_reads(monkeypatch, final_error=RetrievalIndexChangedError())
     runtime = _FakeRuntime(search_hits=())
 
-    with pytest.raises(RetrievalGenerationChangedError):
+    with pytest.raises(RetrievalIndexChangedError):
         asyncio.run(
             retrieve_dense(
                 None,  # type: ignore[arg-type]
@@ -361,23 +358,23 @@ def test_zero_qdrant_result_obeys_final_generation_precedence(
         )
 
 
-def test_zero_qdrant_result_with_same_generation_is_inconsistent(
+def test_zero_qdrant_result_with_same_index_is_legal_empty_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_reads(monkeypatch)
     runtime = _FakeRuntime(search_hits=())
 
-    with pytest.raises(RetrievalIndexInconsistentError):
-        asyncio.run(
-            retrieve_dense(
-                None,  # type: ignore[arg-type]
-                runtime,  # type: ignore[arg-type]
-                user_id=7,
-                knowledge_base_id=4,
-                query="query",
-                top_k=1,
-            )
+    result = asyncio.run(
+        retrieve_dense(
+            None,  # type: ignore[arg-type]
+            runtime,  # type: ignore[arg-type]
+            user_id=7,
+            knowledge_base_id=4,
+            query="query",
+            top_k=1,
         )
+    )
+    assert result.hits == ()
 
 
 def test_qdrant_runtime_failure_is_not_retried_after_final_read(
@@ -398,7 +395,7 @@ def test_qdrant_runtime_failure_is_not_retried_after_final_read(
             )
         )
     assert len(runtime.search_calls) == 1
-    assert final_calls == [()]
+    assert final_calls == []
 
 
 @pytest.mark.parametrize(
@@ -456,7 +453,6 @@ def test_qdrant_search_uses_exact_scope_filters_without_threshold() -> None:
             [0.6, 0.8],
             user_id=7,
             knowledge_base_id=4,
-            generation_id="generation-7",
             top_k=3,
             dimension=2,
         )
@@ -472,7 +468,6 @@ def test_qdrant_search_uses_exact_scope_filters_without_threshold() -> None:
     assert [(condition.key, condition.match.value) for condition in conditions] == [
         ("user_id", 7),
         ("knowledge_base_id", 4),
-        ("generation_id", "generation-7"),
     ]
 
 
@@ -511,7 +506,6 @@ def test_qdrant_retrieval_missing_collection_does_not_create_one() -> None:
                 [0.6, 0.8],
                 user_id=7,
                 knowledge_base_id=4,
-                generation_id="generation",
                 top_k=1,
                 dimension=2,
             )
@@ -524,8 +518,6 @@ def test_qdrant_retrieval_missing_collection_does_not_create_one() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("active_generation_id", None),
-        ("active_generation_id", "not-a-uuid"),
         ("active_embedding_model", None),
         ("active_embedding_model", "  "),
         ("active_embedding_revision", None),
@@ -533,8 +525,6 @@ def test_qdrant_retrieval_missing_collection_does_not_create_one() -> None:
         ("active_embedding_dimension", 0),
         ("active_embedding_dimension", -1),
         ("active_embedding_representation", "unsupported"),
-        ("active_chunk_snapshot_sha256", None),
-        ("active_chunk_snapshot_sha256", "g" * 64),
     ],
 )
 def test_corrupted_ready_active_facts_fail_closed(field: str, value: object) -> None:
@@ -543,12 +533,10 @@ def test_corrupted_ready_active_facts_fail_closed(field: str, value: object) -> 
         user_id=7,
         name="Ready",
         index_status="READY",
-        active_generation_id="11111111-1111-4111-8111-111111111111",
         active_embedding_model="BAAI/bge-m3",
         active_embedding_revision="a" * 40,
         active_embedding_dimension=1024,
-        active_embedding_representation="content_only",
-        active_chunk_snapshot_sha256="b" * 64,
+        active_embedding_representation="source_context_v1",
     )
     setattr(knowledge_base, field, value)
 
@@ -560,7 +548,7 @@ def test_corrupted_ready_active_facts_fail_closed(field: str, value: object) -> 
     "error, expected_status",
     [
         (IndexNotReadyError(), 409),
-        (RetrievalGenerationChangedError(), 409),
+        (RetrievalIndexChangedError(), 409),
         (RetrievalIndexInconsistentError(), 500),
         (RetrievalEmbeddingInvalidError(), 500),
         (RetrievalEmbeddingUnavailableError(), 503),

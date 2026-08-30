@@ -39,13 +39,10 @@ def _index_fact(*, status: str = "READY") -> RuntimeIndexFact:
     return RuntimeIndexFact(
         knowledge_base_id=7,
         index_status=status,
-        active_generation_id="11111111-1111-4111-8111-111111111111",
-        active_chunk_snapshot_sha256="a" * 64,
         active_embedding_model="BAAI/bge-m3",
         active_embedding_revision="revision",
         active_embedding_dimension=1024,
-        active_embedding_representation="content_only",
-        index_job_generation_id="11111111-1111-4111-8111-111111111111",
+        active_embedding_representation="source_context_v1",
         index_job_status="SUCCEEDED",
         index_job_chunk_snapshot_sha256="a" * 64,
         index_job_processed_chunk_count=40,
@@ -66,7 +63,7 @@ def _binding(
         expected_embedding_model="BAAI/bge-m3",
         expected_embedding_revision="revision",
         expected_embedding_dimension=1024,
-        expected_embedding_representation="content_only",
+        expected_embedding_representation="source_context_v1",
         expected_chunk_max_chars=1200,
     )
 
@@ -92,7 +89,6 @@ def test_exact_runtime_corpus_binding_persists_both_identity_directions() -> Non
     }
     assert result["index_state"] == {
         "index_status": "READY",
-        "index_job_generation_id": "11111111-1111-4111-8111-111111111111",
         "index_job_status": "SUCCEEDED",
     }
 

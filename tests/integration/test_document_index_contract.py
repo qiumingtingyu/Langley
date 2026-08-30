@@ -8,7 +8,7 @@ from datetime import datetime
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import select, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from langley.infrastructure.database import (
@@ -135,6 +135,35 @@ def migrated_contract_database(test_database_url: str, reset_database) -> str:
             await dispose_database_engine(engine)
 
     asyncio.run(seed_prior_schema())
+    command.upgrade(config, "0013_document_index_contract")
+
+    async def seed_pre_cutover_readiness() -> None:
+        engine = create_database_engine(test_database_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE document_versions SET indexed_chunk_revision = 1 "
+                        "WHERE id = 2"
+                    )
+                )
+                await connection.execute(
+                    text(
+                        "UPDATE knowledge_bases SET "
+                        "active_generation_id = "
+                        "'11111111-1111-4111-8111-111111111111', "
+                        "active_embedding_model = 'BAAI/bge-m3', "
+                        "active_embedding_revision = :revision, "
+                        "active_embedding_dimension = 1024, "
+                        "active_embedding_representation = 'content_only', "
+                        "active_chunk_snapshot_sha256 = :snapshot WHERE id = 1"
+                    ),
+                    {"revision": "a" * 40, "snapshot": "b" * 64},
+                )
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(seed_pre_cutover_readiness())
     command.upgrade(config, "head")
     return test_database_url
 
@@ -191,6 +220,37 @@ def test_document_index_contract_migration_round_trip(
 
     command.downgrade(config, "0012_pdf_worker_errors")
     command.upgrade(config, "head")
+
+
+def test_retrieval_cutover_removes_generation_schema(
+    migrated_contract_database: str,
+) -> None:
+    async def verify() -> None:
+        engine = create_database_engine(migrated_contract_database)
+        try:
+            async with engine.connect() as connection:
+                base_columns = await connection.run_sync(
+                    lambda sync: {
+                        column["name"]
+                        for column in inspect(sync).get_columns("knowledge_bases")
+                    }
+                )
+                job_columns = await connection.run_sync(
+                    lambda sync: {
+                        column["name"]
+                        for column in inspect(sync).get_columns("knowledge_index_jobs")
+                    }
+                )
+            assert {
+                "active_generation_id",
+                "building_generation_id",
+                "active_chunk_snapshot_sha256",
+            }.isdisjoint(base_columns)
+            assert "generation_id" not in job_columns
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(verify())
 
 
 def test_positive_chunk_revision_requires_fingerprint(

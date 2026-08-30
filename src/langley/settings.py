@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 LogFormat = Literal["console", "json"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 LLMProviderName = Literal["qwen"]
-KnowledgeEmbeddingRepresentation = Literal["content_only"]
+KnowledgeEmbeddingRepresentation = Literal["source_context_v1"]
 
 _DEFAULT_QWEN_MODEL = "qwen3.7-plus-2026-05-26"
 
@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     knowledge_embedding_device: str = "cuda:0"
     knowledge_embedding_dimension: int = Field(default=1024, ge=1)
     knowledge_embedding_representation: KnowledgeEmbeddingRepresentation = (
-        "content_only"
+        "source_context_v1"
     )
     knowledge_index_build_concurrency: int = Field(default=1, ge=1, le=4)
     document_processing_timeout_seconds: float = Field(default=900.0, gt=0)

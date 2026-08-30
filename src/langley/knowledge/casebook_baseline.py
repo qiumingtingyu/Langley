@@ -53,13 +53,10 @@ class RuntimeIndexFact:
 
     knowledge_base_id: int
     index_status: str
-    active_generation_id: str | None
-    active_chunk_snapshot_sha256: str | None
     active_embedding_model: str | None
     active_embedding_revision: str | None
     active_embedding_dimension: int | None
     active_embedding_representation: str | None
-    index_job_generation_id: str | None
     index_job_status: str | None
     index_job_chunk_snapshot_sha256: str | None
     index_job_processed_chunk_count: int | None
@@ -159,14 +156,9 @@ def verify_runtime_corpus_binding(
         raise CasebookRuntimeBindingError(
             f"runtime index is not READY: {index.index_status!r}"
         )
-    if not index.active_generation_id:
-        raise CasebookRuntimeBindingError("runtime index has no active generation")
-    if (
-        index.index_job_generation_id != index.active_generation_id
-        or index.index_job_status != "SUCCEEDED"
-    ):
+    if index.index_job_status != "SUCCEEDED":
         raise CasebookRuntimeBindingError(
-            "active generation has no matching successful index job"
+            "runtime index has no successful full-build job"
         )
     if (
         index.index_job_total_chunk_count is None
@@ -176,14 +168,11 @@ def verify_runtime_corpus_binding(
         != sum(document.chunk_count for document in runtime_documents)
     ):
         raise CasebookRuntimeBindingError(
-            "active generation does not cover the exact current chunk corpus"
+            "full-build job does not cover the exact current chunk corpus"
         )
-    if (
-        not index.active_chunk_snapshot_sha256
-        or index.index_job_chunk_snapshot_sha256 != index.active_chunk_snapshot_sha256
-    ):
+    if not index.index_job_chunk_snapshot_sha256:
         raise CasebookRuntimeBindingError(
-            "active generation chunk snapshot does not match its index job"
+            "full-build job has no document snapshot fingerprint"
         )
     configured_embedding = (
         index.active_embedding_model,
@@ -199,7 +188,7 @@ def verify_runtime_corpus_binding(
     )
     if configured_embedding != expected_embedding:
         raise CasebookRuntimeBindingError(
-            "active generation embedding configuration does not match Formal B0"
+            "active embedding configuration does not match Formal B0"
         )
 
     by_key: dict[str, dict[str, object]] = {}
@@ -218,12 +207,9 @@ def verify_runtime_corpus_binding(
         "status": "VERIFIED",
         "knowledge_base_id": index.knowledge_base_id,
         "eligible_runtime_document_count": len(runtime_documents),
-        "active_generation_id": index.active_generation_id,
-        "active_chunk_snapshot_sha256": index.active_chunk_snapshot_sha256,
-        "active_generation_chunk_count": index.index_job_total_chunk_count,
+        "indexed_chunk_count": index.index_job_total_chunk_count,
         "index_state": {
             "index_status": index.index_status,
-            "index_job_generation_id": index.index_job_generation_id,
             "index_job_status": index.index_job_status,
         },
         "embedding_configuration": {
