@@ -59,13 +59,13 @@ describe("KnowledgePage", () => {
     await settle();
 
     const input = wrapper.get('input[type="file"]');
-    expect(input.attributes("accept")).toBe(".md,text/markdown");
+    expect(input.attributes("accept")).toBe(".md,.pdf,text/markdown,application/pdf");
     Object.defineProperty(input.element, "files", {
       value: [new File(["# new"], "new.md", { type: "text/markdown" })],
     });
     await input.trigger("change");
     expect(wrapper.text()).toContain("已选择：new.md");
-    expect(wrapper.text()).toContain("当前支持 Markdown 文件。");
+    expect(wrapper.text()).toContain("支持 Markdown 和 PDF。");
     await wrapper.findAll("form")[1]!.trigger("submit");
     await settle();
 
@@ -182,14 +182,14 @@ describe("KnowledgePage", () => {
     const wrapper = mount(KnowledgePage);
     await settle();
 
-    const build = wrapper.findAll("button").find((item) => item.text().includes("建立索引"));
+    const build = wrapper.findAll("button").find((item) => item.text().includes("重建全部索引"));
     expect(build?.attributes("disabled")).toBeUndefined();
     await build!.trigger("click");
     await settle();
 
     expect(fetchMock.mock.calls.filter(([path, init]) => path === "/api/knowledge-bases/4/index-build" && init?.method === "POST")).toHaveLength(1);
-    expect(wrapper.text()).toContain("索引状态：正在建立");
-    expect(wrapper.text()).toContain("正在建立索引 · 等待执行 · 0 / 2");
+    expect(wrapper.text()).toContain("索引状态：正在重建全部索引");
+    expect(wrapper.text()).toContain("正在重建全部索引 · 等待执行 · 0 / 2");
     wrapper.unmount();
   });
 
@@ -209,7 +209,7 @@ describe("KnowledgePage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    expect(wrapper.text()).toContain("正在建立索引 · EMBEDDING · 1 / 2");
+    expect(wrapper.text()).toContain("正在重建全部索引 · EMBEDDING · 1 / 2");
 
     await vi.advanceTimersByTimeAsync(5000);
     await settle();
@@ -251,7 +251,7 @@ describe("KnowledgePage", () => {
     const wrapper = mount(KnowledgePage);
     await settle();
     expect(wrapper.text()).toContain("索引建立失败，请重试。");
-    const build = wrapper.findAll("button").find((item) => item.text().includes("建立索引"));
+    const build = wrapper.findAll("button").find((item) => item.text().includes("重建全部索引"));
     expect(build?.attributes("disabled")).toBeUndefined();
     await build!.trigger("click");
     await settle();
@@ -270,7 +270,7 @@ describe("KnowledgePage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    const build = wrapper.findAll("button").find((item) => item.text().includes("建立索引"));
+    const build = wrapper.findAll("button").find((item) => item.text().includes("重建全部索引"));
     expect(build?.attributes("disabled")).toBeUndefined();
     if (state === "STALE") expect(wrapper.text()).toContain("需要重建");
     wrapper.unmount();
@@ -302,7 +302,7 @@ describe("KnowledgePage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    const build = wrapper.findAll("button").find((item) => item.text().includes("建立索引"));
+    const build = wrapper.findAll("button").find((item) => item.text().includes("重建全部索引"));
     expect(build?.attributes("disabled")).toBeDefined();
     await build!.trigger("click");
     expect(fetchMock.mock.calls.filter(([path]) => path === "/api/knowledge-bases/4/index-build")).toHaveLength(0);
@@ -321,7 +321,7 @@ describe("KnowledgePage", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage, { attrs: { onNotice: notice } });
     await settle();
-    await wrapper.findAll("button").find((item) => item.text().includes("建立索引"))!.trigger("click");
+    await wrapper.findAll("button").find((item) => item.text().includes("重建全部索引"))!.trigger("click");
     await settle();
     expect(notice).toHaveBeenCalledWith("还有文档尚未处理，请先完成文档处理后再建立索引。");
     wrapper.unmount();
@@ -344,6 +344,138 @@ describe("KnowledgePage processing bridge", () => {
       throw new Error(`unexpected request: ${path}`);
     });
   }
+
+  const pdfDocument = { id: 8, name: "Report", created_at: "x", source: { document_version_id: 18, filename: "report.pdf", media_type: "application/pdf", size_bytes: 32, sha256: "pdf", created_at: "upload-time" } };
+  const pdfStatus = (status: string, stage: string | null = null, errorMessage: string | null = null) => ({
+    document_version_id: 18,
+    latest_attempt: { id: 30, attempt_no: 1, status, stage, recipe_id: "pdf_docling_hybrid512_v1", error_code: errorMessage === null ? null : "PDF_PARSE_FAILED", error_message: errorMessage, created_at: "x", started_at: status === "PENDING" ? null : "x", finished_at: ["SUCCEEDED", "FAILED", "INTERRUPTED"].includes(status) ? "x" : null },
+    published_chunks_exist: status === "SUCCEEDED",
+  });
+
+  it("uploads a PDF, reads its durable processing status, and never rebuilds it as Markdown", async () => {
+    vi.useFakeTimers();
+    let statusReads = 0;
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents" && init?.method !== "POST") return response([pdfDocument]);
+      if (path === "/api/knowledge-bases/4/documents" && init?.method === "POST") return response({ ...pdfDocument, processing_job: { job_id: 30, attempt_no: 1, status: "PENDING", recipe_id: "pdf_docling_hybrid512_v1" } });
+      if (path.includes("/chunks?")) return response({ ...chunksPage(null, 0), document_version_id: 18 });
+      if (path === "/api/document-versions/18/processing-status") { statusReads += 1; return response(pdfStatus("RUNNING", "PARSING")); }
+      if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("CHUNKED"));
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    const input = wrapper.get('input[type="file"]');
+    Object.defineProperty(input.element, "files", { value: [new File(["pdf"], "report.pdf", { type: "application/pdf" })] });
+    await input.trigger("change");
+    await wrapper.findAll("form")[1]!.trigger("submit");
+    await settle();
+    await vi.advanceTimersByTimeAsync(2500);
+    await settle();
+    expect(statusReads).toBeGreaterThan(1);
+    expect(wrapper.text()).toContain("正在解析 PDF");
+    expect(wrapper.findAll('input[inputmode="numeric"]')).toHaveLength(0);
+    expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/chunks/rebuild"))).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("refreshes PDF chunks after durable success and shows page provenance", async () => {
+    vi.useFakeTimers();
+    let chunkReads = 0;
+    let statusReads = 0;
+    const pdfChunk = { ...chunk, source_regions: [{ kind: "pdf_page", page_start: 3, page_end: 5 }, { kind: "pdf_page", page_start: 8, page_end: 9 }] };
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents") return response([pdfDocument]);
+      if (path.includes("/chunks?")) { chunkReads += 1; return response({ ...chunksPage(null, chunkReads === 1 ? 0 : 1), document_version_id: 18, chunks: chunkReads === 1 ? [] : [pdfChunk] }); }
+      if (path === "/api/document-versions/18/processing-status") { statusReads += 1; return response(statusReads === 1 ? pdfStatus("RUNNING", "PUBLISHING") : pdfStatus("SUCCEEDED")); }
+      if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("READY"));
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    await vi.advanceTimersByTimeAsync(2500);
+    await settle();
+    expect(chunkReads).toBe(2);
+    expect(wrapper.text()).toContain("PDF 已完成处理");
+    expect(wrapper.text()).toContain("第 3–5 页、第 8–9 页");
+    expect(wrapper.text()).toContain("索引状态：可检索");
+    wrapper.unmount();
+  });
+
+  it("refreshes published PDF chunks when succeeded is first observed", async () => {
+    let chunkReads = 0;
+    const publishedPdfChunk = { ...chunk, content: "Published PDF chunk", source_regions: [{ kind: "pdf_page", page_start: 4, page_end: 4 }] };
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents") return response([pdfDocument]);
+      if (path.includes("/chunks?")) {
+        chunkReads += 1;
+        return response({ ...chunksPage(null, chunkReads === 1 ? 0 : 1), document_version_id: 18, chunks: chunkReads === 1 ? [] : [publishedPdfChunk] });
+      }
+      if (path === "/api/document-versions/18/processing-status") return response(pdfStatus("SUCCEEDED"));
+      if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("READY"));
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    expect(chunkReads).toBe(2);
+    expect(wrapper.text()).toContain("Published PDF chunk");
+    wrapper.unmount();
+  });
+
+  it("watches automatic PDF index preparation until the knowledge base is ready", async () => {
+    vi.useFakeTimers();
+    let chunkReads = 0;
+    let indexStatusReads = 0;
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents") return response([pdfDocument]);
+      if (path.includes("/chunks?")) {
+        chunkReads += 1;
+        return response({ ...chunksPage(null, chunkReads === 1 ? 0 : 1), document_version_id: 18, chunks: chunkReads === 1 ? [] : [{ ...chunk, content: "Published PDF chunk" }] });
+      }
+      if (path === "/api/document-versions/18/processing-status") return response(pdfStatus("SUCCEEDED"));
+      if (path === "/api/knowledge-bases/4/index-status") {
+        indexStatusReads += 1;
+        return response(indexStatus(indexStatusReads < 3 ? "CHUNKED" : "READY"));
+      }
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    expect(wrapper.text()).toContain("索引状态：正在准备检索");
+    await vi.advanceTimersByTimeAsync(5000);
+    await settle();
+    expect(indexStatusReads).toBe(3);
+    expect(wrapper.text()).toContain("索引状态：可检索");
+    const settledReads = indexStatusReads;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(indexStatusReads).toBe(settledReads);
+    wrapper.unmount();
+  });
+
+  it("shows a safe terminal PDF processing failure", async () => {
+    const fetchMock = vi.fn(async (path: string) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path === "/api/knowledge-bases/4/documents") return response([pdfDocument]);
+      if (path.includes("/chunks?")) return response({ ...chunksPage(null, 0), document_version_id: 18 });
+      if (path === "/api/document-versions/18/processing-status") return response(pdfStatus("FAILED", "PARSING", "无法读取该 PDF 的文本内容。"));
+      if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("CHUNKED"));
+      throw new Error(`unexpected request: ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    expect(wrapper.text()).toContain("PDF 处理失败");
+    expect(wrapper.text()).toContain("无法读取该 PDF 的文本内容。");
+    wrapper.unmount();
+  });
 
   it("initializes the backend suggestion, distinguishes processed empty chunks, and keeps the current config separate from the draft", async () => {
     const fetchMock = defaultFetch(chunksPage(1200, 0));

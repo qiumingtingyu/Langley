@@ -9,13 +9,16 @@ type Document = { id: number; name: string; created_at: string; source: Document
 type VerifyResult = { document_version_id: number; verified: boolean; verified_at: string };
 type IndexJob = { id: number; status: string; stage: string | null; processed_chunk_count: number; total_chunk_count: number; error_code: string | null; error_message: string | null; created_at: string; started_at: string | null; finished_at: string | null };
 type IndexStatus = { index_status: string; latest_job: IndexJob | null };
-type SourceRegion = { kind: string; start_byte?: number; end_byte?: number };
+type SourceRegion = { kind: string; start_byte?: number; end_byte?: number; page_start?: number; page_end?: number };
 type Chunk = { ordinal: number; content: string; heading_path: string[]; source_regions: SourceRegion[] };
 type ChunksResponse = { document_version_id: number; successful_chunk_max_chars: number | null; suggested_chunk_max_chars: number; chunk_count: number; offset: number; limit: number; chunks: Chunk[] };
 type RebuildResponse = { document_version_id: number; successful_chunk_max_chars: number; chunk_count: number; resulting_index_status: string };
+type DocumentProcessingAttempt = { id: number; attempt_no: number; status: string; stage: string | null; recipe_id: string; error_code: string | null; error_message: string | null; created_at: string; started_at: string | null; finished_at: string | null };
+type DocumentProcessingStatus = { document_version_id: number; latest_attempt: DocumentProcessingAttempt | null; published_chunks_exist: boolean };
 
 const CHUNK_PAGE_SIZE = 10;
 const INDEX_POLL_INTERVAL_MS = 5000;
+const PROCESSING_POLL_INTERVAL_MS = 2500;
 
 const emit = defineEmits<{ notice: [message: string] }>();
 const knowledgeBases = ref<KnowledgeBase[]>([]);
@@ -44,26 +47,32 @@ const processingPending = ref(false);
 const processingError = ref("");
 const chunkLoadError = ref("");
 const expandedChunkOrdinals = ref<number[]>([]);
+const documentProcessingStatus = ref<DocumentProcessingStatus | null>(null);
+const documentProcessingLoading = ref(false);
+const documentProcessingError = ref("");
 let indexPollTimer: number | null = null;
+let processingPollTimer: number | null = null;
 let documentSelectionRevision = 0;
 
 const selectedDocument = computed(() => documents.value.find((item) => item.id === selectedDocumentId.value) ?? null);
+const selectedDocumentIsPdf = computed(() => selectedDocument.value?.source.media_type === "application/pdf");
 const chunksRange = computed(() => chunkCount.value === 0 ? "显示 0–0" : `显示 ${chunkOffset.value + 1}–${Math.min(chunkOffset.value + chunks.value.length, chunkCount.value)}`);
 const processingBlockedByIndex = computed(() => indexStatus.value?.index_status === "INDEXING");
 
 function currentIndexStatusText(status: string | undefined): string {
   if (status === "READY") return "可检索";
   if (status === "STALE") return "需要重建";
-  if (status === "CHUNKED") return "尚未建立";
-  if (status === "INDEXING") return "正在建立";
-  if (status === "FAILED") return "建立失败";
+  if (status === "CHUNKED") return "正在准备检索";
+  if (status === "INDEXING") return "正在重建全部索引";
+  if (status === "FAILED") return "索引准备失败";
   return status ?? "正在读取";
 }
 
 function errorMessage(payload: unknown): string {
   const code = typeof payload === "object" && payload !== null && "detail" in payload ? (payload.detail as { code?: string }).code : undefined;
   if (code === "KNOWLEDGE_BASE_NOT_FOUND" || code === "DOCUMENT_VERSION_NOT_FOUND") return "该知识库或文档已不存在，请刷新后重试。";
-  if (code === "UPLOAD_TOO_LARGE") return "Markdown 文件不能超过 5 MiB。";
+  if (code === "UPLOAD_TOO_LARGE") return "文件超过允许大小。Markdown 最大 5 MiB，PDF 最大 64 MiB。";
+  if (code === "UNSUPPORTED_MEDIA_TYPE") return "当前仅支持 Markdown 和 PDF 文件。";
   if (code === "EMPTY_SOURCE") return "文件内容不能为空。";
   if (code === "INVALID_SOURCE_ENCODING") return "文件必须是 UTF-8 编码的 Markdown。";
   if (code === "SOURCE_MISSING") return "原始文件缺失，无法验证。";
@@ -72,6 +81,8 @@ function errorMessage(payload: unknown): string {
   if (code === "KNOWLEDGE_BASE_NOT_CHUNKED") return "当前知识库还没有可索引的分块。";
   if (code === "INDEX_BUILD_IN_PROGRESS") return "该知识库正在建立索引。";
   if (code === "KNOWLEDGE_BASE_INDEXING") return "知识库正在建立索引，请等待完成后重试。";
+  if (code === "KNOWLEDGE_BASE_DOCUMENTS_INDEXING") return "部分资料正在准备检索，请稍后再重建全部索引。";
+  if (code === "KNOWLEDGE_BASE_DOCUMENTS_PROCESSING") return "还有 PDF 正在处理，请完成后再重建全部索引。";
   if (code === "KNOWLEDGE_BASE_DOCUMENTS_UNPROCESSED") return "还有文档尚未处理，请先完成文档处理后再建立索引。";
   if (code === "VALIDATION_ERROR") return "输入内容无效，请检查后重试。";
   return "操作失败，请稍后重试。";
@@ -162,8 +173,15 @@ async function selectDocument(documentId: number | null): Promise<void> {
   documentSelectionRevision += 1;
   selectedDocumentId.value = documentId;
   processingPending.value = false;
+  stopDocumentProcessingPolling();
+  documentProcessingStatus.value = null;
+  documentProcessingLoading.value = false;
+  documentProcessingError.value = "";
   resetChunkState();
-  if (documentId !== null) await loadChunks(0, "selection");
+  if (documentId !== null) {
+    await loadChunks(0, "selection");
+    if (selectedDocumentIsPdf.value) await loadDocumentProcessingStatus();
+  }
 }
 
 function validDraftMaxChunkChars(): number | null {
@@ -198,7 +216,7 @@ async function rebuildChunks(): Promise<void> {
       indexStatus.value = indexStatus.value === null ? null : { ...indexStatus.value, index_status: result.resulting_index_status };
       await loadChunks(0, "after-rebuild");
     }
-    if (knowledgeBaseId !== null && selectedKnowledgeBaseId.value === knowledgeBaseId) await loadIndexStatus(knowledgeBaseId);
+    if (knowledgeBaseId !== null && selectedKnowledgeBaseId.value === knowledgeBaseId) await loadIndexStatus(knowledgeBaseId, true);
   } catch (error) {
     if (!isCurrentDocument(versionId, revision)) {
       if (knowledgeBaseId !== null && selectedKnowledgeBaseId.value === knowledgeBaseId) await loadIndexStatus(knowledgeBaseId);
@@ -215,11 +233,40 @@ async function rebuildChunks(): Promise<void> {
 
 function sourceRegionText(region: SourceRegion): string {
   if (region.kind === "text_span") return `text_span [${region.start_byte}, ${region.end_byte})`;
+  if (region.kind === "pdf_page") return `pdf_page [${region.page_start}, ${region.page_end}]`;
   return region.kind;
 }
 
 function sourceFormat(mediaType: string): string {
-  return mediaType === "text/markdown" ? "Markdown" : mediaType;
+  if (mediaType === "text/markdown") return "Markdown";
+  if (mediaType === "application/pdf") return "PDF";
+  return mediaType;
+}
+
+function pdfPageLocation(regions: SourceRegion[]): string | null {
+  const pageRegions = regions.filter(
+    (region) => region.kind === "pdf_page" && Number.isInteger(region.page_start) && Number.isInteger(region.page_end),
+  );
+  if (pageRegions.length === 0) return null;
+  return pageRegions.map((region) => region.page_start === region.page_end ? `第 ${region.page_start} 页` : `第 ${region.page_start}–${region.page_end} 页`).join("、");
+}
+
+function processingStatusText(status: DocumentProcessingStatus | null): string {
+  const attempt = status?.latest_attempt;
+  if (attempt === null || attempt === undefined) return "正在等待处理状态";
+  if (attempt.status === "PENDING") return "等待处理";
+  if (attempt.status === "RUNNING") {
+    if (attempt.stage === "VERIFYING_SOURCE") return "正在校验文件";
+    if (attempt.stage === "PARSING") return "正在解析 PDF";
+    if (attempt.stage === "CHUNKING") return "正在生成分块";
+    if (attempt.stage === "VALIDATING") return "正在校验处理结果";
+    if (attempt.stage === "PUBLISHING") return "正在发布资料";
+    return "正在处理 PDF";
+  }
+  if (attempt.status === "SUCCEEDED") return "PDF 已完成处理";
+  if (attempt.status === "FAILED") return "PDF 处理失败";
+  if (attempt.status === "INTERRUPTED") return "PDF 处理已中断";
+  return "正在读取处理状态";
 }
 
 function toggleChunk(ordinal: number): void {
@@ -236,24 +283,73 @@ function nextChunkPage(): void {
   void loadChunks(chunkOffset.value + CHUNK_PAGE_SIZE);
 }
 
-function stopIndexPolling(): void {
+function clearIndexPollTimer(): void {
   if (indexPollTimer !== null) window.clearTimeout(indexPollTimer);
   indexPollTimer = null;
 }
 
-async function loadIndexStatus(knowledgeBaseId: number): Promise<void> {
+let preparingReadinessWatchKnowledgeBaseId: number | null = null;
+
+function stopIndexPolling(): void {
+  clearIndexPollTimer();
+  preparingReadinessWatchKnowledgeBaseId = null;
+}
+
+function stopDocumentProcessingPolling(): void {
+  if (processingPollTimer !== null) window.clearTimeout(processingPollTimer);
+  processingPollTimer = null;
+}
+
+async function loadDocumentProcessingStatus(): Promise<void> {
+  const versionId = selectedDocument.value?.source.document_version_id;
+  if (versionId === undefined || !selectedDocumentIsPdf.value) return;
+  const revision = documentSelectionRevision;
+  documentProcessingLoading.value = true;
+  try {
+    const response = await request(`/api/document-versions/${versionId}/processing-status`);
+    const next = await response.json() as DocumentProcessingStatus;
+    if (!isCurrentDocument(versionId, revision)) return;
+    const previousStatus = documentProcessingStatus.value?.latest_attempt?.status;
+    documentProcessingStatus.value = next;
+    documentProcessingError.value = "";
+    stopDocumentProcessingPolling();
+    if (next.latest_attempt?.status === "PENDING" || next.latest_attempt?.status === "RUNNING") {
+      processingPollTimer = window.setTimeout(() => void loadDocumentProcessingStatus(), PROCESSING_POLL_INTERVAL_MS);
+    } else if (previousStatus !== "SUCCEEDED" && next.latest_attempt?.status === "SUCCEEDED") {
+      await loadChunks(0, "selection");
+      const knowledgeBaseId = selectedKnowledgeBaseId.value;
+      if (knowledgeBaseId !== null) await loadIndexStatus(knowledgeBaseId, true);
+    }
+  } catch (error) {
+    if (isCurrentDocument(versionId, revision)) {
+      documentProcessingError.value = error instanceof Error ? error.message : "暂时无法读取 PDF 处理状态。";
+      stopDocumentProcessingPolling();
+    }
+  } finally {
+    if (isCurrentDocument(versionId, revision)) documentProcessingLoading.value = false;
+  }
+}
+
+async function loadIndexStatus(knowledgeBaseId: number, watchPreparing = false): Promise<void> {
+  if (watchPreparing) preparingReadinessWatchKnowledgeBaseId = knowledgeBaseId;
   const response = await request(`/api/knowledge-bases/${knowledgeBaseId}/index-status`);
   const next = await response.json() as IndexStatus;
   if (selectedKnowledgeBaseId.value !== knowledgeBaseId) return;
   indexStatus.value = next;
-  stopIndexPolling();
-  if (next.latest_job?.status === "PENDING" || next.latest_job?.status === "RUNNING") {
-    indexPollTimer = window.setTimeout(() => void loadIndexStatus(knowledgeBaseId).catch((error: unknown) => emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。")), INDEX_POLL_INTERVAL_MS);
+  clearIndexPollTimer();
+  const hasActiveManualBuild = next.latest_job?.status === "PENDING" || next.latest_job?.status === "RUNNING";
+  if (next.index_status !== "CHUNKED" && preparingReadinessWatchKnowledgeBaseId === knowledgeBaseId) {
+    preparingReadinessWatchKnowledgeBaseId = null;
+  }
+  const keepWatchingPreparing = preparingReadinessWatchKnowledgeBaseId === knowledgeBaseId && next.index_status === "CHUNKED";
+  if (hasActiveManualBuild || keepWatchingPreparing) {
+    indexPollTimer = window.setTimeout(() => void loadIndexStatus(knowledgeBaseId, keepWatchingPreparing).catch((error: unknown) => emit("notice", error instanceof Error ? error.message : "操作失败，请稍后重试。")), INDEX_POLL_INTERVAL_MS);
   }
 }
 
 async function load(): Promise<void> {
   loading.value = true;
+  stopIndexPolling();
   try {
     const response = await request("/api/knowledge-bases");
     knowledgeBases.value = await response.json() as KnowledgeBase[];
@@ -262,6 +358,9 @@ async function load(): Promise<void> {
     documents.value = [];
     selectedDocumentId.value = null;
     indexStatus.value = null;
+    stopDocumentProcessingPolling();
+    documentProcessingStatus.value = null;
+    documentProcessingError.value = "";
     verifiedVersionId.value = null;
     verifiedAt.value = null;
     if (nextId !== null) { await loadDocuments(nextId); await loadIndexStatus(nextId); }
@@ -275,6 +374,9 @@ async function selectKnowledgeBase(id: number): Promise<void> {
   selectedDocumentId.value = null;
   indexStatus.value = null;
   stopIndexPolling();
+  stopDocumentProcessingPolling();
+  documentProcessingStatus.value = null;
+  documentProcessingError.value = "";
   verifiedVersionId.value = null;
   verifiedAt.value = null;
   try { await loadDocuments(id); await loadIndexStatus(id); }
@@ -303,7 +405,7 @@ function chooseFile(event: Event): void {
 async function upload(): Promise<void> {
   const knowledgeBaseId = selectedKnowledgeBaseId.value;
   const file = selectedFile.value;
-  if (knowledgeBaseId === null || file === null) { emit("notice", "请选择一个 Markdown 文件。"); return; }
+  if (knowledgeBaseId === null || file === null) { emit("notice", "请选择一个 Markdown 或 PDF 文件。"); return; }
   uploading.value = true;
   try {
     const body = new FormData();
@@ -345,7 +447,10 @@ async function startIndexBuild(): Promise<void> {
 
 defineExpose({ load });
 onMounted(() => void load());
-onBeforeUnmount(stopIndexPolling);
+onBeforeUnmount(() => {
+  stopIndexPolling();
+  stopDocumentProcessingPolling();
+});
 </script>
 
 <template>
@@ -416,10 +521,11 @@ onBeforeUnmount(stopIndexPolling);
           </div>
           <Button
             type="button"
+            variant="outline"
             :disabled="startingIndexBuild || indexStatus?.index_status === 'INDEXING'"
             @click="startIndexBuild"
           >
-            {{ startingIndexBuild ? "正在提交…" : indexStatus?.index_status === "READY" ? "重建索引" : "建立索引" }}
+            {{ startingIndexBuild ? "正在提交…" : "重建全部索引" }}
           </Button>
         </div>
         <div
@@ -427,7 +533,7 @@ onBeforeUnmount(stopIndexPolling);
           class="mt-4 border-l-2 border-primary bg-subtle px-3 py-2 text-sm text-body"
         >
           <p v-if="indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING'">
-            正在建立索引 · {{ indexStatus.latest_job.stage ?? "等待执行" }} · {{ indexStatus.latest_job.processed_chunk_count }} / {{ indexStatus.latest_job.total_chunk_count }}
+            正在重建全部索引 · {{ indexStatus.latest_job.stage ?? "等待执行" }} · {{ indexStatus.latest_job.processed_chunk_count }} / {{ indexStatus.latest_job.total_chunk_count }}
           </p>
           <p v-else>
             {{ indexStatus.latest_job.error_message ?? "索引建立失败，请重试。" }}
@@ -443,12 +549,12 @@ onBeforeUnmount(stopIndexPolling);
             添加资料
           </h3>
           <p class="text-sm text-muted-foreground">
-            当前支持 Markdown 文件。
+            支持 Markdown 和 PDF。<br>Markdown 最大 5 MiB · PDF 最大 64 MiB
           </p>
           <label class="inline-flex cursor-pointer items-center rounded-sm border border-strong-border bg-surface px-3 py-2 text-sm font-medium text-body hover:bg-subtle focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring">选择文件<input
             class="sr-only"
             type="file"
-            accept=".md,text/markdown"
+            accept=".md,.pdf,text/markdown,application/pdf"
             :disabled="uploading"
             @change="chooseFile"
           ></label>
@@ -554,7 +660,10 @@ onBeforeUnmount(stopIndexPolling);
                 </p>
               </div>
             </details>
-            <section class="mt-6 border-t border-border pt-5">
+            <section
+              v-if="!selectedDocumentIsPdf"
+              class="mt-6 border-t border-border pt-5"
+            >
               <h4 class="font-semibold text-foreground">
                 文档处理
               </h4>
@@ -610,6 +719,30 @@ onBeforeUnmount(stopIndexPolling);
                   {{ processingPending ? "处理中…" : successfulChunkMaxChars === null ? "处理文档" : "重新切片" }}
                 </Button>
               </form>
+            </section>
+            <section
+              v-else
+              class="mt-6 border-t border-border pt-5"
+            >
+              <h4 class="font-semibold text-foreground">
+                PDF 处理
+              </h4>
+              <p class="mt-2 text-body" aria-live="polite">
+                {{ documentProcessingLoading ? "正在读取处理状态…" : processingStatusText(documentProcessingStatus) }}
+              </p>
+              <p
+                v-if="documentProcessingStatus?.latest_attempt?.status === 'FAILED' || documentProcessingStatus?.latest_attempt?.status === 'INTERRUPTED'"
+                class="mt-2 break-words text-sm leading-6 text-muted-foreground"
+              >
+                {{ documentProcessingStatus.latest_attempt.error_message ?? "请稍后查看处理状态。" }}
+              </p>
+              <p
+                v-if="documentProcessingError"
+                role="alert"
+                class="mt-2 text-danger-foreground"
+              >
+                {{ documentProcessingError }}
+              </p>
             </section>
             <section class="mt-6 border-t border-border pt-5">
               <div class="flex items-baseline justify-between gap-3">
@@ -671,12 +804,18 @@ onBeforeUnmount(stopIndexPolling);
                   <p class="font-medium text-foreground">
                     #{{ chunk.ordinal }}
                   </p>
-                  <p
-                    v-if="chunk.heading_path.length > 0"
-                    class="mt-1 text-xs text-muted-foreground"
-                  >
-                    当前位置：{{ chunk.heading_path.join(" › ") }}
-                  </p>
+                <p
+                  v-if="chunk.heading_path.length > 0"
+                  class="mt-1 text-xs text-muted-foreground"
+                >
+                  当前位置：{{ chunk.heading_path.join(" › ") }}
+                </p>
+                <p
+                  v-if="selectedDocumentIsPdf && pdfPageLocation(chunk.source_regions)"
+                  class="mt-1 text-xs font-medium text-body"
+                >
+                  页码：{{ pdfPageLocation(chunk.source_regions) }}
+                </p>
                   <p class="mt-2 break-words whitespace-pre-wrap text-body">
                     {{ expandedChunkOrdinals.includes(chunk.ordinal) ? chunk.content : `${chunk.content.slice(0, 240)}${chunk.content.length > 240 ? "…" : ""}` }}
                   </p>
