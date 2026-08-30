@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+import sys
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
 from uuid import UUID, uuid4
@@ -14,7 +15,7 @@ from langley.knowledge.contracts import StoredSource
 
 def process_is_alive(pid: int) -> bool:
     """Return process liveness without waiting for or signalling the process."""
-    if os.name != "nt":
+    if sys.platform != "win32":
         try:
             os.kill(pid, 0)
         except ProcessLookupError:

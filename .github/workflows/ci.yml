@@ -117,4 +117,4 @@ jobs:
       - name: Run MySQL integration tests
         run: >-
           uv run --no-sync pytest tests/integration
-          --ignore=tests/integration/test_knowledge_retrieval_qdrant.py
+          --ignore-glob='tests/integration/*_qdrant.py'

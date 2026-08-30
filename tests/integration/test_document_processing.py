@@ -700,7 +700,16 @@ def test_atomic_pdf_publication_replaces_all_or_preserves_old_chunks(
                     CandidateChunk(1, "bad two", (), (PdfPageRegion(1, 1),)),
                 ),
             )
-            with pytest.raises(IntegrityError):
+            published_facts = [
+                (
+                    chunk.ordinal,
+                    chunk.content,
+                    chunk.heading_path,
+                    chunk.source_regions,
+                )
+                for chunk in chunks
+            ]
+            with pytest.raises(ValueError, match="invalid chunk ordinal"):
                 await publish_pdf_processing_result(
                     session_factory,
                     claim=failed_claim,
@@ -720,7 +729,15 @@ def test_atomic_pdf_publication_replaces_all_or_preserves_old_chunks(
                     )
                 ).all()
                 job = await session.get(DocumentProcessingJob, failed_claim.job_id)
-                assert [chunk.content for chunk in chunks] == ["new one", "new two"]
+                assert [
+                    (
+                        chunk.ordinal,
+                        chunk.content,
+                        chunk.heading_path,
+                        chunk.source_regions,
+                    )
+                    for chunk in chunks
+                ] == published_facts
                 assert job is not None and (
                     job.status,
                     job.error_code,

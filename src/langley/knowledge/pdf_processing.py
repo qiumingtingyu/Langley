@@ -110,6 +110,9 @@ async def _terminate_and_reap(process: asyncio.subprocess.Process) -> None:
 
 def _wait_for_windows_process_exit(pid: int, timeout_seconds: float) -> bool:
     """Wait a bounded interval for one exact Windows PID to exit."""
+    if sys.platform != "win32":
+        raise RuntimeError("Windows process wait is unavailable on this platform")
+
     import ctypes
     from ctypes import wintypes
 
@@ -152,6 +155,11 @@ def _wait_for_windows_process_exit(pid: int, timeout_seconds: float) -> bool:
 
 def _force_terminate_windows_process(pid: int, timeout_seconds: float) -> None:
     """Force one exact Windows PID to terminate and confirm bounded exit."""
+    if sys.platform != "win32":
+        raise RuntimeError(
+            "Windows process termination is unavailable on this platform"
+        )
+
     import ctypes
     from ctypes import wintypes
 
@@ -326,7 +334,7 @@ class PersistentPdfWorker:
             else:
                 await process.wait()
             if (
-                os.name == "nt"
+                sys.platform == "win32"
                 and worker_pid is not None
                 and not await asyncio.to_thread(
                     _wait_for_windows_process_exit, worker_pid, 0
@@ -346,7 +354,7 @@ class PersistentPdfWorker:
                 return self._process
             await self._terminate()
         creationflags = 0
-        if os.name == "nt":
+        if sys.platform == "win32":
             import subprocess
 
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -557,7 +565,7 @@ class PersistentPdfWorker:
         worker_pid = self._worker_pid
         if process.stdin is not None:
             process.stdin.close()
-        if os.name == "nt" and worker_pid is not None:
+        if sys.platform == "win32" and worker_pid is not None:
             worker_exited = await asyncio.to_thread(
                 _wait_for_windows_process_exit,
                 worker_pid,

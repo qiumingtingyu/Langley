@@ -2,7 +2,9 @@
 
 import asyncio
 from argparse import Namespace
+from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from alembic import command
@@ -418,7 +420,7 @@ def test_same_version_concurrent_distinct_rebuilds_leave_one_complete_set(
 def test_insert_failure_after_delete_rolls_back_to_the_complete_old_set(
     migrated_database: str, tmp_path: Path
 ) -> None:
-    """R6: MySQL uniqueness failure rolls back the DELETE and all replacement rows."""
+    """R6: MySQL insert failure rolls back DELETE and all replacement rows."""
 
     async def verify() -> None:
         engine = create_database_engine(migrated_database)
@@ -430,20 +432,21 @@ def test_insert_failure_after_delete_rolls_back_to_the_complete_old_set(
             source_ref = await load_document_source_ref(
                 factory, user_id=1, document_version_id=version.id
             )
-            duplicate_rows = _materialize_chunk_rows(
+            database_invalid_rows = _materialize_chunk_rows(
                 version.id,
                 (
                     CandidateChunk(1, "new", (), (TextSpanRegion(4, 7),)),
-                    CandidateChunk(1, "set", (), (TextSpanRegion(4, 7),)),
+                    CandidateChunk(2, "set", (), (TextSpanRegion(8, 11),)),
                 ),
             )
+            database_invalid_rows[1].created_at = cast(datetime, None)
 
             with pytest.raises(IntegrityError):
                 await _replace_document_version_chunks(
                     session_factory=factory,
                     user_id=1,
                     source_ref=source_ref,
-                    prepared_rows=duplicate_rows,
+                    prepared_rows=database_invalid_rows,
                 )
 
             assert await _chunk_facts(factory, version.id) == old_facts
