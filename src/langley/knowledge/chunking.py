@@ -109,15 +109,16 @@ def _split_section(
             source_bytes[byte_cursor:end_byte] != content_bytes
         ):
             raise RuntimeError("text splitter chunk does not match source bytes")
-        candidates.append(
-            _direct_chunk(
-                first_ordinal + len(candidates),
-                content,
-                heading_path,
-                byte_cursor,
-                end_byte,
+        if not content.isspace():
+            candidates.append(
+                _direct_chunk(
+                    first_ordinal + len(candidates),
+                    content,
+                    heading_path,
+                    byte_cursor,
+                    end_byte,
+                )
             )
-        )
         char_cursor += len(content)
         byte_cursor = end_byte
     if char_cursor != len(section_text) or byte_cursor != section_end_byte:
@@ -128,7 +129,7 @@ def _split_section(
 def build_candidate_chunks(
     parsed: ParsedDocument, config: ChunkingConfig
 ) -> tuple[CandidateChunk, ...]:
-    """Build lossless current candidates from parsed heading boundaries."""
+    """Build provenance-exact candidates, excluding whitespace-only content."""
 
     source_bytes = parsed.source_bytes
     _validate_headings(parsed.headings, len(source_bytes))

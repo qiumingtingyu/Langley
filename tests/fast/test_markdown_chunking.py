@@ -18,6 +18,8 @@ def _facts(chunks):
 def _assert_provenance(source: bytes, chunks) -> None:
     assert [item.ordinal for item in chunks] == list(range(1, len(chunks) + 1))
     for item in chunks:
+        assert item.content != ""
+        assert not item.content.isspace()
         region = item.source_regions[0]
         assert source[region.start_byte : region.end_byte] == item.content.encode()
 
@@ -97,7 +99,7 @@ def test_oversize_and_unicode_provenance_is_lossless(source: bytes) -> None:
     _assert_provenance(source, chunks)
 
 
-def test_splitter_whitespace_piece_is_retained(monkeypatch) -> None:
+def test_splitter_whitespace_piece_is_not_published(monkeypatch) -> None:
     class FakeSplitter:
         def __init__(self, **_kwargs) -> None:
             pass
@@ -107,8 +109,32 @@ def test_splitter_whitespace_piece_is_retained(monkeypatch) -> None:
 
     monkeypatch.setattr("langley.knowledge.chunking.TextSplitter", FakeSplitter)
     source = b"abc   def"
+    source_before = bytes(source)
     chunks = _build(source, 4)
-    assert [item.content for item in chunks] == ["abc", "   ", "def"]
+    assert [item.content for item in chunks] == ["abc", "def"]
+    assert [item.ordinal for item in chunks] == [1, 2]
+    assert [item.source_regions[0] for item in chunks] == [
+        TextSpanRegion(0, 3),
+        TextSpanRegion(6, 9),
+    ]
+    assert source == source_before == b"abc   def"
+    _assert_provenance(source, chunks)
+
+
+def test_real_splitter_does_not_publish_standalone_newlines() -> None:
+    source = b"abc\n\n\ndef"
+
+    chunks = _build(source, 1)
+
+    assert [item.content for item in chunks] == list("abcdef")
+    assert [item.source_regions[0] for item in chunks] == [
+        TextSpanRegion(0, 1),
+        TextSpanRegion(1, 2),
+        TextSpanRegion(2, 3),
+        TextSpanRegion(6, 7),
+        TextSpanRegion(7, 8),
+        TextSpanRegion(8, 9),
+    ]
     _assert_provenance(source, chunks)
 
 
