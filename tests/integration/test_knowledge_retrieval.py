@@ -29,6 +29,10 @@ from langley.knowledge.index_build import (
     DenseSearchHit,
     current_knowledge_chunks_statement,
 )
+from langley.knowledge.reads import (
+    AdjacentKnowledgeAnchorChangedError,
+    read_adjacent_knowledge_chunks,
+)
 from langley.knowledge.retrieval import (
     KnowledgeBaseRetrievalNotFoundError,
     RetrievalIndexInconsistentError,
@@ -125,6 +129,10 @@ def migrated_database(test_database_url: str, reset_database) -> str:
 class _Seed:
     knowledge_base_id: int
     other_knowledge_base_id: int
+    document_id: int
+    document_version_id: int
+    other_document_id: int
+    other_document_version_id: int
     first_chunk_id: int
     second_chunk_id: int
     other_chunk_id: int
@@ -244,6 +252,10 @@ async def _seed(database_url: str) -> _Seed:
             return _Seed(
                 knowledge_base_id=bases[0].id,
                 other_knowledge_base_id=bases[1].id,
+                document_id=documents[0].id,
+                document_version_id=versions[0].id,
+                other_document_id=documents[1].id,
+                other_document_version_id=versions[1].id,
                 first_chunk_id=chunks[0].id,
                 second_chunk_id=chunks[1].id,
                 other_chunk_id=chunks[2].id,
@@ -280,6 +292,126 @@ def test_real_mysql_retrieval_uses_authoritative_rows_and_qdrant_order(
                 (2, seed.first_chunk_id, "first"),
             ]
             assert runtime.encode_call_count == runtime.search_call_count == 1
+        finally:
+            await dispose_database_engine(engine)
+
+    asyncio.run(scenario())
+
+
+def test_real_mysql_adjacent_chunk_read_is_scoped_and_anchor_stable(
+    migrated_database: str,
+) -> None:
+    async def scenario() -> None:
+        seed = await _seed(migrated_database)
+        engine = create_database_engine(migrated_database)
+        factory = create_session_factory(engine)
+        try:
+            first_neighbors = await read_adjacent_knowledge_chunks(
+                factory,
+                user_id=1,
+                knowledge_base_id=seed.knowledge_base_id,
+                anchor_knowledge_chunk_id=seed.first_chunk_id,
+                anchor_chunk_ordinal=1,
+                anchor_document_id=seed.document_id,
+                anchor_document_version_id=seed.document_version_id,
+                anchor_content="first",
+                anchor_heading_path=("First",),
+                anchor_source_regions=({"kind": "text", "start": 0, "end": 1},),
+                anchor_source_display_name="Retrieval",
+                anchor_source_sha256="c" * 64,
+            )
+            assert [
+                (neighbor.position, neighbor.knowledge_chunk_id)
+                for neighbor in first_neighbors
+            ] == [("next", seed.second_chunk_id)]
+
+            second_neighbors = await read_adjacent_knowledge_chunks(
+                factory,
+                user_id=1,
+                knowledge_base_id=seed.knowledge_base_id,
+                anchor_knowledge_chunk_id=seed.second_chunk_id,
+                anchor_chunk_ordinal=2,
+                anchor_document_id=seed.document_id,
+                anchor_document_version_id=seed.document_version_id,
+                anchor_content="second",
+                anchor_heading_path=("Second",),
+                anchor_source_regions=({"kind": "text", "start": 1, "end": 2},),
+                anchor_source_display_name="Retrieval",
+                anchor_source_sha256="c" * 64,
+            )
+            assert [
+                (neighbor.position, neighbor.knowledge_chunk_id)
+                for neighbor in second_neighbors
+            ] == [("previous", seed.first_chunk_id)]
+
+            assert (
+                await read_adjacent_knowledge_chunks(
+                    factory,
+                    user_id=1,
+                    knowledge_base_id=seed.other_knowledge_base_id,
+                    anchor_knowledge_chunk_id=seed.other_chunk_id,
+                    anchor_chunk_ordinal=1,
+                    anchor_document_id=seed.other_document_id,
+                    anchor_document_version_id=seed.other_document_version_id,
+                    anchor_content="other",
+                    anchor_heading_path=(),
+                    anchor_source_regions=({"kind": "text", "start": 0, "end": 1},),
+                    anchor_source_display_name="Other",
+                    anchor_source_sha256="c" * 64,
+                )
+                == ()
+            )
+
+            with pytest.raises(AdjacentKnowledgeAnchorChangedError):
+                await read_adjacent_knowledge_chunks(
+                    factory,
+                    user_id=2,
+                    knowledge_base_id=seed.knowledge_base_id,
+                    anchor_knowledge_chunk_id=seed.second_chunk_id,
+                    anchor_chunk_ordinal=2,
+                    anchor_document_id=seed.document_id,
+                    anchor_document_version_id=seed.document_version_id,
+                    anchor_content="second",
+                    anchor_heading_path=("Second",),
+                    anchor_source_regions=({"kind": "text", "start": 1, "end": 2},),
+                    anchor_source_display_name="Retrieval",
+                    anchor_source_sha256="c" * 64,
+                )
+
+            async with factory() as session, session.begin():
+                await session.execute(
+                    delete(KnowledgeChunk).where(
+                        KnowledgeChunk.id == seed.second_chunk_id
+                    )
+                )
+                session.add(
+                    KnowledgeChunk(
+                        document_version_id=seed.document_version_id,
+                        ordinal=2,
+                        content="replacement second",
+                        heading_path=["Replacement"],
+                        source_regions=[
+                            {"kind": "text_span", "start_byte": 1, "end_byte": 2}
+                        ],
+                        created_at=utc_now(),
+                    )
+                )
+
+            with pytest.raises(AdjacentKnowledgeAnchorChangedError):
+                await read_adjacent_knowledge_chunks(
+                    factory,
+                    user_id=1,
+                    knowledge_base_id=seed.knowledge_base_id,
+                    anchor_knowledge_chunk_id=seed.second_chunk_id,
+                    anchor_chunk_ordinal=2,
+                    anchor_document_id=seed.document_id,
+                    anchor_document_version_id=seed.document_version_id,
+                    anchor_content="second",
+                    anchor_heading_path=("Second",),
+                    anchor_source_regions=({"kind": "text", "start": 1, "end": 2},),
+                    anchor_source_display_name="Retrieval",
+                    anchor_source_sha256="c" * 64,
+                )
         finally:
             await dispose_database_engine(engine)
 

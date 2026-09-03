@@ -10,12 +10,17 @@ from langley.answering.contracts import ToolCall, ToolResultKind
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.tools import (
     CurrentTimeTool,
+    ExpandEvidenceTool,
     SearchKnowledgeTool,
     ToolContext,
     ToolExecutor,
 )
 from langley.answering.tracing import KnowledgeSearchOrigin
 from langley.knowledge import retrieval_service
+from langley.knowledge.reads import (
+    AdjacentKnowledgeAnchorChangedError,
+    AdjacentKnowledgeChunkRead,
+)
 from langley.knowledge.retrieval import (
     IndexNotReadyError,
     RetrievalHit,
@@ -180,15 +185,174 @@ async def test_search_uses_only_server_context_and_safe_evidence() -> None:
     )[0]
     assert result.kind is ToolResultKind.SUCCESS
     assert service.calls == [(42, 43, "TCP", 2)]
-    assert json.loads(result.content) == {
-        "evidence": [
+    assert result.content == (
+        '{"evidence":[{"evidence_handle":"K1","content":"TIME-WAIT prevents '
+        'delayed packets from being misread.","source_display_name":"tcp.md",'
+        '"heading_path":["TCP","TIME-WAIT"]}]}'
+    )
+
+
+def _neighbor(
+    chunk_id: int,
+    ordinal: int,
+    position: str,
+) -> AdjacentKnowledgeChunkRead:
+    return AdjacentKnowledgeChunkRead(
+        position=position,  # type: ignore[arg-type]
+        knowledge_chunk_id=chunk_id,
+        chunk_ordinal=ordinal,
+        document_id=12,
+        document_version_id=13,
+        content=f"chunk {ordinal}",
+        heading_path=("TCP", f"Part {ordinal}"),
+        source_regions=(
             {
-                "evidence_handle": 1,
-                "content": "TIME-WAIT prevents delayed packets from being misread.",
+                "kind": "text_span",
+                "start_byte": ordinal,
+                "end_byte": ordinal + 1,
+            },
+        ),
+        source_display_name="tcp.md",
+        source_sha256="a" * 64,
+    )
+
+
+@pytest.mark.anyio
+async def test_expand_evidence_is_handle_only_cumulative_and_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    changed = False
+
+    async def read_neighbors(*args: object, **kwargs: object):
+        del args
+        if changed:
+            raise AdjacentKnowledgeAnchorChangedError
+        anchor_id = kwargs["anchor_knowledge_chunk_id"]
+        return {
+            11: (_neighbor(10, 3, "previous"), _neighbor(12, 5, "next")),
+            10: (_neighbor(11, 4, "next"),),
+            12: (_neighbor(11, 4, "previous"), _neighbor(13, 6, "next")),
+            13: (),
+        }[anchor_id]
+
+    monkeypatch.setattr(
+        "langley.answering.tools.read_adjacent_knowledge_chunks", read_neighbors
+    )
+    context = _context()
+    context.knowledge_evidence.register_hit(_hit())
+    executor = ToolExecutor(
+        tools=(ExpandEvidenceTool(None),)  # type: ignore[arg-type]
+    )
+
+    schema = ExpandEvidenceTool.spec.arguments_schema
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["evidence_handle"]["pattern"] == "^K[1-9][0-9]*$"
+    for raw_arguments in (
+        '{"evidence_handle":2}',
+        '{"evidence_handle":"K0"}',
+        '{"evidence_handle":"K1","ordinal":4}',
+    ):
+        result = (
+            await executor.execute_batch(
+                (ToolCall("expand-invalid", "expand_evidence", raw_arguments),),
+                context=context,
+            )
+        )[0]
+        assert result.kind is ToolResultKind.INVALID_ARGUMENTS
+
+    unknown = (
+        await executor.execute_batch(
+            (
+                ToolCall(
+                    "expand-unknown",
+                    "expand_evidence",
+                    '{"evidence_handle":"K9"}',
+                ),
+            ),
+            context=context,
+        )
+    )[0]
+    assert unknown.kind is ToolResultKind.TOOL_ERROR
+    assert json.loads(unknown.content) == {
+        "error": {"code": "KNOWLEDGE_EVIDENCE_UNAVAILABLE", "retryable": False}
+    }
+
+    first = (
+        await executor.execute_batch(
+            (ToolCall("expand-1", "expand_evidence", '{"evidence_handle":"K1"}'),),
+            context=context,
+        )
+    )[0]
+    assert json.loads(first.content) == {
+        "anchor": "K1",
+        "neighbors": [
+            {
+                "position": "previous",
+                "evidence_handle": "K2",
+                "status": "new",
+                "content": "chunk 3",
                 "source_display_name": "tcp.md",
-                "heading_path": ["TCP", "TIME-WAIT"],
-            }
-        ]
+                "heading_path": ["TCP", "Part 3"],
+            },
+            {
+                "position": "next",
+                "evidence_handle": "K3",
+                "status": "new",
+                "content": "chunk 5",
+                "source_display_name": "tcp.md",
+                "heading_path": ["TCP", "Part 5"],
+            },
+        ],
+    }
+
+    repeated = (
+        await executor.execute_batch(
+            (ToolCall("expand-2", "expand_evidence", '{"evidence_handle":"K1"}'),),
+            context=context,
+        )
+    )[0]
+    assert json.loads(repeated.content) == {
+        "anchor": "K1",
+        "neighbors": [
+            {"position": "previous", "evidence_handle": "K2", "status": "existing"},
+            {"position": "next", "evidence_handle": "K3", "status": "existing"},
+        ],
+    }
+
+    chained = (
+        await executor.execute_batch(
+            (ToolCall("expand-3", "expand_evidence", '{"evidence_handle":"K3"}'),),
+            context=context,
+        )
+    )[0]
+    assert json.loads(chained.content)["neighbors"] == [
+        {"position": "previous", "evidence_handle": "K1", "status": "existing"},
+        {
+            "position": "next",
+            "evidence_handle": "K4",
+            "status": "new",
+            "content": "chunk 6",
+            "source_display_name": "tcp.md",
+            "heading_path": ["TCP", "Part 6"],
+        },
+    ]
+    boundary = (
+        await executor.execute_batch(
+            (ToolCall("expand-4", "expand_evidence", '{"evidence_handle":"K4"}'),),
+            context=context,
+        )
+    )[0]
+    assert json.loads(boundary.content) == {"anchor": "K4", "neighbors": []}
+
+    changed = True
+    stale = (
+        await executor.execute_batch(
+            (ToolCall("expand-5", "expand_evidence", '{"evidence_handle":"K1"}'),),
+            context=context,
+        )
+    )[0]
+    assert json.loads(stale.content) == {
+        "error": {"code": "KNOWLEDGE_EVIDENCE_CHANGED", "retryable": False}
     }
 
 

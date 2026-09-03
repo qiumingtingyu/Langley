@@ -16,6 +16,7 @@ from pydantic import (
     ValidationError,
     field_validator,
 )
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.answering.contracts import (
     JSONValue,
@@ -25,6 +26,7 @@ from langley.answering.contracts import (
     ToolSpec,
 )
 from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.knowledge_evidence import KnowledgeEvidenceSession
 from langley.answering.tracing import tool_trace_context
 from langley.answering.web import (
     WebProvider,
@@ -32,7 +34,10 @@ from langley.answering.web import (
     WebSessionError,
     WebToolSession,
 )
-from langley.knowledge.retrieval import RetrievalHit
+from langley.knowledge.reads import (
+    AdjacentKnowledgeAnchorChangedError,
+    read_adjacent_knowledge_chunks,
+)
 from langley.knowledge.retrieval_service import (
     KnowledgeRetrievalService,
     KnowledgeSearchError,
@@ -50,6 +55,10 @@ class ToolContext:
     user_id: int
     knowledge_base_id: int | None
     web_session: WebToolSession | None = None
+    knowledge_evidence: KnowledgeEvidenceSession = field(
+        default_factory=KnowledgeEvidenceSession
+    )
+    knowledge_search_ordinal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -57,7 +66,6 @@ class ToolExecutionOutput:
     """One transient tool outcome split between model and workflow channels."""
 
     observation: str
-    retrieval_hits: tuple[RetrievalHit, ...] = ()
     trace_metadata: dict[str, JSONValue] = field(default_factory=dict)
 
 
@@ -200,22 +208,157 @@ class SearchKnowledgeTool:
         except KnowledgeSearchError as error:
             raise ToolExecutionError(error.code, retryable=error.retryable) from error
 
+        if context.knowledge_search_ordinal != 2:
+            registered_evidence = context.knowledge_evidence.register_hits(result.hits)
+            return ToolExecutionOutput(
+                observation=json.dumps(
+                    {
+                        "evidence": [
+                            {
+                                "evidence_handle": f"K{item.evidence_handle}",
+                                "content": item.content,
+                                "source_display_name": item.source_display_name,
+                                "heading_path": list(item.heading_path),
+                            }
+                            for item in registered_evidence
+                        ]
+                    },
+                    separators=(",", ":"),
+                )
+            )
+
+        observations: list[JSONValue] = []
+        new_evidence_count = 0
+        for hit in result.hits:
+            existing = context.knowledge_evidence.resolve_chunk(hit.knowledge_chunk_id)
+            evidence = context.knowledge_evidence.register_hit(hit)
+            observation: dict[str, JSONValue] = {
+                "evidence_handle": f"K{evidence.evidence_handle}",
+                "status": "existing" if existing is not None else "new",
+                "source_display_name": evidence.source_display_name,
+                "heading_path": list(evidence.heading_path),
+            }
+            if existing is None:
+                observation["content"] = evidence.content
+                new_evidence_count += 1
+            observations.append(observation)
+
+        no_progress = context.knowledge_search_ordinal == 2 and new_evidence_count == 0
+        payload: dict[str, JSONValue] = {
+            "evidence": observations,
+            "new_evidence_count": new_evidence_count,
+        }
+        trace_metadata: dict[str, JSONValue] = {
+            "new_evidence_count": new_evidence_count,
+        }
+        if no_progress:
+            payload["status"] = "NO_PROGRESS"
+            trace_metadata["knowledge_search_outcome"] = "NO_PROGRESS"
+        return ToolExecutionOutput(
+            observation=json.dumps(payload, separators=(",", ":")),
+            trace_metadata=trace_metadata,
+        )
+
+
+class ExpandEvidenceArguments(BaseModel):
+    """The handle-only model contract for local Knowledge expansion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_handle: Annotated[
+        str,
+        StringConstraints(strict=True, pattern=r"^K[1-9][0-9]*$"),
+    ]
+
+
+class ExpandEvidenceTool:
+    """Read immediate authoritative neighbors of one Run-local K# anchor."""
+
+    spec = ToolSpec(
+        name="expand_evidence",
+        description=(
+            "Read the immediate previous and next chunks around a relevant K# "
+            "when its local context is insufficient. Pass only a handle returned "
+            "in this run. Do not use when the available evidence is sufficient."
+        ),
+        arguments_schema=cast(
+            dict[str, JSONValue], ExpandEvidenceArguments.model_json_schema()
+        ),
+    )
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    def validate_arguments(self, arguments: dict[str, JSONValue]) -> bool:
+        try:
+            ExpandEvidenceArguments.model_validate(arguments)
+        except ValidationError:
+            return False
+        return True
+
+    async def execute(
+        self,
+        arguments: dict[str, JSONValue],
+        context: ToolContext | None,
+    ) -> ToolExecutionOutput:
+        validated = ExpandEvidenceArguments.model_validate(arguments)
+        if context is None or context.knowledge_base_id is None:
+            raise ToolExecutionError("KNOWLEDGE_SCOPE_UNAVAILABLE", retryable=False)
+
+        evidence_handle = int(validated.evidence_handle[1:])
+        anchor = context.knowledge_evidence.resolve(evidence_handle)
+        if anchor is None:
+            raise ToolExecutionError("KNOWLEDGE_EVIDENCE_UNAVAILABLE", retryable=False)
+
+        try:
+            neighbors = await read_adjacent_knowledge_chunks(
+                self._session_factory,
+                user_id=context.user_id,
+                knowledge_base_id=context.knowledge_base_id,
+                anchor_knowledge_chunk_id=anchor.knowledge_chunk_id,
+                anchor_chunk_ordinal=anchor.chunk_ordinal,
+                anchor_document_id=anchor.document_id,
+                anchor_document_version_id=anchor.document_version_id,
+                anchor_content=anchor.content,
+                anchor_heading_path=anchor.heading_path,
+                anchor_source_regions=anchor.source_regions,
+                anchor_source_display_name=anchor.source_display_name,
+                anchor_source_sha256=anchor.source_sha256,
+            )
+        except AdjacentKnowledgeAnchorChangedError as error:
+            raise ToolExecutionError(
+                "KNOWLEDGE_EVIDENCE_CHANGED", retryable=False
+            ) from error
+
+        observations: list[dict[str, JSONValue]] = []
+        for neighbor in neighbors:
+            existing = context.knowledge_evidence.resolve_chunk(
+                neighbor.knowledge_chunk_id
+            )
+            evidence = context.knowledge_evidence.register_chunk(neighbor)
+            observation: dict[str, JSONValue] = {
+                "position": neighbor.position,
+                "evidence_handle": f"K{evidence.evidence_handle}",
+                "status": "existing" if existing is not None else "new",
+            }
+            if existing is None:
+                observation.update(
+                    {
+                        "content": evidence.content,
+                        "source_display_name": evidence.source_display_name,
+                        "heading_path": list(evidence.heading_path),
+                    }
+                )
+            observations.append(observation)
+
         return ToolExecutionOutput(
             observation=json.dumps(
                 {
-                    "evidence": [
-                        {
-                            "evidence_handle": evidence_handle,
-                            "content": hit.content,
-                            "source_display_name": hit.source_display_name,
-                            "heading_path": list(hit.heading_path),
-                        }
-                        for evidence_handle, hit in enumerate(result.hits, start=1)
-                    ]
+                    "anchor": validated.evidence_handle,
+                    "neighbors": observations,
                 },
                 separators=(",", ":"),
-            ),
-            retrieval_hits=result.hits,
+            )
         )
 
 

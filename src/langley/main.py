@@ -20,6 +20,7 @@ from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.tools import (
     AgentTool,
     CurrentTimeTool,
+    ExpandEvidenceTool,
     ReadWebpageTool,
     SearchKnowledgeTool,
     SearchWebTool,
@@ -266,6 +267,7 @@ def _workflow_factory_for(
     tools: list[AgentTool] = [
         CurrentTimeTool(),
         SearchKnowledgeTool(retrieval_service),
+        ExpandEvidenceTool(session_factory),
     ]
     if settings.web_search_enabled:
         assert settings.tavily_api_key is not None

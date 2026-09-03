@@ -2,9 +2,10 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from sqlalchemy import exists, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from langley.infrastructure.models import (
     Document,
@@ -77,6 +78,144 @@ class DocumentProcessingRead:
     document_version_id: int
     latest_attempt: DocumentProcessingJobRead | None
     published_chunks_exist: bool
+
+
+@dataclass(frozen=True)
+class AdjacentKnowledgeChunkRead:
+    """One authoritative neighbor of a validated current KnowledgeChunk."""
+
+    position: Literal["previous", "next"]
+    knowledge_chunk_id: int
+    chunk_ordinal: int
+    document_id: int
+    document_version_id: int
+    content: str
+    heading_path: tuple[str, ...]
+    source_regions: tuple[object, ...]
+    source_display_name: str
+    source_sha256: str
+
+
+class AdjacentKnowledgeAnchorChangedError(Exception):
+    """The supplied anchor no longer identifies current retrievable Knowledge."""
+
+
+async def read_adjacent_knowledge_chunks(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: int,
+    knowledge_base_id: int,
+    anchor_knowledge_chunk_id: int,
+    anchor_chunk_ordinal: int,
+    anchor_document_id: int,
+    anchor_document_version_id: int,
+    anchor_content: str,
+    anchor_heading_path: tuple[str, ...],
+    anchor_source_regions: tuple[object, ...],
+    anchor_source_display_name: str,
+    anchor_source_sha256: str,
+) -> tuple[AdjacentKnowledgeChunkRead, ...]:
+    """Validate one current anchor and read its ordinal neighbors atomically."""
+
+    async with session_factory() as session:
+        async with session.begin():
+            anchor = (
+                await session.execute(
+                    select(
+                        KnowledgeChunk.id,
+                        KnowledgeChunk.ordinal,
+                        KnowledgeChunk.content,
+                        KnowledgeChunk.heading_path,
+                        KnowledgeChunk.source_regions,
+                        Document.id.label("document_id"),
+                        DocumentVersion.id.label("document_version_id"),
+                        Document.name.label("source_display_name"),
+                        DocumentVersion.source_sha256,
+                    )
+                    .join(
+                        DocumentVersion,
+                        DocumentVersion.id == KnowledgeChunk.document_version_id,
+                    )
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .join(
+                        KnowledgeBase,
+                        KnowledgeBase.id == Document.knowledge_base_id,
+                    )
+                    .where(
+                        KnowledgeBase.id == knowledge_base_id,
+                        KnowledgeBase.user_id == user_id,
+                        KnowledgeBase.index_status == "READY",
+                        KnowledgeChunk.id == anchor_knowledge_chunk_id,
+                        DocumentVersion.chunk_revision > 0,
+                        DocumentVersion.indexed_chunk_revision
+                        == DocumentVersion.chunk_revision,
+                    )
+                )
+            ).one_or_none()
+            if anchor is None or (
+                anchor.ordinal != anchor_chunk_ordinal
+                or anchor.document_id != anchor_document_id
+                or anchor.document_version_id != anchor_document_version_id
+                or anchor.content != anchor_content
+                or tuple(anchor.heading_path) != anchor_heading_path
+                or tuple(anchor.source_regions) != anchor_source_regions
+                or anchor.source_display_name != anchor_source_display_name
+                or anchor.source_sha256 != anchor_source_sha256
+            ):
+                raise AdjacentKnowledgeAnchorChangedError
+
+            neighbor_ordinals = tuple(
+                ordinal
+                for ordinal in (
+                    anchor_chunk_ordinal - 1,
+                    anchor_chunk_ordinal + 1,
+                )
+                if ordinal > 0
+            )
+            if not neighbor_ordinals:
+                return ()
+
+            rows = (
+                await session.execute(
+                    select(
+                        KnowledgeChunk.id,
+                        KnowledgeChunk.ordinal,
+                        KnowledgeChunk.content,
+                        KnowledgeChunk.heading_path,
+                        KnowledgeChunk.source_regions,
+                        Document.id.label("document_id"),
+                        DocumentVersion.id.label("document_version_id"),
+                        Document.name.label("source_display_name"),
+                        DocumentVersion.source_sha256,
+                    )
+                    .join(
+                        DocumentVersion,
+                        DocumentVersion.id == KnowledgeChunk.document_version_id,
+                    )
+                    .join(Document, Document.id == DocumentVersion.document_id)
+                    .where(
+                        DocumentVersion.id == anchor_document_version_id,
+                        KnowledgeChunk.ordinal.in_(neighbor_ordinals),
+                    )
+                    .order_by(KnowledgeChunk.ordinal.asc())
+                )
+            ).all()
+
+    return tuple(
+        AdjacentKnowledgeChunkRead(
+            position=("previous" if row.ordinal < anchor_chunk_ordinal else "next"),
+            knowledge_chunk_id=row.id,
+            chunk_ordinal=row.ordinal,
+            document_id=row.document_id,
+            document_version_id=row.document_version_id,
+            content=row.content,
+            heading_path=tuple(row.heading_path),
+            source_regions=tuple(row.source_regions),
+            source_display_name=row.source_display_name,
+            source_sha256=row.source_sha256,
+        )
+        for row in rows
+    )
 
 
 async def list_knowledge_bases(

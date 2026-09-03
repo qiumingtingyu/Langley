@@ -1,6 +1,7 @@
 """Deterministic production Workflow and LangGraph regression tests."""
 
 import asyncio
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ from langley.answering.grounding import GroundingPolicy
 from langley.answering.knowledge_qa import INSUFFICIENT_EVIDENCE_ANSWER
 from langley.answering.tools import (
     CurrentTimeTool,
+    ExpandEvidenceTool,
     ReadWebpageTool,
     SearchKnowledgeTool,
     SearchWebTool,
@@ -53,6 +55,7 @@ from langley.answering.web import (
 )
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.knowledge.casebook_baseline import CasebookBaselineTracer
+from langley.knowledge.reads import AdjacentKnowledgeChunkRead
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 from langley.knowledge.retrieval_service import KnowledgeSearchError
 
@@ -302,15 +305,19 @@ class _BoundaryCheckingProvider:
         return events()
 
 
-def _hit() -> RetrievalHit:
+def _hit(
+    knowledge_chunk_id: int = 11,
+    *,
+    content: str = "Authoritative TCP evidence.",
+) -> RetrievalHit:
     return RetrievalHit(
-        knowledge_chunk_id=11,
+        knowledge_chunk_id=knowledge_chunk_id,
         rank=1,
         retrieval_rank=1,
         score=0.9,
         rerank_score=None,
         chunk_ordinal=4,
-        content="Authoritative TCP evidence.",
+        content=content,
         heading_path=("TCP",),
         source_regions=(),
         document_id=12,
@@ -325,6 +332,7 @@ class _FakeRetrievalService:
     calls: list[tuple[int, int, str, int]] = field(default_factory=list)
     error: KnowledgeSearchError | None = None
     hits: tuple[RetrievalHit, ...] = field(default_factory=lambda: (_hit(),))
+    outcomes: list[tuple[RetrievalHit, ...] | KnowledgeSearchError] | None = None
     origins: list[object] = field(default_factory=list)
 
     async def search(
@@ -339,6 +347,13 @@ class _FakeRetrievalService:
     ) -> RetrievalResult:
         self.calls.append((user_id, knowledge_base_id, query, top_k))
         self.origins.append(origin)
+        if self.outcomes is not None:
+            outcome = self.outcomes[len(self.calls) - 1]
+            if isinstance(outcome, KnowledgeSearchError):
+                raise outcome
+            hits = outcome
+        else:
+            hits = self.hits
         if self.error is not None:
             raise self.error
         if trace_parent is not None:
@@ -348,10 +363,10 @@ class _FakeRetrievalService:
                 top_k=top_k,
                 query=query,
             )
-            search_trace.finish(len(self.hits))
+            search_trace.finish(len(hits))
         return RetrievalResult(
             knowledge_base_id=knowledge_base_id,
-            hits=self.hits,
+            hits=hits,
         )
 
 
@@ -360,6 +375,7 @@ def _rag_executor(service: _FakeRetrievalService) -> ToolExecutor:
         tools=(
             CurrentTimeTool(),
             SearchKnowledgeTool(service),  # type: ignore[arg-type]
+            ExpandEvidenceTool(None),  # type: ignore[arg-type]
         )
     )
 
@@ -555,6 +571,8 @@ async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
     assert service.calls == [(1, 44, "TCP", 5)]
     assert tuple(tool.name for tool in grounded_provider.requests[1].allowed_tools) == (
         "get_current_time",
+        "search_knowledge",
+        "expand_evidence",
     )
     assert completion.content == "TCP uses [K1]."
     assert [
@@ -567,16 +585,196 @@ async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
 
 
 @pytest.mark.anyio
-async def test_auto_with_knowledge_scope_neutralizes_historical_handles() -> None:
+async def test_expanded_handle_is_current_run_citation_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def read_neighbors(*args: object, **kwargs: object):
+        del args
+        assert kwargs["anchor_knowledge_chunk_id"] == 11
+        return (
+            AdjacentKnowledgeChunkRead(
+                position="next",
+                knowledge_chunk_id=12,
+                chunk_ordinal=5,
+                document_id=12,
+                document_version_id=13,
+                content="Expanded authoritative TCP evidence.",
+                heading_path=("TCP", "Next"),
+                source_regions=(
+                    {"kind": "text_span", "start_byte": 10, "end_byte": 20},
+                ),
+                source_display_name="tcp.md",
+                source_sha256="a" * 64,
+            ),
+        )
+
+    monkeypatch.setattr(
+        "langley.answering.tools.read_adjacent_knowledge_chunks", read_neighbors
+    )
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"TCP"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall(
+                                "expand-1",
+                                "expand_evidence",
+                                '{"evidence_handle":"K1"}',
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="Expanded fact [K2]."),)),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert tuple(tool.name for tool in provider.requests[0].allowed_tools) == (
+        "get_current_time",
+        "search_knowledge",
+    )
+    assert tuple(tool.name for tool in provider.requests[1].allowed_tools) == (
+        "get_current_time",
+        "search_knowledge",
+        "expand_evidence",
+    )
+    assert completion.content == "Expanded fact [K2]."
+    assert [citation.evidence_handle for citation in completion.citations] == [2]
+    expansion = cast(ToolResult, provider.requests[2].transcript[4])
+    assert json.loads(expansion.content)["neighbors"][0]["evidence_handle"] == "K2"
+
+
+@pytest.mark.anyio
+async def test_knowledge_dependent_tool_batches_are_rejected_before_execution() -> None:
+    search_call = ToolCall("search-1", "search_knowledge", '{"query":"TCP"}')
+    expand_call = ToolCall("expand-1", "expand_evidence", '{"evidence_handle":"K1"}')
+    combined_service = _FakeRetrievalService()
+    combined = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call, expand_call),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            )
+        ]
+    )
+
+    with pytest.raises(WorkflowFailure) as combined_failure:
+        await _execute_workflow(
+            _workflow(combined, tool_executor=_rag_executor(combined_service)),
+            knowledge_base_id=44,
+        )
+    assert combined_failure.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert combined_service.calls == []
+
+    double_search_service = _FakeRetrievalService()
+    double_search = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            search_call,
+                            ToolCall(
+                                "search-2",
+                                "search_knowledge",
+                                '{"query":"congestion control"}',
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            )
+        ]
+    )
+    with pytest.raises(WorkflowFailure) as double_search_failure:
+        await _execute_workflow(
+            _workflow(
+                double_search,
+                tool_executor=_rag_executor(double_search_service),
+            ),
+            knowledge_base_id=44,
+        )
+    assert double_search_failure.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert double_search_service.calls == []
+
+    repeated_service = _FakeRetrievalService()
+    repeated = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(search_call,),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            expand_call,
+                            ToolCall(
+                                "expand-2",
+                                "expand_evidence",
+                                '{"evidence_handle":"K2"}',
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(WorkflowFailure) as repeated_failure:
+        await _execute_workflow(
+            _workflow(repeated, tool_executor=_rag_executor(repeated_service)),
+            knowledge_base_id=44,
+        )
+    assert repeated_failure.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert repeated_service.calls == [(1, 44, "TCP", 5)]
+
+
+@pytest.mark.anyio
+async def test_model_history_strips_citations_without_mutating_source_context() -> None:
     context = AnswerContext(
         completed_turns=(
             CompletedTurn(
-                user_content="previous",
+                user_content="previous [K8]",
                 assistant_content="Earlier [K1] and [K2].",
                 estimated_tokens=8,
             ),
         ),
-        current_user_content="current",
+        current_user_content="current discusses [K9]",
+        conversation_compact_context="Compact [K3] and [W1:E1].",
     )
     provider = FakeProvider(
         [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
@@ -591,15 +789,16 @@ async def test_auto_with_knowledge_scope_neutralizes_historical_handles() -> Non
     )
 
     historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
-    assert historical.content == (
-        "Earlier <HISTORICAL_CITATION:K1> and <HISTORICAL_CITATION:K2>."
-    )
+    assert historical.content == "Earlier  and ."
+    assert provider.requests[0].transcript[0].content == "previous [K8]"
+    assert provider.requests[0].transcript[2].content == "current discusses [K9]"
+    assert provider.requests[0].conversation_compact_context == "Compact  and ."
+    assert context.completed_turns[0].assistant_content == "Earlier [K1] and [K2]."
+    assert context.conversation_compact_context == "Compact [K3] and [W1:E1]."
 
 
 @pytest.mark.anyio
-async def test_auto_without_knowledge_scope_preserves_historical_content_exactly() -> (
-    None
-):
+async def test_auto_without_knowledge_scope_also_strips_historical_citations() -> None:
     context = AnswerContext(
         completed_turns=(
             CompletedTurn(
@@ -622,7 +821,7 @@ async def test_auto_without_knowledge_scope_preserves_historical_content_exactly
     )
 
     historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
-    assert historical.content == "Earlier [K1] and [K2]."
+    assert historical.content == "Earlier  and ."
 
 
 @pytest.mark.anyio
@@ -665,7 +864,7 @@ async def test_auto_search_current_handle_maps_only_to_current_retrieval_hit() -
     )
 
     historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
-    assert historical.content == "Historical claim <HISTORICAL_CITATION:K1>."
+    assert historical.content == "Historical claim ."
     assert completion.content == "Current [K1]."
     assert [
         (citation.evidence_handle, citation.document_version_id)
@@ -716,9 +915,7 @@ async def test_retrieval_evidence_survives_a_later_time_tool_batch() -> None:
 
 
 @pytest.mark.anyio
-async def test_grounded_citation_validation_and_second_search_stop_before_service() -> (
-    None
-):
+async def test_grounding_and_duplicate_search2_stop_before_service() -> None:
     service = _FakeRetrievalService()
     search_call = ToolCall("search-1", "search_knowledge", '{"query":"TCP"}')
     missing_citation = FakeProvider(
@@ -799,6 +996,366 @@ async def test_grounded_citation_validation_and_second_search_stop_before_servic
 
 
 @pytest.mark.anyio
+async def test_distinct_search2_accumulates_evidence_and_hides_search3() -> None:
+    service = _FakeRetrievalService(
+        outcomes=[
+            (_hit(11), _hit(22, content="Initial congestion evidence.")),
+            (
+                _hit(11, content="Duplicate body must not replace K1."),
+                _hit(33, content="Distinct congestion-control evidence."),
+            ),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"TCP"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall(
+                                "search-2",
+                                "search_knowledge",
+                                '{"query":"congestion control"}',
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(_completion(content="TCP congestion uses [K1] and [K3]."),)
+            ),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert "another unresolved facet or retrieval angle or direction" in (
+        provider.requests[0].system_input
+    )
+    assert "directly grounded in the original user request" in (
+        provider.requests[0].system_input
+    )
+    assert "materially different query" in provider.requests[0].system_input
+    assert "do not use Search2 for multi-hop bridge discovery" in (
+        provider.requests[0].system_input
+    )
+    assert "no third Knowledge search" in provider.requests[0].system_input
+    assert (
+        "supports every distinct fact, mechanism, comparison, or other information "
+        "requirement explicitly requested by the user"
+        in provider.requests[0].system_input
+    )
+    assert "derive requirements only from the actual user question" in (
+        provider.requests[0].system_input
+    )
+    assert "Highly relevant evidence is not necessarily complete evidence" in (
+        provider.requests[0].system_input
+    )
+    assert (
+        "missing information is immediate local context around an existing K#"
+        in provider.requests[0].system_input
+    )
+    assert "If all explicit requirements are supported, answer directly" in (
+        provider.requests[0].system_input
+    )
+    assert tuple(tool.name for tool in provider.requests[1].allowed_tools) == (
+        "get_current_time",
+        "search_knowledge",
+        "expand_evidence",
+    )
+    assert tuple(tool.name for tool in provider.requests[2].allowed_tools) == (
+        "get_current_time",
+        "expand_evidence",
+    )
+    assert service.calls == [
+        (1, 44, "TCP", 5),
+        (1, 44, "congestion control", 5),
+    ]
+    second_observation = json.loads(
+        cast(ToolResult, provider.requests[2].transcript[4]).content
+    )
+    assert second_observation == {
+        "evidence": [
+            {
+                "evidence_handle": "K1",
+                "status": "existing",
+                "source_display_name": "tcp.md",
+                "heading_path": ["TCP"],
+            },
+            {
+                "evidence_handle": "K3",
+                "status": "new",
+                "source_display_name": "tcp.md",
+                "heading_path": ["TCP"],
+                "content": "Distinct congestion-control evidence.",
+            },
+        ],
+        "new_evidence_count": 1,
+    }
+    assert [citation.evidence_handle for citation in completion.citations] == [1, 3]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("search1_query", "search2_query"),
+    [
+        ("HashMap", " hashmap "),
+        ("hash map", "  HASH \t MAP  "),
+        ("ＡＢＣ", "ABC"),
+    ],
+)
+async def test_normalized_duplicate_search2_is_rejected_before_execution(
+    search1_query: str, search2_query: str
+) -> None:
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall(
+                                "search-1",
+                                "search_knowledge",
+                                json.dumps({"query": search1_query}),
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall(
+                                "search-2",
+                                "search_knowledge",
+                                json.dumps({"query": search2_query}),
+                            ),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(provider, tool_executor=_rag_executor(service)),
+            knowledge_base_id=44,
+        )
+
+    assert raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert service.calls == [(1, 44, search1_query.strip(), 5)]
+
+
+@pytest.mark.anyio
+async def test_search3_is_rejected_before_execution() -> None:
+    service = _FakeRetrievalService(outcomes=[(_hit(11),), (_hit(22),), (_hit(33),)])
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"A"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-2", "search_knowledge", '{"query":"B"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-3", "search_knowledge", '{"query":"C"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+        ]
+    )
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(provider, tool_executor=_rag_executor(service)),
+            knowledge_base_id=44,
+        )
+
+    assert raised.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
+    assert service.calls == [(1, 44, "A", 5), (1, 44, "B", 5)]
+
+
+@pytest.mark.anyio
+async def test_failed_attempt_does_not_consume_a_successful_search_slot() -> None:
+    service = _FakeRetrievalService(
+        outcomes=[
+            KnowledgeSearchError("KNOWLEDGE_INDEX_NOT_READY", retryable=True),
+            (_hit(11),),
+            (_hit(22, content="Second-facet evidence."),),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("attempt-1", "search_knowledge", '{"query":"A"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"A"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-2", "search_knowledge", '{"query":"B"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(events=(_completion(content="Answer [K1] [K2]."),)),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    assert service.calls == [
+        (1, 44, "A", 5),
+        (1, 44, "A", 5),
+        (1, 44, "B", 5),
+    ]
+    assert "search_knowledge" in tuple(
+        tool.name for tool in provider.requests[1].allowed_tools
+    )
+    assert "search_knowledge" in tuple(
+        tool.name for tool in provider.requests[2].allowed_tools
+    )
+    assert "search_knowledge" not in tuple(
+        tool.name for tool in provider.requests[3].allowed_tools
+    )
+    assert [citation.evidence_handle for citation in completion.citations] == [1, 2]
+
+
+@pytest.mark.anyio
+async def test_zero_new_search2_reports_no_progress_without_failing() -> None:
+    service = _FakeRetrievalService(
+        outcomes=[
+            (_hit(11),),
+            (_hit(11, content="Duplicate body must be omitted."),),
+        ]
+    )
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-1", "search_knowledge", '{"query":"A"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(
+                    _completion(
+                        content="",
+                        tool_calls=(
+                            ToolCall("search-2", "search_knowledge", '{"query":"B"}'),
+                        ),
+                        finish_reason=LLMFinishReason.TOOL_CALLS,
+                    ),
+                )
+            ),
+            ScriptedProviderRound(
+                events=(_completion(content="Still answerable [K1]."),)
+            ),
+        ]
+    )
+
+    completion = await _execute_workflow(
+        _workflow(provider, tool_executor=_rag_executor(service)),
+        knowledge_base_id=44,
+    )
+
+    second_observation = json.loads(
+        cast(ToolResult, provider.requests[2].transcript[4]).content
+    )
+    assert second_observation == {
+        "evidence": [
+            {
+                "evidence_handle": "K1",
+                "status": "existing",
+                "source_display_name": "tcp.md",
+                "heading_path": ["TCP"],
+            }
+        ],
+        "new_evidence_count": 0,
+        "status": "NO_PROGRESS",
+    }
+    assert "search_knowledge" not in tuple(
+        tool.name for tool in provider.requests[2].allowed_tools
+    )
+    assert completion.content == "Still answerable [K1]."
+    assert [citation.evidence_handle for citation in completion.citations] == [1]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("content", "expected_abstained"),
     [
@@ -841,9 +1398,7 @@ async def test_auto_preserves_legacy_sentinel_exact_equality_semantics(
 
 
 @pytest.mark.anyio
-async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles() -> (
-    None
-):
+async def test_required_retrieval_is_no_tool_and_strips_historical_handles() -> None:
     service = _FakeRetrievalService()
     provider = FakeProvider(
         [
@@ -890,7 +1445,7 @@ async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles(
     assert request.allowed_tools == ()
     assert request.personal_context is None
     assert request.conversation_compact_context == (
-        "Active constraints:\n- Historical answer used <HISTORICAL_CITATION:K1>."
+        "Active constraints:\n- Historical answer used ."
     )
     assert "[K1]" in (request.evidence_context or "")
     token_match = re.search(
@@ -903,9 +1458,7 @@ async def test_required_retrieval_is_no_tool_and_neutralizes_historical_handles(
         request.system_input
     )
     historical = cast(AssistantRuntimeMessage, request.transcript[1])
-    assert historical.content == (
-        "Earlier <HISTORICAL_CITATION:K2> and <HISTORICAL_CITATION:K1>."
-    )
+    assert historical.content == "Earlier  and ."
 
 
 @pytest.mark.anyio
@@ -1700,7 +2253,7 @@ async def test_search_and_dependent_read_cannot_share_one_tool_batch() -> None:
 
 
 @pytest.mark.anyio
-async def test_web_enabled_run_neutralizes_historical_web_handles() -> None:
+async def test_web_enabled_run_strips_historical_web_handles() -> None:
     context = AnswerContext(
         completed_turns=(
             CompletedTurn(
@@ -1723,10 +2276,9 @@ async def test_web_enabled_run_neutralizes_historical_web_handles() -> None:
     )
 
     historical = cast(AssistantRuntimeMessage, provider.requests[0].transcript[1])
-    assert historical.content == ("Earlier evidence <HISTORICAL_WEB_CITATION:W1:E2>.")
+    assert historical.content == "Earlier evidence ."
     assert all(
-        request.conversation_compact_context
-        == "Earlier compact evidence <HISTORICAL_WEB_CITATION:W1:E1>."
+        request.conversation_compact_context == "Earlier compact evidence ."
         for request in provider.requests
     )
     assert "Current evidence [W1:E1]." in completion.content
