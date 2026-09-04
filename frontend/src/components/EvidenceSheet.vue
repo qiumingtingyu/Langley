@@ -8,7 +8,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet";
-import type { MessageCitation } from "@/types";
+import type { MessageCitation, PdfPageRegion } from "@/types";
 
 const props = defineProps<{
   citation: MessageCitation | null;
@@ -23,10 +23,29 @@ const ordinal = computed(() =>
 );
 
 const headingSegments = computed(() =>
-  (props.citation?.heading_path ?? []).filter(
+  (Array.isArray(props.citation?.heading_path) ? props.citation.heading_path : []).filter(
     (segment): segment is string => typeof segment === "string" && segment.trim().length > 0,
   ),
 );
+
+function isPdfPageRegion(region: unknown): region is PdfPageRegion {
+  if (typeof region !== "object" || region === null) return false;
+  const candidate = region as Partial<PdfPageRegion>;
+  return candidate.kind === "pdf_page"
+    && Number.isInteger(candidate.page_start)
+    && Number.isInteger(candidate.page_end)
+    && candidate.page_start! >= 1
+    && candidate.page_end! >= candidate.page_start!;
+}
+
+const pageLocation = computed(() => {
+  const regions = Array.isArray(props.citation?.source_regions) ? props.citation.source_regions : [];
+  const pageRegions = regions.filter(isPdfPageRegion);
+  if (pageRegions.length === 0) return null;
+  const ranges = pageRegions
+    .map((region) => region.page_start === region.page_end ? String(region.page_start) : `${region.page_start}–${region.page_end}`);
+  return `第 ${ranges.join("、")} 页`;
+});
 
 function handleOpenChange(open: boolean): void {
   if (!open) emit("close");
@@ -51,7 +70,13 @@ function handleOpenChange(open: boolean): void {
             {{ citation.source_display_name }}
           </SheetTitle>
           <p
-            v-if="headingSegments.length > 0"
+            v-if="pageLocation"
+            class="mt-1 break-words text-xs font-medium leading-5 text-body [overflow-wrap:anywhere]"
+          >
+            {{ pageLocation }}
+          </p>
+          <p
+            v-else-if="headingSegments.length > 0"
             class="mt-1 break-words text-xs leading-5 text-muted-foreground [overflow-wrap:anywhere]"
           >
             {{ headingSegments.join(" › ") }}

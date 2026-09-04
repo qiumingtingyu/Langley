@@ -7,7 +7,7 @@ import App from "../src/App.vue";
 type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 type Run = { id: number; input_message_id: number; attempt_no: number; knowledge_base_id: number | null; grounding_policy: "AUTO" | "REQUIRED"; status: RunStatus; started_at: string | null; finished_at: string | null; error_code: string | null };
 type KnowledgeBase = { id: number; name: string; created_at: string };
-type MessageCitation = { evidence_handle: number; document_version_id: number; evidence_text: string; source_display_name: string; heading_path: unknown[]; source_regions: unknown[] };
+type MessageCitation = { evidence_handle: number; document_version_id: number; evidence_text: string; source_display_name: string; heading_path: unknown[]; source_regions: import("../src/types").SourceRegion[] };
 type Message = { id: number; sequence_no: number; role: "USER" | "ASSISTANT"; content: string; run_id: number | null; regenerated_from_message_id: number | null; created_at: string; citations: MessageCitation[] };
 
 class FakeEventSource {
@@ -223,7 +223,7 @@ describe("App user behavior", () => {
       evidence_text: "TCP uses a four-way handshake to close a connection.",
       source_display_name: "TCP Notes.md",
       heading_path: ["Transport", "TCP", "Close"],
-      source_regions: [{ start_byte: 10, end_byte: 64 }],
+      source_regions: [{ kind: "text_span", start_byte: 10, end_byte: 64 }],
     };
     const wrapper = await mountInitial(run(201, "SUCCEEDED"), [
       message(1, "TCP 如何关闭连接？"),
@@ -247,6 +247,35 @@ describe("App user behavior", () => {
     dialog?.querySelector<HTMLElement>('[data-slot="sheet-close"]')?.click();
     await settle();
     expect(document.body.querySelector('[role="dialog"]')).toBeNull();
+    wrapper.unmount();
+  });
+
+  it("shows PDF page provenance in the evidence sheet without raw regions", async () => {
+    const citation: MessageCitation = {
+      evidence_handle: 2,
+      document_version_id: 42,
+      evidence_text: "The scheduler keeps the process queue ordered by priority.",
+      source_display_name: "os.pdf",
+      heading_path: ["Internal PDF heading"],
+      source_regions: [
+        { kind: "pdf_page", page_start: 37, page_end: 39 },
+        { kind: "pdf_page", page_start: 42, page_end: 43 },
+      ],
+    };
+    const wrapper = await mountInitial(run(201, "SUCCEEDED"), [
+      message(1, "调度器如何管理进程？"),
+      message(2, "调度器按优先级管理进程队列。[K2]", "ASSISTANT", 201, [citation]),
+    ]);
+
+    await wrapper.get('button[data-citation-handle="2"]').trigger("click");
+    await settle();
+
+    const dialog = document.body.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.textContent).toContain("os.pdf");
+    expect(dialog?.textContent).toContain("第 37–39、42–43 页");
+    expect(dialog?.textContent).toContain("The scheduler keeps the process queue ordered by priority.");
+    expect(dialog?.textContent).not.toContain("pdf_page");
+    expect(dialog?.textContent).not.toContain("Internal PDF heading");
     wrapper.unmount();
   });
 

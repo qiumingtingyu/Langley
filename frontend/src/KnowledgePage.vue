@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 
 import { Button } from "@/components/ui/button";
+import type { PdfPageRegion, SourceRegion } from "@/types";
 
 type KnowledgeBase = { id: number; name: string; created_at: string };
 type DocumentSource = { document_version_id: number; filename: string; media_type: string; size_bytes: number; sha256: string; created_at: string };
@@ -9,7 +10,6 @@ type Document = { id: number; name: string; created_at: string; source: Document
 type VerifyResult = { document_version_id: number; verified: boolean; verified_at: string };
 type IndexJob = { id: number; status: string; stage: string | null; processed_chunk_count: number; total_chunk_count: number; error_code: string | null; error_message: string | null; created_at: string; started_at: string | null; finished_at: string | null };
 type IndexStatus = { index_status: string; latest_job: IndexJob | null };
-type SourceRegion = { kind: string; start_byte?: number; end_byte?: number; page_start?: number; page_end?: number };
 type Chunk = { ordinal: number; content: string; heading_path: string[]; source_regions: SourceRegion[] };
 type ChunksResponse = { document_version_id: number; successful_chunk_max_chars: number | null; suggested_chunk_max_chars: number; chunk_count: number; offset: number; limit: number; chunks: Chunk[] };
 type RebuildResponse = { document_version_id: number; successful_chunk_max_chars: number; chunk_count: number; resulting_index_status: string };
@@ -233,8 +233,7 @@ async function rebuildChunks(): Promise<void> {
 
 function sourceRegionText(region: SourceRegion): string {
   if (region.kind === "text_span") return `text_span [${region.start_byte}, ${region.end_byte})`;
-  if (region.kind === "pdf_page") return `pdf_page [${region.page_start}, ${region.page_end}]`;
-  return region.kind;
+  return `pdf_page [${region.page_start}, ${region.page_end}]`;
 }
 
 function sourceFormat(mediaType: string): string {
@@ -243,10 +242,12 @@ function sourceFormat(mediaType: string): string {
   return mediaType;
 }
 
+function isPdfPageRegion(region: SourceRegion): region is PdfPageRegion {
+  return region.kind === "pdf_page" && Number.isInteger(region.page_start) && Number.isInteger(region.page_end);
+}
+
 function pdfPageLocation(regions: SourceRegion[]): string | null {
-  const pageRegions = regions.filter(
-    (region) => region.kind === "pdf_page" && Number.isInteger(region.page_start) && Number.isInteger(region.page_end),
-  );
+  const pageRegions = regions.filter(isPdfPageRegion);
   if (pageRegions.length === 0) return null;
   return pageRegions.map((region) => region.page_start === region.page_end ? `第 ${region.page_start} 页` : `第 ${region.page_start}–${region.page_end} 页`).join("、");
 }
@@ -317,6 +318,7 @@ async function loadDocumentProcessingStatus(): Promise<void> {
       processingPollTimer = window.setTimeout(() => void loadDocumentProcessingStatus(), PROCESSING_POLL_INTERVAL_MS);
     } else if (previousStatus !== "SUCCEEDED" && next.latest_attempt?.status === "SUCCEEDED") {
       await loadChunks(0, "selection");
+      if (!isCurrentDocument(versionId, revision)) return;
       const knowledgeBaseId = selectedKnowledgeBaseId.value;
       if (knowledgeBaseId !== null) await loadIndexStatus(knowledgeBaseId, true);
     }
@@ -871,7 +873,7 @@ onBeforeUnmount(() => {
       v-else
       class="m-5 border border-dashed border-strong-border px-6 py-12 text-center text-sm text-muted-foreground sm:m-8"
     >
-      创建或选择一个知识库后即可管理资料。当前支持 Markdown 文件。
+      创建或选择一个知识库后即可管理资料。当前支持 Markdown 和 PDF 文件。
     </main>
   </section>
 </template>

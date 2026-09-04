@@ -2,6 +2,7 @@ import { mount } from "@vue/test-utils";
 import { describe, expect, it } from "vitest";
 
 import MessageContent from "../src/components/MessageContent.vue";
+import type { MessageCitation } from "../src/types";
 
 describe("MessageContent", () => {
   it("renders the Markdown baseline and keeps wide content locally scrollable", () => {
@@ -64,13 +65,13 @@ describe("MessageContent", () => {
   });
 
   it("promotes only authoritative citation markers outside code", async () => {
-    const citation = {
+    const citation: MessageCitation = {
       evidence_handle: 1,
       document_version_id: 41,
       evidence_text: "authoritative evidence",
       source_display_name: "TCP Notes.md",
       heading_path: ["Transport", "TCP"],
-      source_regions: [{ start_byte: 10, end_byte: 32 }],
+      source_regions: [{ kind: "text_span", start_byte: 10, end_byte: 32 }],
     };
     const wrapper = mount(MessageContent, {
       props: {

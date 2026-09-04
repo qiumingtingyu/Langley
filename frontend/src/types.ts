@@ -45,13 +45,27 @@ export interface MemorySyncResult {
   oldest_pending_created_at: string | null;
 }
 
+export interface TextSpanRegion {
+  kind: "text_span";
+  start_byte: number;
+  end_byte: number;
+}
+
+export interface PdfPageRegion {
+  kind: "pdf_page";
+  page_start: number;
+  page_end: number;
+}
+
+export type SourceRegion = TextSpanRegion | PdfPageRegion;
+
 export interface MessageCitation {
   evidence_handle: number;
   document_version_id: number;
   evidence_text: string;
   source_display_name: string;
   heading_path: unknown[];
-  source_regions: unknown[];
+  source_regions: SourceRegion[];
 }
 
 export interface Message {
