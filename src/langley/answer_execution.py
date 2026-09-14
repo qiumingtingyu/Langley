@@ -43,6 +43,7 @@ class AnswerExecutionManager:
         self._session_factory = session_factory
         self._workflow_factory = workflow_factory
         self._active_answers: dict[int, ActiveAnswer] = {}
+        self._workspace_changes: dict[int, dict] = {}
         self._task_scheduler = task_scheduler
         self._memory_catch_up = memory_catch_up
         self._memory_boundary_capture = memory_boundary_capture
@@ -134,6 +135,10 @@ class AnswerExecutionManager:
         answer.streams.add(queue)
         return answer, answer.partial_text, queue
 
+    def workspace_changes(self, run_id: int) -> dict | None:
+        """Bounded, process-local display data; caller must first validate Run owner."""
+        return self._workspace_changes.get(run_id)
+
     @staticmethod
     def unsubscribe(
         answer: ActiveAnswer, queue: asyncio.Queue[StreamItem | None]
@@ -178,10 +183,25 @@ class AnswerExecutionManager:
                 content=completion.content,
                 citation_drafts=completion.citations,
             )
+            if completion.workspace_changes is not None:
+                self._workspace_changes[command.run.id] = completion.workspace_changes
+                if len(self._workspace_changes) > 100:
+                    del self._workspace_changes[next(iter(self._workspace_changes))]
             if grounding_policy is GroundingPolicy.REQUIRED:
                 await self._publish_delta(answer, command.run.id, completion.content)
             self._close_after_terminal(
-                answer, ("run.succeeded", {"run_id": command.run.id})
+                answer,
+                (
+                    "run.succeeded",
+                    {
+                        "run_id": command.run.id,
+                        **(
+                            {"workspace_changes": completion.workspace_changes}
+                            if completion.workspace_changes is not None
+                            else {}
+                        ),
+                    },
+                ),
             )
             await self._schedule_memory_wake(command.user_id)
         except WorkflowFailure as failure:

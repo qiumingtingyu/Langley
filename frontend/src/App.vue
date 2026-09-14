@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import AppSidebar from "@/components/AppSidebar.vue";
 import ChatWorkspace from "@/components/ChatWorkspace.vue";
+import WorkspacePanel from "@/components/WorkspacePanel.vue";
+import type { WorkspaceChanges } from "@/types";
 import KnowledgePage from "@/KnowledgePage.vue";
 import MemoryPage from "@/MemoryPage.vue";
 import type { ActiveView, Conversation, GroundingPolicy, KnowledgeBase, Message, Run, StreamState } from "@/types";
@@ -31,6 +33,7 @@ const ERROR_MESSAGES: Record<string, string> = {
 };
 
 const conversations = ref<Conversation[]>([]);
+const workspaceChanges = ref<{ runId: number; conversationId: number; changes: WorkspaceChanges } | null>(null);
 const selectedConversationId = ref<number | null>(null);
 const messages = ref<Message[]>([]);
 const latestRun = ref<Run | null>(null);
@@ -205,6 +208,14 @@ async function loadConversation(conversationId: number, revision = viewRevision)
       observeRun(conversationId, payload.latest_run, revision);
     } else {
       closeStream();
+      if (payload.latest_run?.status === "SUCCEEDED" && selectedConversation.value?.workspace_id) {
+        const runId = payload.latest_run.id;
+        const changeResponse = await fetch(`/api/runs/${runId}`, { signal: controller.signal });
+        const changePayload = await changeResponse.json();
+        if (changeResponse.ok && isCurrentView(conversationId, revision) && latestRun.value?.id === runId && changePayload.workspace_changes) {
+          workspaceChanges.value = { runId, conversationId, changes: changePayload.workspace_changes };
+        }
+      }
     }
   } finally {
     if (readController === controller) readController = null;
@@ -316,8 +327,16 @@ function observeRun(
     }
   });
   for (const eventName of ["run.succeeded", "run.failed", "run.cancelled"]) {
-    source.addEventListener(eventName, () => {
+    source.addEventListener(eventName, (event) => {
       if (isCurrentView(conversationId, revision)) {
+        if (eventName === "run.succeeded") {
+          try {
+            const payload = JSON.parse((event as MessageEvent<string>).data);
+            if (payload.run_id === run.id && payload.workspace_changes) {
+              workspaceChanges.value = { runId: run.id, conversationId, changes: payload.workspace_changes };
+            }
+          } catch { /* Durable Run reread below remains authoritative. */ }
+        }
         source.close();
         void refreshRun(conversationId, run.id, revision, reconnected);
       }
@@ -562,6 +581,14 @@ onBeforeUnmount(() => {
       @open-chat="openChatView"
       @open-knowledge="openKnowledgeView"
       @open-memory="openMemoryView"
+    />
+
+    <WorkspacePanel
+      v-if="activeView === 'chat'"
+      :conversations="conversations"
+      :workspace-id="selectedConversation?.workspace_id ?? null"
+      :changes="workspaceChanges?.conversationId === selectedConversationId && workspaceChanges?.runId === latestRun?.id ? workspaceChanges.changes : null"
+      @open="refreshFacts($event)"
     />
 
     <p

@@ -17,6 +17,7 @@ from langley.answering.conversation_context_builder import (
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
 from langley.answering.tracing import context_compaction_trace_context
 from langley.infrastructure.models import (
+    Conversation,
     ConversationContextSnapshot,
     Memory,
     Message,
@@ -696,8 +697,9 @@ def test_builder_releases_its_database_scope_before_returning_context() -> None:
                 return ScalarResult((_run(10, 1, "PENDING"),))
             return ScalarResult(())
 
-        async def get(self, *args: object, **kwargs: object) -> None:
-            del args, kwargs
+        async def get(self, model, identity):
+            if model is Conversation:
+                return Conversation(id=identity, user_id=1, workspace_id=None)
             return None
 
     factory = RecordingSessionFactory()

@@ -17,6 +17,7 @@ from langley.answering.contracts import LLMProvider, LLMRequest, LLMStreamEvent
 from langley.answering.conversation_context import LLMConversationCompactor
 from langley.answering.conversation_context_builder import ConversationContextBuilder
 from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.local_tracing import CompositeTracer, LocalJsonTracer
 from langley.answering.tools import (
     AgentTool,
     CurrentTimeTool,
@@ -29,11 +30,13 @@ from langley.answering.tools import (
 from langley.answering.tracing import LangSmithTracer, Tracer
 from langley.answering.web import TavilyWebProvider
 from langley.answering.workflow import LearningAssistantWorkflow
+from langley.answering.workspace_tools import WORKSPACE_TOOL_NAMES, WorkspaceTool
 from langley.api.conversations import router as conversations_router
 from langley.api.health import router as health_router
 from langley.api.knowledge import router as knowledge_router
 from langley.api.memories import router as memories_router
 from langley.api.runs import router as runs_router
+from langley.api.workspaces import router as workspaces_router
 from langley.infrastructure.database import (
     create_database_engine,
     create_session_factory,
@@ -74,6 +77,7 @@ from langley.memory.processing import (
 )
 from langley.observability import configure_logging
 from langley.settings import Settings
+from langley.workspace_storage import WorkspaceStorage
 
 logger = structlog.get_logger(__name__)
 
@@ -235,6 +239,7 @@ def _workflow_factory_for(
     session_factory,
     knowledge_index_runtime: KnowledgeIndexBuildRuntime,
     conversation_compactor_provider: LLMProvider | None = None,
+    workspace_storage: WorkspaceStorage | None = None,
 ):
     """Assemble one production Workflow factory without giving routes AI authority."""
 
@@ -273,11 +278,23 @@ def _workflow_factory_for(
         assert settings.tavily_api_key is not None
         web_provider = TavilyWebProvider(settings.tavily_api_key.get_secret_value())
         tools.extend((SearchWebTool(web_provider), ReadWebpageTool(web_provider)))
+    workspace_storage = workspace_storage or WorkspaceStorage(settings)
+    tools.extend(
+        WorkspaceTool(name, workspace_storage) for name in sorted(WORKSPACE_TOOL_NAMES)
+    )
     tool_executor = ToolExecutor(tools=tools)
     resolved_tracer = tracer or LangSmithTracer(
         enabled=settings.tracing_enabled,
         project=settings.langsmith_project,
     )
+    if settings.effective_local_run_diagnostics_enabled:
+        resolved_tracer = CompositeTracer(
+            resolved_tracer,
+            LocalJsonTracer(
+                settings.local_run_diagnostics_root,
+                include_content=settings.effective_local_run_diagnostics_include_content,
+            ),
+        )
 
     def factory() -> LearningAssistantWorkflow:
         return LearningAssistantWorkflow(
@@ -292,6 +309,7 @@ def _workflow_factory_for(
             trace_content_enabled=settings.trace_content_enabled,
             tracer=resolved_tracer,
             retrieval_service=retrieval_service,
+            workspace_storage=workspace_storage,
         )
 
     return factory
@@ -380,6 +398,7 @@ def create_app(
         )
 
     app.state.settings = resolved_settings
+    app.state.workspace_storage = WorkspaceStorage(resolved_settings)
     app.state.local_file_storage = LocalFileStorage(
         resolved_settings.knowledge_storage_root
     )
@@ -468,6 +487,7 @@ def create_app(
                 app.state.session_factory,
                 app.state.knowledge_index_runtime,
                 configured_compactor_provider,
+                workspace_storage=app.state.workspace_storage,
             ),
             memory_catch_up=memory_callbacks[0]
             if memory_callbacks is not None
@@ -524,6 +544,7 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(conversations_router)
+    app.include_router(workspaces_router)
     app.include_router(runs_router)
     app.include_router(memories_router)
     app.include_router(knowledge_router)

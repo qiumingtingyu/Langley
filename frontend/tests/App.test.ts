@@ -42,7 +42,7 @@ describe("App user behavior", () => {
 
   beforeEach(() => {
     const responses: Array<Response | Promise<Response>> = [];
-    fetchMock = vi.fn((path: string) => { const next = responses.shift(); if (next !== undefined) return Promise.resolve(next); if (path === "/api/knowledge-bases") return Promise.resolve(response([])); throw new Error(`unexpected fetch: ${path}`); });
+    fetchMock = vi.fn((path: string) => { if (path === "/api/workspaces") return Promise.resolve(response([])); const next = responses.shift(); if (next !== undefined) return Promise.resolve(next); if (path === "/api/knowledge-bases") return Promise.resolve(response([])); throw new Error(`unexpected fetch: ${path}`); });
     enqueue = (value) => responses.push(value);
     FakeEventSource.instances = [];
     vi.stubGlobal("fetch", fetchMock);

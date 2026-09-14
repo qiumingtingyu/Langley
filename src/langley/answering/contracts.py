@@ -39,6 +39,7 @@ class ToolSpec:
     name: str
     description: str
     arguments_schema: dict[str, JSONValue]
+    side_effecting: bool = False
 
 
 @dataclass(frozen=True)

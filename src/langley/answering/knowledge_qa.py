@@ -49,6 +49,7 @@ class AnswerCompletion:
     content: str
     citations: tuple[CitationDraft, ...]
     abstained: bool
+    workspace_changes: dict | None = None
 
 
 class KnowledgeQAFlow:

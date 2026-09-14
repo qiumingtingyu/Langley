@@ -11,6 +11,7 @@ from langley.infrastructure.models import (
     Message,
     MessageCitation,
     Run,
+    Workspace,
 )
 
 
@@ -29,13 +30,17 @@ class MessageCitationRead:
 
 
 async def create_conversation(
-    session: AsyncSession, user_id: int, title: str | None
+    session: AsyncSession,
+    user_id: int,
+    title: str | None,
+    workspace_id: int | None = None,
 ) -> Conversation:
     """Create a Conversation owned by the resolved current user."""
 
     now = utc_now()
     conversation = Conversation(
         user_id=user_id,
+        workspace_id=workspace_id,
         title=title,
         created_at=now,
         updated_at=now,
@@ -43,6 +48,10 @@ async def create_conversation(
         deleted_at=None,
     )
     async with session.begin():
+        if workspace_id is not None:
+            workspace = await session.get(Workspace, workspace_id)
+            if workspace is None or workspace.user_id != user_id:
+                raise ValueError("WORKSPACE_NOT_FOUND")
         session.add(conversation)
         await session.flush()
     return conversation

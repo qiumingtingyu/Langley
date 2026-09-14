@@ -33,6 +33,10 @@ class AnswerContext:
     current_user_content: str
     personal_context: tuple[PersonalContextItem, ...] | None = ()
     conversation_compact_context: str | None = None
+    user_id: int | None = None
+    workspace_id: int | None = None
+    workspace_name: str | None = None
+    workspace_storage_key: str | None = None
 
 
 class AnswerContextBuilder(Protocol):

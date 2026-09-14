@@ -26,6 +26,28 @@ class Settings(BaseSettings):
     database_url: str | None = None
     test_database_url: str | None = None
     knowledge_storage_root: Path = Path("data/knowledge")
+    workspace_storage_root: Path = Path("data/workspaces")
+    workspace_max_import_file_bytes: int = Field(default=10_485_760, ge=1)
+    workspace_max_import_total_bytes: int = Field(default=52_428_800, ge=1)
+    workspace_max_import_files: int = Field(default=1000, ge=1)
+    workspace_max_text_read_bytes: int = Field(default=1_048_576, ge=1)
+    workspace_max_read_output_bytes: int = Field(default=16_384, ge=1)
+    workspace_max_text_mutation_bytes: int = Field(default=1_048_576, ge=1)
+    workspace_max_write_bytes: int = Field(default=1_048_576, ge=1)
+    workspace_max_read_lines: int = Field(default=500, ge=1)
+    workspace_max_entries: int = Field(default=1000, ge=1)
+    workspace_max_diff_chars: int = Field(default=8000, ge=1)
+    workspace_manifest_max_files: int = Field(default=5000, ge=1)
+    workspace_manifest_max_bytes: int = Field(default=104_857_600, ge=1)
+    workspace_max_llm_rounds: int = Field(default=8, ge=1)
+    workspace_max_tool_calls: int = Field(default=10, ge=1)
+    sandbox_image: str = "langley-sandbox:v0"
+    sandbox_cpus: float = Field(default=1.0, gt=0)
+    sandbox_memory_mb: int = Field(default=256, ge=64)
+    sandbox_pids_limit: int = Field(default=64, ge=8)
+    sandbox_command_timeout_seconds: int = Field(default=30, ge=1)
+    sandbox_max_timeout_seconds: int = Field(default=60, ge=1)
+    sandbox_max_output_bytes: int = Field(default=16_384, ge=1)
     qdrant_url: str = "http://127.0.0.1:6333"
     knowledge_embedding_model: str = "BAAI/bge-m3"
     knowledge_embedding_revision: str = "5617a9f61b028005a4858fdac845db406aefb181"
@@ -59,6 +81,9 @@ class Settings(BaseSettings):
     overall_workflow_deadline_seconds: float = Field(default=180.0, gt=0)
     tracing_enabled: bool = False
     trace_content_enabled: bool = False
+    local_run_diagnostics_enabled: bool | None = None
+    local_run_diagnostics_include_content: bool | None = None
+    local_run_diagnostics_root: Path = Path(".runtime/traces")
     langsmith_project: str | None = None
     web_search_enabled: bool = False
     tavily_api_key: SecretStr | None = Field(
@@ -77,6 +102,16 @@ class Settings(BaseSettings):
         except ZoneInfoNotFoundError as error:
             raise ValueError("local_timezone must be a valid IANA timezone") from error
         return value
+
+    @property
+    def effective_local_run_diagnostics_enabled(self) -> bool:
+        value = self.local_run_diagnostics_enabled
+        return self.environment == "development" if value is None else value
+
+    @property
+    def effective_local_run_diagnostics_include_content(self) -> bool:
+        value = self.local_run_diagnostics_include_content
+        return self.environment == "development" if value is None else value
 
     @model_validator(mode="after")
     def configured_memory_policy_requires_budget(self) -> "Settings":

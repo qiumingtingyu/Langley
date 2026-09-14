@@ -94,7 +94,19 @@ async def test_malformed_or_schema_invalid_arguments_are_independent_safe_observ
     )[0]
 
     assert result.kind is ToolResultKind.INVALID_ARGUMENTS
-    assert json.loads(result.content) == {"error": "INVALID_ARGUMENTS"}
+    assert json.loads(result.content) == {
+        "error": {
+            "code": "INVALID_ARGUMENTS",
+            "issues": [
+                {
+                    "field": "$",
+                    "message": (
+                        "Arguments must be a valid JSON object matching the Tool schema"
+                    ),
+                }
+            ],
+        }
+    }
 
 
 class _UnexpectedFailureTimeTool(CurrentTimeTool):

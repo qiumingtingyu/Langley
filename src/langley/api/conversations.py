@@ -49,6 +49,7 @@ class CreateConversationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: str | None = Field(default=None, max_length=255)
+    workspace_id: int | None = None
 
 
 class NewQuestionRequest(BaseModel):
@@ -86,6 +87,7 @@ class ConversationResponse(BaseModel):
     created_at: str
     updated_at: str
     last_message_at: str | None
+    workspace_id: int | None = None
 
 
 class ConversationMessagesResponse(BaseModel):
@@ -105,6 +107,7 @@ class AnswerCommandResponse(BaseModel):
 def _conversation_response(conversation: Conversation) -> ConversationResponse:
     return ConversationResponse(
         id=conversation.id,
+        workspace_id=conversation.workspace_id,
         title=conversation.title,
         created_at=as_utc(conversation.created_at),
         updated_at=as_utc(conversation.updated_at),
@@ -166,7 +169,12 @@ async def post_conversation(
 ) -> ConversationResponse:
     """Create a Conversation for the configured current user."""
 
-    conversation = await create_conversation(session, current_user_id, body.title)
+    try:
+        conversation = await create_conversation(
+            session, current_user_id, body.title, body.workspace_id
+        )
+    except ValueError as error:
+        raise HTTPException(404, detail={"code": "WORKSPACE_NOT_FOUND"}) from error
     return _conversation_response(conversation)
 
 

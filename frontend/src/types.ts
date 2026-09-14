@@ -4,11 +4,19 @@ export type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCEL
 export type GroundingPolicy = "AUTO" | "REQUIRED";
 
 export interface Conversation {
+  workspace_id?: number | null;
   id: number;
   title: string | null;
   created_at: string;
   updated_at: string;
   last_message_at: string | null;
+}
+
+export interface WorkspaceChanges {
+  added: string[];
+  modified: string[];
+  deleted: string[];
+  complete: boolean;
 }
 
 export interface KnowledgeBase {

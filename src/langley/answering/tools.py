@@ -45,6 +45,7 @@ from langley.knowledge.retrieval_service import (
 
 if TYPE_CHECKING:
     from langley.answering.tracing import ExecutionTrace, ToolTrace
+    from langley.sandbox import SandboxRuntime
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,11 @@ class ToolContext:
         default_factory=KnowledgeEvidenceSession
     )
     knowledge_search_ordinal: int | None = None
+    workspace_id: int | None = None
+    workspace_name: str | None = None
+    workspace_storage_key: str | None = None
+    workspace_overview: str | None = None
+    sandbox_runtime: "SandboxRuntime | None" = None
 
 
 @dataclass(frozen=True)
@@ -88,10 +94,13 @@ class AgentTool(Protocol):
 class ToolExecutionError(Exception):
     """A safe, expected tool observation rather than a workflow failure."""
 
-    def __init__(self, code: str, *, retryable: bool) -> None:
+    def __init__(
+        self, code: str, *, retryable: bool, hints: dict | None = None
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
+        self.hints = hints or {}
 
 
 class CurrentTimeArguments(BaseModel):
@@ -566,6 +575,7 @@ class ToolExecutor:
         """Execute independent read-only calls serially in canonical order."""
 
         self._validate_call_identities(calls)
+        batch_rejected = self.side_effect_batch_unsupported(calls)
         results: list[ToolResult] = []
         for call_index, call in enumerate(calls, start=1):
             tool_trace = self._start_tool_trace(
@@ -586,12 +596,31 @@ class ToolExecutor:
 
             try:
                 with tool_trace_context(tool_trace):
-                    result, execution_trace_metadata = await self._execute_call(
-                        call,
-                        context,
-                        capture_execution,
-                    )
-                    trace_metadata.update(execution_trace_metadata)
+                    if batch_rejected:
+                        code = "SIDE_EFFECT_BATCH_UNSUPPORTED"
+                        result = ToolResult(
+                            call_id=call.call_id,
+                            name=call.name,
+                            kind=ToolResultKind.TOOL_ERROR,
+                            content=json.dumps(
+                                {"error": {"code": code, "retryable": False}}
+                            ),
+                        )
+                        trace_metadata.update(
+                            {
+                                "success": False,
+                                "executed": False,
+                                "tool_error_code": code,
+                                "retryable": False,
+                            }
+                        )
+                    else:
+                        result, execution_trace_metadata = await self._execute_call(
+                            call,
+                            context,
+                            capture_execution,
+                        )
+                        trace_metadata.update(execution_trace_metadata)
             except asyncio.CancelledError:
                 error_code = "CANCELLED"
                 raise
@@ -607,6 +636,13 @@ class ToolExecutor:
             results.append(result)
         return tuple(results)
 
+    def side_effect_batch_unsupported(self, calls: tuple[ToolCall, ...]) -> bool:
+        return len(calls) > 1 and any(
+            call.name in self._tools_by_name
+            and self._tools_by_name[call.name].spec.side_effecting
+            for call in calls
+        )
+
     async def _execute_call(
         self,
         call: ToolCall,
@@ -619,7 +655,29 @@ class ToolExecutor:
 
         arguments = self._parse_arguments(call.raw_arguments)
         if arguments is None or not tool.validate_arguments(arguments):
-            return self._result(call, ToolResultKind.INVALID_ARGUMENTS), {}
+            issues: list[dict[str, JSONValue]] = [
+                {
+                    "field": "$",
+                    "message": (
+                        "Arguments must be a valid JSON object matching the Tool schema"
+                    ),
+                }
+            ]
+            explainer = getattr(tool, "explain_invalid_arguments", None)
+            if arguments is not None and callable(explainer):
+                issues = explainer(arguments) or issues
+            return ToolResult(
+                call_id=call.call_id,
+                name=call.name,
+                kind=ToolResultKind.INVALID_ARGUMENTS,
+                content=json.dumps(
+                    {"error": {"code": "INVALID_ARGUMENTS", "issues": issues}}
+                ),
+            ), {
+                "success": False,
+                "executed": False,
+                "tool_error_code": "INVALID_ARGUMENTS",
+            }
 
         try:
             output = await tool.execute(arguments, context)
@@ -636,6 +694,7 @@ class ToolExecutor:
                             "error": {
                                 "code": error.code,
                                 "retryable": error.retryable,
+                                **error.hints,
                             }
                         },
                         separators=(",", ":"),

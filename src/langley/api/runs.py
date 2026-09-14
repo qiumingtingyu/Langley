@@ -38,6 +38,7 @@ class RunQueryResponse(BaseModel):
 
     run: RunResponse
     assistant_message: MessageResponse | None
+    workspace_changes: dict | None = None
 
 
 def _raise_run_http_error(error: Exception) -> None:
@@ -54,11 +55,14 @@ def _raise_run_http_error(error: Exception) -> None:
     raise error
 
 
-@router.get("/{run_id}", response_model=RunQueryResponse)
+@router.get(
+    "/{run_id}", response_model=RunQueryResponse, response_model_exclude_unset=True
+)
 async def get_run(
     run_id: int,
     session: AsyncSession = Depends(get_session),
     current_user_id: int = Depends(get_current_user_id),
+    execution_manager: AnswerExecutionManager = Depends(get_execution_manager),
 ) -> RunQueryResponse:
     """Return a pure authoritative recovery read for one owned Run."""
 
@@ -72,6 +76,11 @@ async def get_run(
             message_response(result.assistant_message)
             if result.assistant_message is not None
             else None
+        ),
+        **(
+            {"workspace_changes": execution_manager.workspace_changes(run_id)}
+            if execution_manager.workspace_changes(run_id) is not None
+            else {}
         ),
     )
 

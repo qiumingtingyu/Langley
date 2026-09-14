@@ -476,11 +476,31 @@ class KnowledgeChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
 
 
+class Workspace(Base):
+    """Owned managed artifact scope; files remain filesystem authority."""
+
+    __tablename__ = "workspaces"
+    __table_args__ = (Index("ix_workspaces_user", "user_id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", name="fk_workspaces_user"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    storage_key: Mapped[str] = mapped_column(
+        String(32, collation="utf8mb4_0900_bin"), unique=True, nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
+
+
 class Conversation(Base):
     """A user-owned, linearly ordered conversation."""
 
     __tablename__ = "conversations"
-    __table_args__ = (Index("ix_conversations_user", "user_id"),)
+    __table_args__ = (
+        Index("ix_conversations_user", "user_id"),
+        Index("ix_conversations_workspace", "workspace_id"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(
@@ -489,6 +509,11 @@ class Conversation(Base):
         nullable=False,
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    workspace_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("workspaces.id", name="fk_conversations_workspace"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), nullable=False)
     last_message_at: Mapped[datetime | None] = mapped_column(

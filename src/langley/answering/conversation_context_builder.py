@@ -33,6 +33,7 @@ from langley.infrastructure.models import (
     Memory,
     Message,
     Run,
+    Workspace,
 )
 
 logger = structlog.get_logger(__name__)
@@ -44,6 +45,10 @@ class _AuthoritativeContextFacts:
     runs: tuple[Run, ...]
     memories: tuple[Memory, ...]
     snapshot: ConversationContextSnapshot | None
+    user_id: int | None = None
+    workspace_id: int | None = None
+    workspace_name: str | None = None
+    workspace_storage_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -158,6 +163,7 @@ class ConversationContextBuilder:
                 compact_state=previous_state,
                 current_user=current_user,
                 memories=facts.memories,
+                scope=facts,
                 messages_by_id=messages_by_id,
             )
 
@@ -186,6 +192,7 @@ class ConversationContextBuilder:
                 compact_state=previous_state,
                 current_user=current_user,
                 memories=facts.memories,
+                scope=facts,
                 messages_by_id=messages_by_id,
             )
 
@@ -273,6 +280,7 @@ class ConversationContextBuilder:
                 compact_state=previous_state,
                 current_user=current_user,
                 memories=facts.memories,
+                scope=facts,
                 messages_by_id=messages_by_id,
             )
 
@@ -298,6 +306,7 @@ class ConversationContextBuilder:
             compact_state=compaction.state,
             current_user=current_user,
             memories=facts.memories,
+            scope=facts,
             messages_by_id=messages_by_id,
         )
 
@@ -343,11 +352,29 @@ class ConversationContextBuilder:
                 snapshot = await session.get(
                     ConversationContextSnapshot, conversation_id
                 )
+                conversation = await session.get(Conversation, conversation_id)
+                if conversation is None or conversation.deleted_at is not None:
+                    raise ValueError("conversation unavailable")
+                workspace = (
+                    await session.get(Workspace, conversation.workspace_id)
+                    if conversation.workspace_id is not None
+                    else None
+                )
+                if conversation.workspace_id is not None and (
+                    workspace is None or workspace.user_id != conversation.user_id
+                ):
+                    raise ValueError("workspace ownership mismatch")
                 return _AuthoritativeContextFacts(
                     messages=messages,
                     runs=runs,
                     memories=memories,
                     snapshot=snapshot,
+                    user_id=conversation.user_id,
+                    workspace_id=conversation.workspace_id,
+                    workspace_name=None if workspace is None else workspace.name,
+                    workspace_storage_key=None
+                    if workspace is None
+                    else workspace.storage_key,
                 )
 
     async def _persist_snapshot(
@@ -517,6 +544,7 @@ class ConversationContextBuilder:
         current_user: Message,
         memories: tuple[Memory, ...],
         messages_by_id: dict[int, Message],
+        scope: _AuthoritativeContextFacts,
     ) -> AnswerContext:
         exposed_canonical_user_ids = {self._canonical_user_message_id(current_user)}
         exposed_canonical_user_ids.update(
@@ -543,6 +571,10 @@ class ConversationContextBuilder:
             else None
         )
         return AnswerContext(
+            user_id=scope.user_id,
+            workspace_id=scope.workspace_id,
+            workspace_name=scope.workspace_name,
+            workspace_storage_key=scope.workspace_storage_key,
             completed_turns=raw_turns,
             current_user_content=current_user.content,
             personal_context=personal_context,

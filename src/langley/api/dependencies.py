@@ -13,6 +13,7 @@ from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
 from langley.knowledge.pdf_processing import DocumentProcessingDispatcher
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
+from langley.workspace_storage import WorkspaceStorage
 
 
 def _get_session_factory(request: Request) -> async_sessionmaker[AsyncSession]:
@@ -47,6 +48,11 @@ def get_execution_manager(request: Request) -> AnswerExecutionManager:
 
 def get_settings(request: Request):
     return request.app.state.settings
+
+
+def get_workspace_storage(request: Request) -> WorkspaceStorage:
+    """Share the application's physical storage and execution-lock domain."""
+    return request.app.state.workspace_storage
 
 
 def get_local_file_storage(request: Request) -> LocalFileStorage:
