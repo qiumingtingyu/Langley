@@ -1,7 +1,30 @@
 """Minimal typed boundaries for Knowledge source persistence."""
 
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias
+from typing import Literal, Protocol, TypeAlias
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class KnowledgeLocator(BaseModel):
+    """Public semantic address; cross-field/format rules belong to resolution."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    document_id: int = Field(gt=0)
+    kind: Literal["document", "heading", "pages"]
+    heading_path: list[str] | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+class KnowledgePerceptionError(Exception):
+    """Safe deterministic inspect/read failure, with no infrastructure details."""
+
+    def __init__(self, code: str, reason: str):
+        super().__init__(code)
+        self.code = code
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -67,6 +90,19 @@ class PdfPageRegion:
 
 
 SourceRegion: TypeAlias = TextSpanRegion | PdfPageRegion
+
+
+@dataclass(frozen=True)
+class KnowledgeReadResult:
+    """One complete bounded observation, independent of retrieval chunk identity."""
+
+    locator: KnowledgeLocator
+    document_version_id: int
+    content: str
+    source_display_name: str
+    source_sha256: str
+    heading_path: tuple[str, ...]
+    source_regions: tuple[SourceRegion, ...]
 
 
 def encode_source_region(region: SourceRegion) -> dict[str, object]:

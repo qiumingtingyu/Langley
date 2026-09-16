@@ -1,6 +1,7 @@
 """Deterministic production Workflow and LangGraph regression tests."""
 
 import asyncio
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ import pytest
 from langsmith import get_tracing_context
 
 import langley.answering.workflow as workflow_module
+from langley.answering import knowledge_tools
 from langley.answering.context_builder import (
     AnswerContext,
     AnswerContextBuilder,
@@ -36,7 +38,11 @@ from langley.answering.errors import (
 )
 from langley.answering.fake_provider import FakeProvider, ScriptedProviderRound
 from langley.answering.grounding import GroundingPolicy
-from langley.answering.knowledge_qa import INSUFFICIENT_EVIDENCE_ANSWER
+from langley.answering.knowledge_qa import (
+    AUTO_INSUFFICIENT_EVIDENCE_SENTINEL,
+    INSUFFICIENT_EVIDENCE_ANSWER,
+)
+from langley.answering.knowledge_tools import InspectKnowledgeTool, ReadKnowledgeTool
 from langley.answering.tools import (
     CurrentTimeTool,
     ExpandEvidenceTool,
@@ -50,11 +56,17 @@ from langley.answering.tools import (
 from langley.answering.tracing import CitationNamespace, KnowledgeSearchOrigin, Tracer
 from langley.answering.web import (
     WebExtractResponse,
+    WebProviderError,
     WebSearchResponse,
     WebSearchResult,
 )
 from langley.answering.workflow import LearningAssistantWorkflow
 from langley.knowledge.casebook_baseline import CasebookBaselineTracer
+from langley.knowledge.contracts import (
+    KnowledgePerceptionError,
+    KnowledgeReadResult,
+    TextSpanRegion,
+)
 from langley.knowledge.reads import AdjacentKnowledgeChunkRead
 from langley.knowledge.retrieval import RetrievalHit, RetrievalResult
 from langley.knowledge.retrieval_service import KnowledgeSearchError
@@ -532,6 +544,136 @@ async def test_direct_answer_uses_canonical_completion_not_stream_deltas() -> No
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("knowledge_base_id", [None, 44])
+@pytest.mark.parametrize("web_enabled", [False, True])
+async def test_auto_prompt_and_tools_match_run_capabilities(
+    knowledge_base_id: int | None, web_enabled: bool
+) -> None:
+    service = _FakeRetrievalService()
+    web_provider = _WorkflowWebProvider()
+    tools = [SearchKnowledgeTool(service), ExpandEvidenceTool(None)]
+    if web_enabled:
+        tools.extend([SearchWebTool(web_provider), ReadWebpageTool(web_provider)])
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="direct answer"),))]
+    )
+
+    result = await _execute_workflow(
+        _workflow(provider, tool_executor=ToolExecutor(tools=tuple(tools))),
+        knowledge_base_id=knowledge_base_id,
+    )
+
+    assert result.content == "direct answer"
+    assert result.abstained is False
+    request = provider.requests[0]
+    expected = workflow_module.BASE_LEARNING_ASSISTANT_SYSTEM_INPUT
+    expected_tools = set()
+    if knowledge_base_id is not None:
+        expected += workflow_module.KNOWLEDGE_SYSTEM_GUIDANCE
+        expected_tools.add("search_knowledge")
+        # Captured from the pre-repair working tree, independently of new constants.
+        assert hashlib.sha256(expected.encode("utf-8")).hexdigest() == (
+            "f45bc0140de3a660a593ce435d8bed2c7a3bc60b4612e8b44e36be834cf41292"
+        )
+        assert expected == workflow_module.LEARNING_ASSISTANT_SYSTEM_INPUT
+    else:
+        for instruction in (
+            "search_knowledge",
+            "expand_evidence",
+            "[K#]",
+            AUTO_INSUFFICIENT_EVIDENCE_SENTINEL,
+            "knowledge base",
+        ):
+            assert instruction not in request.system_input
+    if web_enabled:
+        expected += workflow_module._WEB_SYSTEM_GUIDANCE
+        expected_tools.add("search_web")
+    assert request.system_input.encode("utf-8") == expected.encode("utf-8")
+    assert {tool.name for tool in request.allowed_tools} == expected_tools
+    assert service.calls == []
+    assert web_provider.search_calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("web_state", ["disabled", "enabled", "used"])
+@pytest.mark.parametrize("delta_mode", ["none", "whole", "split", "characters"])
+async def test_no_kb_abstention_is_invalid_and_never_streamed(
+    web_state: str, delta_mode: str
+) -> None:
+    token = AUTO_INSUFFICIENT_EVIDENCE_SENTINEL
+    chunks = {
+        "none": (),
+        "whole": (token,),
+        "split": (token[:5], token[5:-2], token[-2:]),
+        "characters": tuple(token),
+    }[delta_mode]
+    provider = FakeProvider(
+        (_web_rounds(token)[:-1] if web_state == "used" else [])
+        + [
+            ScriptedProviderRound(
+                events=(
+                    *(AssistantContentDelta(chunk) for chunk in chunks),
+                    _completion(content=token),
+                )
+            )
+        ]
+    )
+    visible_deltas: list[str] = []
+
+    async def capture_delta(content: str) -> None:
+        visible_deltas.append(content)
+
+    with pytest.raises(WorkflowFailure) as raised:
+        await _execute_workflow(
+            _workflow(
+                provider,
+                tool_executor=(
+                    _web_executor(_WorkflowWebProvider())
+                    if web_state != "disabled"
+                    else None
+                ),
+            ),
+            on_assistant_delta=capture_delta,
+        )
+
+    assert raised.value.error_code is RunErrorCode.LLM_RESPONSE_INVALID
+    assert visible_deltas == []
+    assert INSUFFICIENT_EVIDENCE_ANSWER not in str(raised.value)
+    assert token not in str(raised.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "chunks", [("ordinary", " answer"), ("[", "[Item", "]]"), ("[",)]
+)
+async def test_no_kb_ordinary_streaming_preserves_text(
+    chunks: tuple[str, ...],
+) -> None:
+    content = "".join(chunks)
+    provider = FakeProvider(
+        [
+            ScriptedProviderRound(
+                events=(
+                    *(AssistantContentDelta(chunk) for chunk in chunks),
+                    _completion(content=content),
+                )
+            )
+        ]
+    )
+    visible_deltas: list[str] = []
+
+    async def capture_delta(delta: str) -> None:
+        visible_deltas.append(delta)
+
+    result = await _execute_workflow(_workflow(provider), capture_delta)
+
+    assert result.content == content
+    assert "".join(visible_deltas) == content
+    if chunks[0] == "ordinary":
+        assert visible_deltas == list(chunks)
+
+
+@pytest.mark.anyio
 async def test_knowledge_scope_controls_tools_and_grounded_citations() -> None:
     service = _FakeRetrievalService()
     direct_provider = FakeProvider(
@@ -961,6 +1103,7 @@ async def test_grounding_and_duplicate_search2_stop_before_service() -> None:
     )
     assert abstained.abstained is True
     assert abstained.citations == ()
+    assert abstained.content == INSUFFICIENT_EVIDENCE_ANSWER
 
     repeated_search = FakeProvider(
         [
@@ -2250,6 +2393,240 @@ async def test_search_and_dependent_read_cannot_share_one_tool_batch() -> None:
     assert error.value.error_code is RunErrorCode.AGENT_EXECUTION_LIMIT
     assert web_provider.search_calls == []
     assert web_provider.extract_calls == []
+
+
+def _perception_executor(monkeypatch, service=None, web=None, *, read_fails=False):
+    async def direct_read(*args, **kwargs):
+        if read_fails:
+            raise KnowledgePerceptionError("LOCATION_NOT_FOUND", "Inspect again.")
+        return KnowledgeReadResult(
+            locator=kwargs["locator"],
+            document_version_id=13,
+            content="source native",
+            source_display_name="notes.md",
+            source_sha256="a" * 64,
+            heading_path=(),
+            source_regions=(TextSpanRegion(0, 13),),
+        )
+
+    async def inspect(*args, **kwargs):
+        return {
+            "documents": [
+                {
+                    "label": "notes.md",
+                    "locator": {"document_id": 12, "kind": "document"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(knowledge_tools, "read_knowledge", direct_read)
+    monkeypatch.setattr(knowledge_tools, "inspect_knowledge", inspect)
+    tools = [
+        InspectKnowledgeTool(None, None),
+        ReadKnowledgeTool(None, None, max_content_bytes=128),
+        SearchKnowledgeTool(service or _FakeRetrievalService()),
+        ExpandEvidenceTool(None),
+    ]
+    if web is not None:
+        tools.extend((SearchWebTool(web), ReadWebpageTool(web)))
+    return ToolExecutor(tools=tools)
+
+
+def _perception_round(name, arguments):
+    return ScriptedProviderRound(
+        events=(
+            _completion(
+                content="",
+                tool_calls=(ToolCall(name, name, json.dumps(arguments)),),
+                finish_reason=LLMFinishReason.TOOL_CALLS,
+            ),
+        )
+    )
+
+
+_DIRECT_READ_ARGUMENTS = {"locator": {"document_id": 12, "kind": "document"}}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kb", [None, 44])
+@pytest.mark.parametrize("web_enabled", [False, True])
+async def test_perception_capability_prompt_matrix(monkeypatch, kb, web_enabled):
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="answer"),))]
+    )
+    web = _WorkflowWebProvider() if web_enabled else None
+    executor = _perception_executor(monkeypatch, web=web)
+    await _execute_workflow(
+        _workflow(provider, tool_executor=executor), knowledge_base_id=kb
+    )
+    request = provider.requests[0]
+    names = {tool.name for tool in request.allowed_tools}
+    assert ("inspect_knowledge" in names) == (kb is not None)
+    assert ("read_knowledge" in names) == (kb is not None)
+    assert ("search_web" in names) == web_enabled
+    assert "expand_evidence" not in names
+    expected = workflow_module.BASE_LEARNING_ASSISTANT_SYSTEM_INPUT
+    if kb is not None:
+        expected += workflow_module.KNOWLEDGE_PERCEPTION_GUIDANCE
+        assert (
+            "If semantic discovery is needed, use Search1 once normally."
+            in request.system_input
+        )
+        for forbidden in ("learning-map", "study-review", "artifact", "clean Markdown"):
+            assert forbidden not in request.system_input
+    if web_enabled:
+        expected += workflow_module._WEB_SYSTEM_GUIDANCE
+    assert request.system_input == expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("final", ["answer [K1]", "uncited"])
+async def test_inspect_read_requires_citation_without_search(monkeypatch, final):
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            _perception_round("inspect_knowledge", {}),
+            _perception_round("read_knowledge", _DIRECT_READ_ARGUMENTS),
+            ScriptedProviderRound(events=(_completion(content=final),)),
+        ]
+    )
+    flow = _workflow(provider, tool_executor=_perception_executor(monkeypatch, service))
+    if final == "uncited":
+        with pytest.raises(WorkflowFailure) as error:
+            await _execute_workflow(flow, knowledge_base_id=44)
+        assert (
+            error.value.invalid_response_subtype
+            is InvalidResponseSubtype.MISSING_REQUIRED_CITATION
+        )
+    else:
+        answer = await _execute_workflow(flow, knowledge_base_id=44)
+        assert answer.citations[0].evidence_text == "source native"
+    assert service.calls == []
+    assert "expand_evidence" not in {
+        tool.name for tool in provider.requests[-1].allowed_tools
+    }
+    assert "search_knowledge" in {
+        tool.name for tool in provider.requests[-1].allowed_tools
+    }
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failed_tool", ["search_knowledge", "read_knowledge"])
+async def test_perception_recovers_via_other_knowledge_tool(monkeypatch, failed_tool):
+    service = _FakeRetrievalService()
+    if failed_tool == "search_knowledge":
+        service.error = KnowledgeSearchError("KNOWLEDGE_UNAVAILABLE", retryable=False)
+    sequence = [
+        ("search_knowledge", {"query": "query"}),
+        ("read_knowledge", _DIRECT_READ_ARGUMENTS),
+    ]
+    if failed_tool == "read_knowledge":
+        sequence.reverse()
+    provider = FakeProvider(
+        [
+            *(_perception_round(*call) for call in sequence),
+            ScriptedProviderRound(events=(_completion(content="answer [K1]"),)),
+        ]
+    )
+    answer = await _execute_workflow(
+        _workflow(
+            provider,
+            tool_executor=_perception_executor(
+                monkeypatch, service, read_fails=failed_tool == "read_knowledge"
+            ),
+        ),
+        knowledge_base_id=44,
+    )
+    assert answer.content == "answer [K1]" and len(answer.citations) == 1
+
+
+@pytest.mark.anyio
+async def test_failed_direct_read_without_evidence_uses_read_unavailable(monkeypatch):
+    provider = FakeProvider(
+        [
+            _perception_round("read_knowledge", _DIRECT_READ_ARGUMENTS),
+            ScriptedProviderRound(events=(_completion(content="unsupported claim"),)),
+        ]
+    )
+    answer = await _execute_workflow(
+        _workflow(
+            provider, tool_executor=_perception_executor(monkeypatch, read_fails=True)
+        ),
+        knowledge_base_id=44,
+    )
+    assert answer.content == workflow_module._KNOWLEDGE_READ_UNAVAILABLE_ANSWER
+    assert answer.citations == () and not answer.abstained
+
+
+@pytest.mark.anyio
+async def test_read_does_not_consume_search2_or_enable_search3(monkeypatch):
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [
+            _perception_round("read_knowledge", _DIRECT_READ_ARGUMENTS),
+            _perception_round("search_knowledge", {"query": "first facet"}),
+            _perception_round("search_knowledge", {"query": "second facet"}),
+            ScriptedProviderRound(events=(_completion(content="answer [K1] [K2]"),)),
+        ]
+    )
+    answer = await _execute_workflow(
+        _workflow(provider, tool_executor=_perception_executor(monkeypatch, service)),
+        knowledge_base_id=44,
+    )
+    assert len(service.calls) == 2 and len(answer.citations) == 2
+    assert "search_knowledge" not in {
+        t.name for t in provider.requests[-1].allowed_tools
+    }
+
+
+@pytest.mark.anyio
+async def test_required_with_perception_registry_remains_no_tool(monkeypatch):
+    service = _FakeRetrievalService()
+    provider = FakeProvider(
+        [ScriptedProviderRound(events=(_completion(content="answer [K1]"),))]
+    )
+    flow = _workflow(
+        provider,
+        tool_executor=_perception_executor(monkeypatch),
+        retrieval_service=service,
+    )
+    await _execute_workflow(
+        flow, knowledge_base_id=44, grounding_policy=GroundingPolicy.REQUIRED
+    )
+    assert provider.requests[0].allowed_tools == ()
+    assert "inspect_knowledge" not in provider.requests[0].system_input
+    assert service.origins == [KnowledgeSearchOrigin.HARNESS_REQUIRED]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("web_read", [False, True, "search_failed"])
+async def test_direct_read_composes_with_web_without_losing_citations(
+    monkeypatch, web_read
+):
+    web = _WorkflowWebProvider()
+    if web_read == "search_failed":
+
+        async def fail_search(query):
+            raise WebProviderError("WEB_PROVIDER_UNAVAILABLE", retryable=False)
+
+        monkeypatch.setattr(web, "search", fail_search)
+    rounds = [
+        _perception_round("read_knowledge", _DIRECT_READ_ARGUMENTS),
+        *_web_rounds("unused")[:1],
+    ]
+    if web_read is True:
+        rounds.extend(_web_rounds("unused")[1:2])
+    final = "answer [K1]" + (" and [W1:E1]" if web_read is True else "")
+    provider = FakeProvider(
+        [*rounds, ScriptedProviderRound(events=(_completion(content=final),))]
+    )
+    answer = await _execute_workflow(
+        _workflow(provider, tool_executor=_perception_executor(monkeypatch, web=web)),
+        knowledge_base_id=44,
+    )
+    assert answer.citations[0].evidence_text == "source native"
+    assert ("来源：" in answer.content) == (web_read is True)
+    assert answer.content.startswith(final)
 
 
 @pytest.mark.anyio

@@ -17,6 +17,11 @@ from langley.answering.tools import (
 )
 from langley.answering.tracing import KnowledgeSearchOrigin
 from langley.knowledge import retrieval_service
+from langley.knowledge.contracts import (
+    KnowledgeLocator,
+    KnowledgeReadResult,
+    TextSpanRegion,
+)
 from langley.knowledge.reads import (
     AdjacentKnowledgeAnchorChangedError,
     AdjacentKnowledgeChunkRead,
@@ -87,6 +92,30 @@ def _executor(service: _FakeRetrievalService) -> ToolExecutor:
 
 def _context(knowledge_base_id: int | None = 43) -> ToolContext:
     return ToolContext(run_id=41, user_id=42, knowledge_base_id=knowledge_base_id)
+
+
+def test_expand_rejects_direct_read_anchor_without_database_access():
+    context = _context()
+    context.knowledge_evidence.register_read(
+        KnowledgeReadResult(
+            locator=KnowledgeLocator(document_id=12, kind="document"),
+            document_version_id=13,
+            content="read",
+            source_display_name="notes.md",
+            source_sha256="a" * 64,
+            heading_path=(),
+            source_regions=(TextSpanRegion(0, 4),),
+        )
+    )
+    (result,) = asyncio.run(
+        ToolExecutor(tools=(ExpandEvidenceTool(None),)).execute_batch(
+            (ToolCall("expand", "expand_evidence", '{"evidence_handle":"K1"}'),),
+            context=context,
+        )
+    )
+    assert (
+        json.loads(result.content)["error"]["code"] == "KNOWLEDGE_EVIDENCE_UNAVAILABLE"
+    )
 
 
 @pytest.mark.anyio

@@ -170,9 +170,14 @@ class QwenProvider:
     def _request_payload(self, request: LLMRequest) -> dict[str, Any]:
         """Map only Langley's normalized request fields to Qwen's wire shape."""
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": request.system_input}
-        ]
+        system_input = request.system_input
+        if request.active_skill is not None:
+            system_input += (
+                f"\n\n[Active Skill Instructions: {request.active_skill.name}]\n"
+                + request.active_skill.instructions
+                + "\n[End Active Skill Instructions]"
+            )
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_input}]
         for index, item in enumerate(request.transcript):
             if isinstance(item, UserRuntimeMessage):
                 content: object = item.content
@@ -199,6 +204,34 @@ class QwenProvider:
                                 else {}
                             ),
                             "current_user_request": item.content,
+                            **(
+                                {
+                                    "active_skill_resources": [
+                                        {
+                                            "path": resource.path,
+                                            "byte_size": resource.byte_size,
+                                        }
+                                        for resource in request.active_skill_resources
+                                    ]
+                                }
+                                if request.active_skill is not None
+                                and request.active_skill_resources
+                                else {}
+                            ),
+                            **(
+                                {
+                                    "available_skills": [
+                                        {
+                                            "name": skill.name,
+                                            "description": skill.description,
+                                        }
+                                        for skill in request.available_skills
+                                    ]
+                                }
+                                if request.available_skills
+                                and request.active_skill is None
+                                else {}
+                            ),
                             **(
                                 {"evidence_context": request.evidence_context}
                                 if request.evidence_context is not None

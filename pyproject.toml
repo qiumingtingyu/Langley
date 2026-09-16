@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "python-multipart>=0.0.20",
+    "pyyaml>=6.0.3,<7",
     "sqlalchemy>=2.0",
     "semantic-text-splitter>=0.32,<0.33",
     "structlog>=25.0",
@@ -31,6 +32,7 @@ dev = [
     "numpy>=2.0,<3",
     "pytest>=8.3",
     "ruff>=0.8",
+    "types-pyyaml>=6.0.12,<7",
 ]
 eval = [
     "sentence-transformers>=5.0,<6",

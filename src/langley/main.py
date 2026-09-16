@@ -17,6 +17,7 @@ from langley.answering.contracts import LLMProvider, LLMRequest, LLMStreamEvent
 from langley.answering.conversation_context import LLMConversationCompactor
 from langley.answering.conversation_context_builder import ConversationContextBuilder
 from langley.answering.errors import RunErrorCode, WorkflowFailure
+from langley.answering.knowledge_tools import InspectKnowledgeTool, ReadKnowledgeTool
 from langley.answering.local_tracing import CompositeTracer, LocalJsonTracer
 from langley.answering.tools import (
     AgentTool,
@@ -77,6 +78,8 @@ from langley.memory.processing import (
 )
 from langley.observability import configure_logging
 from langley.settings import Settings
+from langley.skill_store import SkillStore
+from langley.skills import SkillRegistry
 from langley.workspace_storage import WorkspaceStorage
 
 logger = structlog.get_logger(__name__)
@@ -269,10 +272,17 @@ def _workflow_factory_for(
         reranker=_reranker_for(settings),
         reranker_candidate_k=settings.knowledge_reranker_candidate_k,
     )
+    knowledge_storage = LocalFileStorage(settings.knowledge_storage_root)
     tools: list[AgentTool] = [
         CurrentTimeTool(),
         SearchKnowledgeTool(retrieval_service),
         ExpandEvidenceTool(session_factory),
+        InspectKnowledgeTool(session_factory, knowledge_storage),
+        ReadKnowledgeTool(
+            session_factory,
+            knowledge_storage,
+            max_content_bytes=settings.knowledge_read_max_content_bytes,
+        ),
     ]
     if settings.web_search_enabled:
         assert settings.tavily_api_key is not None
@@ -283,6 +293,9 @@ def _workflow_factory_for(
         WorkspaceTool(name, workspace_storage) for name in sorted(WORKSPACE_TOOL_NAMES)
     )
     tool_executor = ToolExecutor(tools=tools)
+    skill_registry = SkillRegistry(
+        settings.builtin_skill_root, SkillStore(settings).user_root
+    )
     resolved_tracer = tracer or LangSmithTracer(
         enabled=settings.tracing_enabled,
         project=settings.langsmith_project,
@@ -310,6 +323,7 @@ def _workflow_factory_for(
             tracer=resolved_tracer,
             retrieval_service=retrieval_service,
             workspace_storage=workspace_storage,
+            skill_registry=skill_registry,
         )
 
     return factory

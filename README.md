@@ -15,6 +15,51 @@ Langley 是面向个人的知识与执行 Agent：在 Web 中结合带来源证�
 | **Act** | New Workspace、Import Folder（managed copy）、五个文件/命令 Tools、Docker Sandbox、文件预览与 Run change summary。 |
 | **Observe / Evaluate** | 有预算和权限边界的 Agent Harness、LangSmith metadata tracing、本地 Run diagnostics，以及检索/回答质量 Eval。 |
 
+## Skill Runtime v0
+
+AUTO execution 支持 builtin 与本地安装的 user Skill：两种来源进入同一个
+Registry / execution snapshot / catalog / `load_skill` / reference reader。
+Skill 是独立的 procedure axis；没有 KB 也可以使用，且不会因此获得 Knowledge、
+Web 或 Workspace capability。REQUIRED 继续走确定性 KB QA，不进入 Skill AUTO graph。
+
+从仓库根目录配置并安装本地包：
+
+```powershell
+$env:LANGLEY_BUILTIN_SKILL_ROOT = 'G:\LangleySkills\builtin'
+$env:LANGLEY_SKILL_STORAGE_ROOT = 'G:\LangleySkills\installed'
+uv run --locked python -m langley.skill_installation 'G:\Downloads\example-skill'
+```
+
+默认 builtin root 为 `skills/builtin`，storage root 为 `data/skills`；两者以及
+Workspace storage 必须互不包含。应用与安装命令使用相同配置。每个包目录名必须与
+SKILL.md frontmatter 中的 name 完全一致；name 为最多 64 字符的小写字母、数字和内部
+单连字符，description 为最多 1024 字符的非空字符串。仓库不预装业务 Skill。
+
+安装会将输入目录有界复制到私有 staging，验证后原子发布到
+`<storage-root>/user/<name>`。该受控目录是安装事实；不写 Skill DB 表。
+完整包限制为 256 个文件、512 个遍历条目、4 MiB/文件、8 MiB 总量，SKILL.md 上限
+64 KiB；拒绝路径逃逸、symlink/junction、hardlink 和特殊文件。每个 source 最多发现
+64 个 Skill；builtin/user 名称全局唯一，不覆盖同名包。
+
+安装只在名称/数量检查和 rename 期间持有本地 OS 文件锁，避免并发安装越过上限；
+复制和验证在锁外。锁文件在 user root 之外，不记录安装状态，进程关闭时由 OS 释放锁。
+
+Builtin 在应用装配时发现；新 AUTO execution 扫描已发布 user root，冻结自己的
+SkillSnapshot。因此安装后无需重启即可供新 execution 发现，已有 execution 不会中途
+获得新 Skill。load 时重验 SKILL.md SHA；激活后必须重新规划，最多一个 active Skill。
+正文只叠加在当前 capability-aware instructions 上，不授予 Tool 或 Sandbox 权限。
+
+仅 `references/` 是 Runtime resource：激活时冻结 path/byte-size/hash manifest，
+按需读取时验证字节身份，内容作为 data 返回。限制为 64 文件、256 KiB/文件、2 MiB
+总量、256 遍历条目，单次 JSON observation 最多 16 KiB。文本模板应放入 references；
+`templates/` 不再是 Runtime 分类。scripts/assets 可作为有界包文件保存，但不执行或渲染。
+
+这是本地操作者入口，没有 Agent 安装 Tool、HTTP 管理 API、update/uninstall、GC 或
+watcher。published root 必须由应用控制，不放进模型可写 Workspace；不能防御拥有相同
+宿主文件权限的恶意进程。发布保证完整目录的原子可见性，不承诺断电持久性；staging
+cleanup 失败不改变安装结果，可能保留不可发现的临时目录。旧 `packages/<uuid>/...`
+不会自动导入新 user root。
+
 ## 技术架构
 
 ```mermaid

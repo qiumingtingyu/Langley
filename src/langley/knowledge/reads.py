@@ -15,6 +15,159 @@ from langley.infrastructure.models import (
     KnowledgeChunk,
 )
 from langley.knowledge.chunking import ChunkingConfig
+from langley.knowledge.contracts import (
+    DocumentSourceRef,
+    KnowledgeLocator,
+    KnowledgePerceptionError,
+    PdfPageRegion,
+    validate_heading_path,
+    validate_source_regions,
+)
+
+
+@dataclass(frozen=True)
+class PublishedPdfChunkRead:
+    ordinal: int
+    heading_path: tuple[str, ...]
+    source_regions: tuple[PdfPageRegion, ...]
+    content: str | None = None
+
+
+@dataclass(frozen=True)
+class PerceptionDocumentRead:
+    document_id: int
+    name: str
+    source: DocumentSourceRef
+    pdf_chunks: tuple[PublishedPdfChunkRead, ...] = ()
+
+
+async def read_perception_document(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: int,
+    knowledge_base_id: int,
+    document_id: int,
+    locator: KnowledgeLocator | None = None,
+    max_content_bytes: int,
+) -> PerceptionDocumentRead:
+    """Detach owned source facts and one consistent published PDF snapshot.
+
+    Multiple versions fail closed temporarily: current-version authority does not
+    exist yet. This must not become a latest-ID or processing-attempt heuristic.
+    No retrieval/index readiness is required for direct observation.
+    """
+    async with session_factory() as session, session.begin():
+        rows = (
+            await session.execute(
+                select(
+                    Document.name,
+                    DocumentVersion.id,
+                    DocumentVersion.storage_key,
+                    DocumentVersion.source_media_type,
+                    DocumentVersion.source_sha256,
+                    DocumentVersion.source_size_bytes,
+                    DocumentVersion.chunk_revision,
+                )
+                .join(Document, Document.id == DocumentVersion.document_id)
+                .join(KnowledgeBase, KnowledgeBase.id == Document.knowledge_base_id)
+                .where(
+                    KnowledgeBase.user_id == user_id,
+                    KnowledgeBase.id == knowledge_base_id,
+                    Document.id == document_id,
+                )
+                .limit(2)
+            )
+        ).all()
+        if not rows:
+            raise KnowledgePerceptionError(
+                "DOCUMENT_NOT_AVAILABLE", "Document is unavailable in this run's KB."
+            )
+        if len(rows) != 1:
+            raise KnowledgePerceptionError(
+                "KNOWLEDGE_READ_UNAVAILABLE", "Current document version is ambiguous."
+            )
+        row = rows[0]
+        source = DocumentSourceRef(
+            document_version_id=row.id,
+            storage_key=row.storage_key,
+            source_media_type=row.source_media_type,
+            source_sha256=row.source_sha256,
+            source_size_bytes=row.source_size_bytes,
+        )
+        if source.source_media_type != "application/pdf":
+            return PerceptionDocumentRead(document_id, row.name, source)
+        if locator is not None and locator.kind == "heading":
+            raise KnowledgePerceptionError(
+                "INVALID_LOCATOR", "PDF v0 supports document/pages, not headings."
+            )
+        metadata = (
+            await session.execute(
+                select(
+                    KnowledgeChunk.ordinal,
+                    KnowledgeChunk.heading_path,
+                    KnowledgeChunk.source_regions,
+                    func.octet_length(KnowledgeChunk.content).label("content_bytes"),
+                )
+                .where(KnowledgeChunk.document_version_id == source.document_version_id)
+                .order_by(KnowledgeChunk.ordinal.asc())
+            )
+        ).all()
+        if row.chunk_revision < 1 or not metadata:
+            raise KnowledgePerceptionError(
+                "KNOWLEDGE_READ_UNAVAILABLE", "No published PDF content is available."
+            )
+        chunks: list[PublishedPdfChunkRead] = []
+        content_bytes = 0
+        for item in metadata:
+            try:
+                regions = validate_source_regions(item.source_regions)
+                pdf_regions = tuple(r for r in regions if isinstance(r, PdfPageRegion))
+                if len(pdf_regions) != len(regions):
+                    raise ValueError("non-PDF provenance")
+                headings = tuple(validate_heading_path(item.heading_path))
+            except ValueError as error:
+                raise KnowledgePerceptionError(
+                    "KNOWLEDGE_READ_UNAVAILABLE", "Published PDF metadata is invalid."
+                ) from error
+            if locator is not None and locator.kind == "pages":
+                assert locator.page_start is not None and locator.page_end is not None
+                if not any(
+                    region.page_start <= locator.page_end
+                    and region.page_end >= locator.page_start
+                    for region in pdf_regions
+                ):
+                    continue
+            chunks.append(PublishedPdfChunkRead(item.ordinal, headings, pdf_regions))
+            content_bytes += item.content_bytes
+        if not chunks:
+            raise KnowledgePerceptionError(
+                "LOCATION_NOT_FOUND", "No published region intersects these pages."
+            )
+        if locator is not None:
+            # Separators are part of the observation. Never fetch an oversized body.
+            if content_bytes + 2 * (len(chunks) - 1) > max_content_bytes:
+                raise KnowledgePerceptionError(
+                    "KNOWLEDGE_READ_SCOPE_TOO_LARGE",
+                    "Use inspect_knowledge for a narrower location "
+                    "or search_knowledge.",
+                )
+            content_rows = (
+                await session.execute(
+                    select(KnowledgeChunk.ordinal, KnowledgeChunk.content).where(
+                        KnowledgeChunk.document_version_id
+                        == source.document_version_id,
+                        KnowledgeChunk.ordinal.in_(c.ordinal for c in chunks),
+                    )
+                )
+            ).all()
+            contents = {item.ordinal: item.content for item in content_rows}
+            chunks = [
+                PublishedPdfChunkRead(
+                    c.ordinal, c.heading_path, c.source_regions, contents[c.ordinal]
+                )
+                for c in chunks
+            ]
+    return PerceptionDocumentRead(document_id, row.name, source, tuple(chunks))
 
 
 @dataclass(frozen=True)

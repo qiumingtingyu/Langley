@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 
+from langley.knowledge.contracts import KnowledgeReadResult, encode_source_region
 from langley.knowledge.reads import AdjacentKnowledgeChunkRead
 from langley.knowledge.retrieval import RetrievalHit
 
@@ -11,8 +12,8 @@ class KnowledgeEvidence:
     """Authoritative evidence facts exposed under one stable model-visible K#."""
 
     evidence_handle: int
-    knowledge_chunk_id: int
-    chunk_ordinal: int
+    knowledge_chunk_id: int | None
+    chunk_ordinal: int | None
     document_id: int
     document_version_id: int
     content: str
@@ -20,6 +21,10 @@ class KnowledgeEvidence:
     source_regions: tuple[object, ...]
     source_display_name: str
     source_sha256: str
+
+    def __post_init__(self) -> None:
+        if (self.knowledge_chunk_id is None) != (self.chunk_ordinal is None):
+            raise ValueError("retrieval identity fields must be present together")
 
 
 class KnowledgeEvidenceSession:
@@ -32,6 +37,29 @@ class KnowledgeEvidenceSession:
     @property
     def evidence(self) -> tuple[KnowledgeEvidence, ...]:
         return tuple(self._evidence_by_handle.values())
+
+    @property
+    def has_chunk_evidence(self) -> bool:
+        return bool(self._handle_by_chunk_id)
+
+    def register_read(self, result: KnowledgeReadResult) -> KnowledgeEvidence:
+        """Register one complete bounded read without inventing retrieval identity."""
+        return self._store(
+            KnowledgeEvidence(
+                evidence_handle=len(self._evidence_by_handle) + 1,
+                knowledge_chunk_id=None,
+                chunk_ordinal=None,
+                document_id=result.locator.document_id,
+                document_version_id=result.document_version_id,
+                content=result.content,
+                heading_path=result.heading_path,
+                source_regions=tuple(
+                    encode_source_region(region) for region in result.source_regions
+                ),
+                source_display_name=result.source_display_name,
+                source_sha256=result.source_sha256,
+            )
+        )
 
     def register_hits(
         self, hits: tuple[RetrievalHit, ...]
@@ -84,7 +112,10 @@ class KnowledgeEvidenceSession:
 
     def _store(self, evidence: KnowledgeEvidence) -> KnowledgeEvidence:
         self._evidence_by_handle[evidence.evidence_handle] = evidence
-        self._handle_by_chunk_id[evidence.knowledge_chunk_id] = evidence.evidence_handle
+        if evidence.knowledge_chunk_id is not None:
+            self._handle_by_chunk_id[evidence.knowledge_chunk_id] = (
+                evidence.evidence_handle
+            )
         return evidence
 
     def resolve(self, evidence_handle: int) -> KnowledgeEvidence | None:

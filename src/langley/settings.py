@@ -26,7 +26,11 @@ class Settings(BaseSettings):
     database_url: str | None = None
     test_database_url: str | None = None
     knowledge_storage_root: Path = Path("data/knowledge")
+    # Configurable v0 candidate, not a frozen product/token-budget contract.
+    knowledge_read_max_content_bytes: int = Field(default=16_384, ge=1)
     workspace_storage_root: Path = Path("data/workspaces")
+    skill_storage_root: Path = Path("data/skills")
+    builtin_skill_root: Path = Path("skills/builtin")
     workspace_max_import_file_bytes: int = Field(default=10_485_760, ge=1)
     workspace_max_import_total_bytes: int = Field(default=52_428_800, ge=1)
     workspace_max_import_files: int = Field(default=1000, ge=1)

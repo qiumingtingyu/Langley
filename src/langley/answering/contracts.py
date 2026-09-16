@@ -82,6 +82,30 @@ RuntimeTranscriptItem: TypeAlias = (
 
 
 @dataclass(frozen=True)
+class SkillSummary:
+    """Discovery data only; no server identity or instruction authority."""
+
+    name: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ActiveSkill:
+    """Verified procedure subordinate to base policy, Tools and current USER intent."""
+
+    name: str
+    instructions: str
+
+
+@dataclass(frozen=True)
+class SkillResourceSummary:
+    """Supporting-data manifest entry; no server filesystem path or hash."""
+
+    path: str
+    byte_size: int
+
+
+@dataclass(frozen=True)
 class LLMRequest:
     """A provider-neutral request for exactly one LLM round."""
 
@@ -92,6 +116,9 @@ class LLMRequest:
     current_user_message_index: int | None = None
     conversation_compact_context: str | None = None
     evidence_context: str | None = None
+    available_skills: tuple[SkillSummary, ...] = ()
+    active_skill: ActiveSkill | None = None
+    active_skill_resources: tuple[SkillResourceSummary, ...] = ()
 
 
 @dataclass(frozen=True)

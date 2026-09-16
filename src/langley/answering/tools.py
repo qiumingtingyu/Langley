@@ -288,7 +288,8 @@ class ExpandEvidenceTool:
         description=(
             "Read the immediate previous and next chunks around a relevant K# "
             "when its local context is insufficient. Pass only a handle returned "
-            "in this run. Do not use when the available evidence is sufficient."
+            "by search_knowledge or expand_evidence in this run, not a direct-read "
+            "handle. Do not use when the available evidence is sufficient."
         ),
         arguments_schema=cast(
             dict[str, JSONValue], ExpandEvidenceArguments.model_json_schema()
@@ -318,6 +319,15 @@ class ExpandEvidenceTool:
         anchor = context.knowledge_evidence.resolve(evidence_handle)
         if anchor is None:
             raise ToolExecutionError("KNOWLEDGE_EVIDENCE_UNAVAILABLE", retryable=False)
+        if anchor.knowledge_chunk_id is None or anchor.chunk_ordinal is None:
+            raise ToolExecutionError(
+                "KNOWLEDGE_EVIDENCE_UNAVAILABLE",
+                retryable=False,
+                hints={
+                    "reason": "Direct-read evidence has no chunk neighbors; use "
+                    "inspect_knowledge, read_knowledge or search_knowledge."
+                },
+            )
 
         try:
             neighbors = await read_adjacent_knowledge_chunks(
@@ -561,6 +571,11 @@ class ToolExecutor:
 
         return tuple(tool.spec for tool in self._tools_by_name.values())
 
+    def with_runtime_tool(self, tool: AgentTool) -> "ToolExecutor":
+        """Add one Run-scoped implementation without mutating the shared registry."""
+
+        return ToolExecutor(tools=(*self._tools_by_name.values(), tool))
+
     async def execute_batch(
         self,
         calls: tuple[ToolCall, ...],
@@ -571,11 +586,20 @@ class ToolExecutor:
         ) = None,
         trace: "ExecutionTrace | None" = None,
         tool_calls_used_start: int = 0,
+        reject_batch_code: str | None = None,
     ) -> tuple[ToolResult, ...]:
-        """Execute independent read-only calls serially in canonical order."""
+        """Execute calls in canonical order, or trace a Harness-rejected batch.
+
+        reject_batch_code is a server-supplied reason, never a model argument.
+        Rejection preserves call identities/traces and executes zero Tools.
+        """
 
         self._validate_call_identities(calls)
-        batch_rejected = self.side_effect_batch_unsupported(calls)
+        batch_rejection = reject_batch_code or (
+            "SIDE_EFFECT_BATCH_UNSUPPORTED"
+            if self.side_effect_batch_unsupported(calls)
+            else None
+        )
         results: list[ToolResult] = []
         for call_index, call in enumerate(calls, start=1):
             tool_trace = self._start_tool_trace(
@@ -596,8 +620,8 @@ class ToolExecutor:
 
             try:
                 with tool_trace_context(tool_trace):
-                    if batch_rejected:
-                        code = "SIDE_EFFECT_BATCH_UNSUPPORTED"
+                    if batch_rejection is not None:
+                        code = batch_rejection
                         result = ToolResult(
                             call_id=call.call_id,
                             name=call.name,
