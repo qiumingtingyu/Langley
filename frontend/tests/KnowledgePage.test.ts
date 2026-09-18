@@ -358,7 +358,7 @@ describe("KnowledgePage processing bridge", () => {
     const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
       if (path === "/api/knowledge-bases") return response(knowledgeBase);
       if (path === "/api/knowledge-bases/4/documents" && init?.method !== "POST") return response([pdfDocument]);
-      if (path === "/api/knowledge-bases/4/documents" && init?.method === "POST") return response({ ...pdfDocument, processing_job: { job_id: 30, attempt_no: 1, status: "PENDING", recipe_id: "pdf_docling_hybrid512_v1" } });
+      if (path === "/api/knowledge-bases/4/documents" && init?.method === "POST") return Object.assign(response({ ...pdfDocument, processing_job: { job_id: 30, attempt_no: 1, status: "PENDING", recipe_id: "pdf_docling_hybrid512_v1" } }), { status: 202 });
       if (path.includes("/chunks?")) return response({ ...chunksPage(null, 0), document_version_id: 18 });
       if (path === "/api/document-versions/18/processing-status") { statusReads += 1; return response(pdfStatus("RUNNING", "PARSING")); }
       if (path === "/api/knowledge-bases/4/index-status") return response(indexStatus("CHUNKED"));
@@ -372,12 +372,44 @@ describe("KnowledgePage processing bridge", () => {
     await input.trigger("change");
     await wrapper.findAll("form")[1]!.trigger("submit");
     await settle();
-    await vi.advanceTimersByTimeAsync(2500);
+    await vi.advanceTimersByTimeAsync(5000);
     await settle();
     expect(statusReads).toBeGreaterThan(1);
     expect(wrapper.text()).toContain("正在解析 PDF");
+    expect(wrapper.get('[role="status"]').text()).toContain("上传请求已接受，PDF 将在后台处理");
+    expect(wrapper.text()).not.toContain("PDF 已完成处理");
     expect(wrapper.findAll('input[inputmode="numeric"]')).toHaveLength(0);
     expect(fetchMock.mock.calls.some(([path]) => String(path).endsWith("/chunks/rebuild"))).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("waits five seconds between PDF polls and retains the current status during refresh", async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    let resolve!: (value: Response) => void;
+    const pending = new Promise<Response>((done) => { resolve = done; });
+    vi.stubGlobal("fetch", vi.fn(async (path: string) => {
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path.endsWith("/documents")) return response([pdfDocument]);
+      if (path.includes("/chunks?")) return response({ ...chunksPage(null, 0), document_version_id: 18 });
+      if (path.endsWith("/index-status")) return response(indexStatus("CHUNKED"));
+      if (path.endsWith("/processing-status")) return ++reads === 1 ? response(pdfStatus("RUNNING", "PARSING")) : pending;
+      throw new Error("Unexpected fixture request");
+    }));
+    const wrapper = mount(KnowledgePage);
+    await settle();
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(reads).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(reads).toBe(2);
+    expect(wrapper.text()).toContain("正在解析 PDF");
+    expect(wrapper.text()).not.toContain("正在读取处理状态…");
+    resolve(response(pdfStatus("FAILED", null, "PDF parsing failed")));
+    await settle();
+    expect(wrapper.text()).toContain("PDF parsing failed");
+    expect(wrapper.text()).not.toContain("PDF 解析可能需要一些时间");
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(reads).toBe(2);
     wrapper.unmount();
   });
 
@@ -397,7 +429,7 @@ describe("KnowledgePage processing bridge", () => {
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
     await settle();
-    await vi.advanceTimersByTimeAsync(2500);
+    await vi.advanceTimersByTimeAsync(5000);
     await settle();
     expect(chunkReads).toBe(2);
     expect(wrapper.text()).toContain("PDF 已完成处理");
@@ -491,7 +523,7 @@ describe("KnowledgePage processing bridge", () => {
     wrapper.unmount();
   });
 
-  it("shows unknown historical configuration truthfully and renders chunk facts with expand", async () => {
+  it("shows unknown historical configuration and short chunks without an expand button", async () => {
     const fetchMock = defaultFetch(chunksPage(null, 1));
     vi.stubGlobal("fetch", fetchMock);
     const wrapper = mount(KnowledgePage);
@@ -499,10 +531,10 @@ describe("KnowledgePage processing bridge", () => {
     expect(wrapper.text()).toContain("当前切片配置未知，请重新处理文档。");
     expect(wrapper.text()).toContain("处理文档");
     expect((wrapper.findAll("input").find((item) => item.attributes("inputmode") === "numeric")!.element as HTMLInputElement).value).toBe("1200");
-    expect(wrapper.text()).toContain("#1");
+    expect(wrapper.text()).toContain(chunk.content);
     expect(wrapper.text()).toContain("操作系统 › 进程");
     expect(wrapper.text()).toContain("text_span [12, 48)");
-    await wrapper.findAll("button").find((item) => item.text() === "展开")!.trigger("click");
+    expect(wrapper.findAll("button").some((item) => item.text() === "展开")).toBe(false);
     expect(wrapper.text()).toContain(chunk.content);
     wrapper.unmount();
   });
@@ -526,7 +558,7 @@ describe("KnowledgePage processing bridge", () => {
     await input.setValue("800");
     await wrapper.findAll("form").at(-1)!.trigger("submit");
     expect(input.attributes("disabled")).toBeDefined();
-    expect(wrapper.text()).toContain("#1");
+    expect(wrapper.text()).toContain(chunk.content);
     resolveRebuild!(response({ document_version_id: 17, successful_chunk_max_chars: 800, chunk_count: 1, resulting_index_status: "STALE" }));
     await settle();
     expect(wrapper.text()).toContain("当前分块配置：800");
@@ -585,7 +617,7 @@ describe("KnowledgePage processing bridge", () => {
     await settle();
     expect(wrapper.text()).toContain("输入内容无效，请检查后重试。");
     expect(wrapper.text()).toContain("当前分块配置：1200");
-    expect(wrapper.text()).toContain("#1");
+    expect(wrapper.text()).toContain(chunk.content);
     expect((input.element as HTMLInputElement).value).toBe("800");
     wrapper.unmount();
   });
@@ -609,7 +641,7 @@ describe("KnowledgePage processing bridge", () => {
     await next.trigger("click");
     await settle();
     expect(wrapper.text()).toContain("显示 11–11");
-    expect(wrapper.text()).toContain("#11");
+    expect(wrapper.text()).toContain("位置详情 · 片段 11");
     expect(next.attributes("disabled")).toBeDefined();
     wrapper.unmount();
   });
@@ -655,7 +687,7 @@ describe("KnowledgePage processing bridge", () => {
     expect(wrapper.text()).toContain("处理已完成，但暂时无法刷新 Chunk，请刷新后查看。");
     expect(wrapper.text()).toContain("需要重建");
     expect(wrapper.text()).not.toContain("尚未处理");
-    expect(wrapper.text()).not.toContain("#1");
+    expect(wrapper.text()).not.toContain(chunk.content);
     wrapper.unmount();
   });
 
@@ -754,6 +786,129 @@ describe("KnowledgePage processing bridge", () => {
     await settle();
     expect(wrapper.text()).not.toContain("文档处理");
     expect(notice).toHaveBeenCalledWith("该知识库或文档已不存在，请刷新后重试。");
+    wrapper.unmount();
+  });
+});
+
+describe("UI-1 upload feedback and reading", () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); document.body.innerHTML = ""; });
+
+  const doc = { id: 1, name: "Guide", created_at: "x", source: { document_version_id: 11, filename: "guide.md", media_type: "text/markdown", size_bytes: 2048, sha256: "abc", created_at: "2026-09-14T11:54:00Z" } };
+  async function setup(post: () => Promise<Response>, content = "A short passage.") {
+    const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+      if (init?.method === "POST") return post();
+      if (path === "/api/knowledge-bases") return response(knowledgeBase);
+      if (path.endsWith("/documents")) return response([doc]);
+      if (path.endsWith("/index-status")) return response(indexStatus("READY"));
+      if (path.includes("/chunks?")) return response({ successful_chunk_max_chars: 1200, suggested_chunk_max_chars: 1200, chunk_count: 1, offset: 0, limit: 10, chunks: [{ ordinal: 1, content, heading_path: ["Guide"], source_regions: [] }] });
+      throw new Error("Unexpected fixture request");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(KnowledgePage, { attachTo: document.body });
+    await settle();
+    return { wrapper, fetchMock };
+  }
+  async function choose(wrapper: ReturnType<typeof mount>, name: string, size: number, type = "") {
+    const file = new File(["fixture"], name, { type });
+    Object.defineProperty(file, "size", { configurable: true, value: size });
+    const input = wrapper.get('input[type="file"]');
+    Object.defineProperty(input.element, "files", { configurable: true, value: [file] });
+    await input.trigger("change");
+    return file;
+  }
+
+  it.each([["note.MD", 5], ["report.PDF", 64]] as const)("blocks oversized %s locally, clears errors on valid reselection, and accepts the exact limit", async (name, limitMiB) => {
+    const { wrapper, fetchMock } = await setup(async () => response(doc));
+    await wrapper.get('button[aria-controls="knowledge-upload"]').trigger("click");
+    await choose(wrapper, name, limitMiB * 1024 * 1024 + 1);
+    expect(wrapper.get('[role="alert"]').isVisible()).toBe(true);
+    expect(wrapper.get('[role="alert"]').text()).toContain(`${limitMiB} MiB`);
+    expect(wrapper.get('[role="alert"]').text()).toContain("bytes");
+    await wrapper.get("#knowledge-upload").trigger("submit");
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
+    await choose(wrapper, name, limitMiB * 1024 * 1024);
+    expect(wrapper.find('[role="alert"]').exists()).toBe(false);
+    await wrapper.get("#knowledge-upload").trigger("submit");
+    await settle();
+    const posts = fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts).toHaveLength(1);
+    if (name.endsWith(".PDF")) expect((posts[0]![1]!.body as FormData).get("file")).toHaveProperty("type", "application/pdf");
+    wrapper.unmount();
+  });
+
+  it("preserves the chosen file and edited name across collapse, and prevents duplicate pending uploads", async () => {
+    let resolve!: (value: Response) => void;
+    const pending = new Promise<Response>((done) => { resolve = done; });
+    const { wrapper, fetchMock } = await setup(() => pending);
+    const toggle = wrapper.get('button[aria-controls="knowledge-upload"]');
+    expect(wrapper.get("#knowledge-upload").isVisible()).toBe(false);
+    await toggle.trigger("click");
+    await choose(wrapper, "guide.md", 20);
+    const name = wrapper.get('#knowledge-upload input[maxlength="255"]');
+    await name.setValue("Edited title");
+    await toggle.trigger("click");
+    expect(wrapper.get("#knowledge-upload").isVisible()).toBe(false);
+    await toggle.trigger("click");
+    expect((name.element as HTMLInputElement).value).toBe("Edited title");
+    expect(wrapper.get("#knowledge-upload").isVisible()).toBe(true);
+    expect(wrapper.text()).toContain("已选择：guide.md");
+    await wrapper.get("#knowledge-upload").trigger("submit");
+    await wrapper.get("#knowledge-upload").trigger("submit");
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    resolve(response({ detail: { code: "UPLOAD_TOO_LARGE" } }, false));
+    await settle();
+    expect(wrapper.get('[role="alert"]').isVisible()).toBe(true);
+    expect(wrapper.get("#knowledge-upload").isVisible()).toBe(true);
+    expect((name.element as HTMLInputElement).value).toBe("Edited title");
+    expect(wrapper.get('#knowledge-upload button[type="submit"]').attributes("disabled")).toBeUndefined();
+    wrapper.unmount();
+  });
+
+  it.each([
+    ["server limit", () => Promise.resolve(response({ detail: { code: "UPLOAD_TOO_LARGE" } }, false)), "文件超过允许大小"],
+    ["HTML", () => Promise.resolve(new Response("<html>private stack</html>", { status: 502 })), "HTTP 502"],
+    ["empty", () => Promise.resolve(new Response(null, { status: 503 })), "HTTP 503"],
+    ["null detail", () => Promise.resolve(response({ detail: null }, false)), "操作失败"],
+    ["network", () => Promise.reject(new TypeError("private stack")), "上传结果不明确，请先刷新文档列表确认"],
+  ] as const)("keeps readable inline feedback for %s without automatically reposting", async (_label, post, expected) => {
+    const { wrapper, fetchMock } = await setup(post);
+    await wrapper.get('button[aria-controls="knowledge-upload"]').trigger("click");
+    await choose(wrapper, "guide.md", 20);
+    await wrapper.get("#knowledge-upload").trigger("submit");
+    await settle();
+    expect(wrapper.get('[role="alert"]').isVisible()).toBe(true);
+    expect(wrapper.get('[role="alert"]').text()).toContain(expected);
+    expect(wrapper.text()).not.toContain("private stack");
+    expect(wrapper.text()).not.toContain("SyntaxError");
+    expect(wrapper.text()).toContain("已选择：guide.md");
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    wrapper.unmount();
+  });
+
+  it("expands long chunks as plain text and shows readable source metadata", async () => {
+    const content = "Readable passage ".repeat(30) + "<script>unsafe()</script>";
+    const { wrapper } = await setup(async () => response(doc), content);
+    const detail = wrapper.get('[aria-label="文档阅读区"]');
+    expect(detail.text()).toContain("Markdown · 2 KiB ·");
+    expect(detail.text()).not.toContain("2026-09-14T");
+    expect(detail.text()).not.toContain("<script>unsafe()");
+    const expand = detail.findAll("button").find((item) => item.text() === "展开")!;
+    await expand.trigger("click");
+    expect(detail.text()).toContain(content);
+    expect(detail.find("script").exists()).toBe(false);
+    expect(expand.attributes("aria-expanded")).toBe("true");
+    await expand.trigger("click");
+    expect(detail.text()).not.toContain("<script>unsafe()");
+    wrapper.unmount();
+  });
+
+  it("revalidates size at submission even without another file change event", async () => {
+    const { wrapper, fetchMock } = await setup(async () => response(doc));
+    const file = await choose(wrapper, "guide.md", 20);
+    Object.defineProperty(file, "size", { value: 5 * 1024 * 1024 + 1 });
+    await wrapper.get("#knowledge-upload").trigger("submit");
+    expect(wrapper.get('[role="alert"]').isVisible()).toBe(true);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(0);
     wrapper.unmount();
   });
 });

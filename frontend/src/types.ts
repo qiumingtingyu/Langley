@@ -1,4 +1,22 @@
-export type ActiveView = "chat" | "memory" | "knowledge";
+export type ActiveView = "chat" | "memory" | "knowledge" | "skills" | "observatory";
+
+export type SkillSource = "BUILTIN" | "USER_INSTALLED";
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  source: SkillSource;
+}
+
+export interface SkillResource {
+  path: string;
+  byte_size: number;
+}
+
+export interface SkillDetail extends SkillSummary {
+  instructions: string;
+  resources: SkillResource[];
+}
 
 export type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 export type GroundingPolicy = "AUTO" | "REQUIRED";

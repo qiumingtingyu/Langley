@@ -1,8 +1,173 @@
-import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+import { DOMWrapper, flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import { nextTick } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../src/App.vue";
+import ChatWorkspace from "../src/components/ChatWorkspace.vue";
+import AppSidebar from "../src/components/AppSidebar.vue";
+import WorkspacePanel from "../src/components/WorkspacePanel.vue";
+import SkillsPage from "../src/SkillsPage.vue";
+describe("Workspace product integration", () => {
+  const wrappers: VueWrapper[] = [];
+  afterEach(() => {
+    wrappers.splice(0).forEach(wrapper => wrapper.unmount());
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+  });
+
+  function start(handler: (path: string, init?: RequestInit) => Response | Promise<Response>) {
+    FakeEventSource.instances = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
+    const fetchMock = vi.fn(handler);
+    vi.stubGlobal("fetch", fetchMock);
+    const wrapper = mount(App, { attachTo: document.body });
+    wrappers.push(wrapper);
+    return { wrapper, fetchMock };
+  }
+  function panel() {
+    return new DOMWrapper(document.querySelector<HTMLElement>('[role="dialog"]')!);
+  }
+  const changes = (path: string) => ({ added: [path], modified: [], deleted: [], complete: true });
+
+  it("keeps ordinary Chat free of the file panel until opened and restores focus without mutations", async () => {
+    const chats = [conversation(1, "Ordinary")];
+    const { wrapper, fetchMock } = start(path => {
+      if (path === "/api/conversations") return response(chats);
+      if (path.endsWith("/messages")) return response({ messages: [message(1, "Long message ".repeat(120))], latest_run: null });
+      return response([]);
+    });
+    await settle();
+    const trigger = wrapper.get('button[aria-label="打开工作区"]');
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(wrapper.findComponent(WorkspacePanel).find("aside").exists()).toBe(false);
+    expect(wrapper.findComponent(WorkspacePanel).find("select").exists()).toBe(false);
+    expect(trigger.text()).toBe("工作区");
+    await wrapper.get("textarea").setValue("unsent draft");
+    await trigger.trigger("click");
+    await settle();
+    expect(trigger.attributes("aria-expanded")).toBe("true");
+    expect(panel().text()).toContain("选择或创建工作区后，将进入该工作区的会话。");
+    expect((panel().get("select").element as HTMLSelectElement).value).toBe("");
+    await panel().get('button[aria-label="关闭面板"]').trigger("click");
+    await settle();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(trigger.element);
+    expect((wrapper.get("textarea").element as HTMLTextAreaElement).value).toBe("unsent draft");
+    await trigger.trigger("click");
+    await settle();
+    document.activeElement?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    await settle();
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(wrapper.findComponent(ChatWorkspace).props("selectedConversation")?.workspace_id).toBeUndefined();
+    expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
+  });
+
+  it("enters the selected workspace conversation using durable facts and keeps ordinary binding intact", async () => {
+    const chats = [conversation(1, "Ordinary"), { ...conversation(2, "Project"), workspace_id: 7 }];
+    const { wrapper, fetchMock } = start(path => {
+      if (path === "/api/conversations") return response(chats);
+      if (path === "/api/workspaces") return response([{ id: 7, name: "Test project" }]);
+      if (path.includes("/files?")) return response({ entries: [{ name: "hello.py", type: "file" }] });
+      if (path.endsWith("/messages")) return response({ messages: [], latest_run: null });
+      return response([]);
+    });
+    await settle();
+    await wrapper.get('button[aria-label="打开工作区"]').trigger("click");
+    await settle();
+    await panel().get("select").setValue("7");
+    await settle();
+    expect(wrapper.findComponent(ChatWorkspace).props("selectedConversation")?.id).toBe(2);
+    expect(wrapper.get('button[aria-label="打开工作区"]').text()).toContain("已连接");
+    expect((panel().get("select").element as HTMLSelectElement).value).toBe("7");
+    expect(panel().text()).toContain("hello.py");
+    await panel().get('button[aria-label="关闭面板"]').trigger("click");
+    await settle();
+    await wrapper.get('button[aria-label="打开工作区"]').trigger("click");
+    await settle();
+    expect((panel().get("select").element as HTMLSelectElement).value).toBe("7");
+    expect(chats[0]).not.toHaveProperty("workspace_id");
+    expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
+  });
+
+  it.each(["conversation", "run"] as const)("drops an old decoded change summary after %s switching", async (scope) => {
+    const oldBody = deferred<unknown>();
+    const chats = [{ ...conversation(1, "A"), workspace_id: 7 }, { ...conversation(2, "B"), workspace_id: 8 }];
+    let currentRun = 10;
+    const { wrapper } = start(path => {
+      if (path === "/api/conversations") return response(chats);
+      if (path === "/api/workspaces") return response([{ id: 7, name: "A files" }, { id: 8, name: "B files" }]);
+      if (path.endsWith("/messages")) return response({ messages: [], latest_run: run(path.includes("/2/") ? 20 : currentRun, "SUCCEEDED") });
+      if (path === "/api/runs/10") return { ok: true, json: () => oldBody.promise } as Response;
+      if (path.startsWith("/api/runs/")) return response({ workspace_changes: changes("current.txt") });
+      if (path.includes("/files?")) return response({ entries: [] });
+      return response([]);
+    });
+    await settle();
+    if (scope === "conversation") wrapper.findComponent(AppSidebar).vm.$emit("select", 2);
+    else {
+      currentRun = 11;
+      // A refresh can arrive independently while an older Run body is decoding.
+      wrapper.findComponent(ChatWorkspace).vm.$emit("refresh");
+    }
+    await settle();
+    oldBody.resolve({ workspace_changes: changes("stale.txt") });
+    await settle();
+    expect(wrapper.findComponent(WorkspacePanel).props("changes")).toEqual(changes("current.txt"));
+    await wrapper.get('button[aria-label="打开工作区"]').trigger("click");
+    await settle();
+    expect(panel().text()).toContain("current.txt");
+    expect(panel().text()).not.toContain("stale.txt");
+  });
+
+  it("ignores old terminal events and only presents changes for the latest successful Run", async () => {
+    let currentRun = run(10, "RUNNING");
+    const { wrapper, fetchMock } = start(path => {
+      if (path === "/api/conversations") return response([{ ...conversation(1, "A"), workspace_id: 7 }]);
+      if (path.endsWith("/messages")) return response({ messages: [], latest_run: currentRun });
+      if (path.startsWith("/api/runs/")) return response({ run: currentRun, assistant_message: null, workspace_changes: changes("latest.txt") });
+      if (path.includes("/files?")) return response({ entries: [] });
+      return response([]);
+    });
+    await settle();
+    const oldStream = FakeEventSource.instances.find(source => source.url === "/api/runs/10/events")!;
+    currentRun = run(11, "RUNNING");
+    wrapper.findComponent(ChatWorkspace).vm.$emit("refresh");
+    await settle();
+    const currentStream = FakeEventSource.instances.find(source => source.url === "/api/runs/11/events")!;
+    oldStream.emit("run.succeeded", new MessageEvent("run.succeeded", { data: JSON.stringify({ run_id: 10, workspace_changes: changes("stale.txt") }) }));
+    await settle();
+    expect(wrapper.findComponent(WorkspacePanel).props("changes")).toBeNull();
+    currentRun = run(11, "SUCCEEDED");
+    currentStream.emit("run.succeeded", new MessageEvent("run.succeeded", { data: JSON.stringify({ run_id: 11, workspace_changes: changes("latest.txt") }) }));
+    await settle();
+    expect(wrapper.findComponent(WorkspacePanel).props("changes")).toEqual(changes("latest.txt"));
+    const requestCount = fetchMock.mock.calls.length;
+    oldStream.emit("run.succeeded", new MessageEvent("run.succeeded", { data: JSON.stringify({ run_id: 10, workspace_changes: changes("stale.txt") }) }));
+    await settle();
+    expect(wrapper.findComponent(WorkspacePanel).props("changes")).toEqual(changes("latest.txt"));
+    expect(fetchMock.mock.calls).toHaveLength(requestCount);
+  });
+
+  it("opens Skills as a normal product view and returns to Chat", async () => {
+    const { wrapper } = start(path => {
+      if (path === "/api/conversations") return response([]);
+      if (path === "/api/knowledge-bases") return response([]);
+      if (path === "/api/skills") return response([]);
+      return response([]);
+    });
+    await settle();
+
+    wrapper.findComponent(AppSidebar).vm.$emit("openSkills");
+    await settle();
+    expect(wrapper.findComponent(SkillsPage).exists()).toBe(true);
+    expect(wrapper.findComponent(ChatWorkspace).exists()).toBe(false);
+
+    wrapper.findComponent(AppSidebar).vm.$emit("openChat");
+    await settle();
+    expect(wrapper.findComponent(ChatWorkspace).exists()).toBe(true);
+  });
+});
 
 type RunStatus = "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED";
 type Run = { id: number; input_message_id: number; attempt_no: number; knowledge_base_id: number | null; grounding_policy: "AUTO" | "REQUIRED"; status: RunStatus; started_at: string | null; finished_at: string | null; error_code: string | null };
@@ -299,10 +464,55 @@ describe("App user behavior", () => {
     enqueue(response(run(201, "CANCELLED")));
     enqueue(response({ run: run(201, "CANCELLED"), assistant_message: null }));
     enqueue(response({ messages: [message(1, "问题 A")], latest_run: run(201, "CANCELLED") }));
-    await button(wrapper, "停止").trigger("click");
+    await button(wrapper, "停止回答").trigger("click");
     await settle();
     expect(wrapper.text()).toContain("已停止回答");
     expect(wrapper.text()).not.toContain("已保存回答");
+    wrapper.unmount();
+  });
+
+  it("keeps Stop in the composer, blocks duplicate cancellation and awaits durable terminal state", async () => {
+    const wrapper = await mountInitial(run(201, "RUNNING"));
+    const cancel = deferred<Response>();
+    const reread = deferred<Response>();
+    enqueue(cancel.promise);
+    enqueue(reread.promise);
+    const stop = wrapper.get('form button[aria-label="停止回答"]');
+    expect(stop.attributes("type")).toBe("button");
+    expect(wrapper.findAll('button[aria-label="停止回答"]')).toHaveLength(1);
+    await stop.trigger("click");
+    expect(wrapper.get('form button[aria-label="正在停止"]').attributes("disabled")).toBeDefined();
+    wrapper.findComponent(ChatWorkspace).vm.$emit("stop");
+    await wrapper.get("textarea").trigger("keydown", { key: "Enter", ctrlKey: true });
+    await wrapper.get("form").trigger("submit");
+    expect(fetchMock.mock.calls.filter(([path]) => path === "/api/runs/201/cancel")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    expect(wrapper.findComponent(ChatWorkspace).emitted("send")).toBeUndefined();
+    cancel.resolve(response(run(201, "CANCELLED")));
+    await settle();
+    expect(wrapper.text()).not.toContain("已停止回答");
+    expect(wrapper.get('form button[aria-label="正在停止"]').attributes("disabled")).toBeDefined();
+    enqueue(response({ messages: [message(1, "问题 A")], latest_run: run(201, "CANCELLED") }));
+    reread.resolve(response({ run: run(201, "CANCELLED"), assistant_message: null }));
+    await settle();
+    expect(wrapper.get('form button[aria-label="发送问题"]').exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("does not expose Stop or submit another command before admission returns a Run", async () => {
+    const wrapper = await mountInitial();
+    const admission = deferred<Response>();
+    enqueue(admission.promise);
+    await sendQuestion(wrapper, "Question");
+    await wrapper.get("textarea").trigger("keydown", { key: "Enter", metaKey: true });
+    await wrapper.get("textarea").trigger("keydown", { key: "Enter", ctrlKey: true });
+    await wrapper.get("form").trigger("submit");
+    wrapper.findComponent(ChatWorkspace).vm.$emit("send");
+    expect(wrapper.find('button[aria-label="停止回答"]').exists()).toBe(false);
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
+    admission.resolve(response({ user_message: message(2, "Question"), run: run(201, "PENDING") }));
+    await settle();
+    expect(wrapper.get('form button[aria-label="停止回答"]').exists()).toBe(true);
     wrapper.unmount();
   });
 
@@ -394,12 +604,15 @@ describe("App user behavior", () => {
     expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/memory-status");
     expect(fetchMock.mock.calls.map(([path]) => path)).toContain("/api/memories");
 
-    await wrapper.get('textarea[maxlength="1000"]').setValue("记住偏好");
-    await wrapper.get('input[type="datetime-local"]').setValue("2030-01-02T03:04");
+    await button(wrapper, "添加记忆").trigger("click");
+    await settle();
+    const editor = new DOMWrapper(document.querySelector<HTMLElement>('[role="dialog"]')!);
+    await editor.get('textarea[maxlength="1000"]').setValue("记住偏好");
+    await editor.get('input[type="datetime-local"]').setValue("2030-01-02T03:04");
     enqueue(response({ id: 3 }));
     enqueue(response(memoryStatus(true)));
     enqueue(response([]));
-    await wrapper.findAll("form").at(-1)!.trigger("submit");
+    await editor.get("form").trigger("submit");
     await settle();
     const add = fetchMock.mock.calls.find(([path, init]) => path === "/api/memories" && init?.method === "POST");
     expect(JSON.parse(String(add?.[1]?.body)).valid_until).toMatch(/Z$/);
@@ -438,7 +651,8 @@ describe("App user behavior", () => {
   });
 
   it("maps Memory errors, handles direct and conversational source lazily, and forgets idempotently", async () => {
-    vi.stubGlobal("confirm", () => true);
+    const confirm = vi.fn();
+    vi.stubGlobal("confirm", confirm);
     const wrapper = await mountInitial();
     enqueue(response(memoryStatus(false)));
     enqueue(response([{ id: 4, content: "直接记忆", valid_until: null, source_message_id: null, created_at: "x", updated_at: "x" }]));
@@ -452,6 +666,10 @@ describe("App user behavior", () => {
     enqueue(response({})); enqueue(response(memoryStatus(false))); enqueue(response([]));
     await button(wrapper, "忘记").trigger("click");
     await settle();
+    const confirmation = new DOMWrapper(document.querySelector<HTMLElement>('[role="dialog"]')!);
+    await confirmation.findAll("button").find((item) => item.text() === "忘记")!.trigger("click");
+    await settle();
+    expect(confirm).not.toHaveBeenCalled();
     expect(wrapper.text()).toContain("还没有长期记忆");
     wrapper.unmount();
   });
@@ -495,8 +713,10 @@ describe("App user behavior", () => {
     enqueue(response(memoryStatus(false))); enqueue(response([memory]));
     await button(wrapper, "记忆").trigger("click"); await settle();
     await button(wrapper, "修改").trigger("click");
+    await settle();
+    const editor = new DOMWrapper(document.querySelector<HTMLElement>('[role="dialog"]')!);
     enqueue(response(memory)); enqueue(response(memoryStatus(false))); enqueue(response([memory]));
-    await wrapper.findAll("form").at(-1)!.trigger("submit"); await settle();
+    await editor.get("form").trigger("submit"); await settle();
     const put = fetchMock.mock.calls.find(([path, init]) => path === "/api/memories/9" && init?.method === "PUT");
     expect(JSON.parse(String(put?.[1]?.body)).valid_until).toBe("2030-01-02T03:04:37.000Z");
     enqueue(response({ auto_memory_enabled: true })); enqueue(response(memoryStatus(true))); enqueue(response([memory])); await button(wrapper, "开启自动整理").trigger("click"); await settle(); expect(wrapper.text()).toContain("关闭自动整理");
@@ -548,9 +768,11 @@ describe("App user behavior", () => {
     enqueue(response({ detail: { code: "MEMORY_NOT_FOUND", internal: "never show" } }, false));
     await button(wrapper, "来源").trigger("click"); await settle();
     expect(wrapper.text()).toContain("这条长期记忆已不存在"); expect(wrapper.text()).not.toContain("never show");
-    await wrapper.get('textarea[maxlength="1000"]').setValue("bad");
+    await button(wrapper, "添加记忆").trigger("click"); await settle();
+    const editor = new DOMWrapper(document.querySelector<HTMLElement>('[role="dialog"]')!);
+    await editor.get('textarea[maxlength="1000"]').setValue("bad");
     enqueue(response({ detail: { code: "VALIDATION_ERROR", internal: "never show" } }, false));
-    await wrapper.findAll("form").at(-1)!.trigger("submit"); await settle();
+    await editor.get("form").trigger("submit"); await settle();
     expect(wrapper.text()).toContain("输入内容无效，请检查后重试"); expect(wrapper.text()).not.toContain("never show");
     wrapper.unmount();
   });

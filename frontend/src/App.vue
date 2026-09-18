@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import AppSidebar from "@/components/AppSidebar.vue";
 import ChatWorkspace from "@/components/ChatWorkspace.vue";
 import WorkspacePanel from "@/components/WorkspacePanel.vue";
 import type { WorkspaceChanges } from "@/types";
 import KnowledgePage from "@/KnowledgePage.vue";
 import MemoryPage from "@/MemoryPage.vue";
+import ObservatoryRunsPage from "@/ObservatoryRunsPage.vue";
+import SkillsPage from "@/SkillsPage.vue";
 import type { ActiveView, Conversation, GroundingPolicy, KnowledgeBase, Message, Run, StreamState } from "@/types";
 
 interface CommandScope {
@@ -33,6 +35,7 @@ const ERROR_MESSAGES: Record<string, string> = {
 };
 
 const conversations = ref<Conversation[]>([]);
+const workspacePanelOpen = ref(false);
 const workspaceChanges = ref<{ runId: number; conversationId: number; changes: WorkspaceChanges } | null>(null);
 const selectedConversationId = ref<number | null>(null);
 const messages = ref<Message[]>([]);
@@ -50,6 +53,8 @@ const pendingNetworkCommand = ref<PendingCommand | null>(null);
 const activeCommandScope = ref<CommandScope | null>(null);
 const streamState = ref<StreamState | null>(null);
 const activeView = ref<ActiveView>("chat");
+const developerObservatoryEnabled = import.meta.env.DEV;
+watch(activeView, () => { workspacePanelOpen.value = false; });
 const memoryNotice = ref<string | null>(null);
 const memoryPage = ref<{ load(): Promise<void> } | null>(null);
 const memoryUpdated = ref(false);
@@ -85,6 +90,10 @@ const hasCurrentStream = computed(
 
 function isActive(run: Run): boolean {
   return run.status === "PENDING" || run.status === "RUNNING";
+}
+
+function restoreWorkspaceFocus(): void {
+  document.getElementById("workspace-trigger")?.focus();
 }
 
 function scopeFromRun(run: Run): CommandScope {
@@ -124,6 +133,14 @@ function openMemoryView(): void {
 
 function openKnowledgeView(): void {
   activeView.value = "knowledge";
+}
+
+function openSkillsView(): void {
+  activeView.value = "skills";
+}
+
+function openObservatoryView(): void {
+  if (developerObservatoryEnabled) activeView.value = "observatory";
 }
 
 function enterChatView(): void {
@@ -328,7 +345,7 @@ function observeRun(
   });
   for (const eventName of ["run.succeeded", "run.failed", "run.cancelled"]) {
     source.addEventListener(eventName, (event) => {
-      if (isCurrentView(conversationId, revision)) {
+      if (isCurrentView(conversationId, revision) && latestRun.value?.id === run.id) {
         if (eventName === "run.succeeded") {
           try {
             const payload = JSON.parse((event as MessageEvent<string>).data);
@@ -420,7 +437,7 @@ async function submitCommand(command: PendingCommand): Promise<void> {
 }
 
 function sendQuestion(): void {
-  if (selectedConversationId.value === null || !composerContent.value.trim()) return;
+  if (busyAction.value !== null || hasActiveRun.value || selectedConversationId.value === null || !composerContent.value.trim()) return;
   void submitCommand({
     conversationId: selectedConversationId.value,
     label: "正在生成…",
@@ -462,7 +479,7 @@ function retryNetworkRequest(): void {
 }
 
 async function stopAnswer(): Promise<void> {
-  if (selectedConversationId.value === null || latestRun.value === null || !hasActiveRun.value) return;
+  if (busyAction.value !== null || selectedConversationId.value === null || latestRun.value === null || !hasActiveRun.value) return;
   const conversationId = selectedConversationId.value;
   const runId = latestRun.value.id;
   const revision = viewRevision;
@@ -576,19 +593,26 @@ onBeforeUnmount(() => {
       :memory-updated="memoryUpdated"
       :busy="busyAction !== null"
       :loading="isLoading"
+      :developer-enabled="developerObservatoryEnabled"
       @create="createConversation"
       @select="selectConversation"
       @open-chat="openChatView"
       @open-knowledge="openKnowledgeView"
       @open-memory="openMemoryView"
+      @open-skills="openSkillsView"
+      @open-observatory="openObservatoryView"
     />
 
     <WorkspacePanel
       v-if="activeView === 'chat'"
+      v-model:open="workspacePanelOpen"
+      :navigation-busy="isLoading"
       :conversations="conversations"
+      :conversation-id="selectedConversationId"
       :workspace-id="selectedConversation?.workspace_id ?? null"
-      :changes="workspaceChanges?.conversationId === selectedConversationId && workspaceChanges?.runId === latestRun?.id ? workspaceChanges.changes : null"
+      :changes="latestRun?.status === 'SUCCEEDED' && workspaceChanges?.conversationId === selectedConversationId && workspaceChanges?.runId === latestRun?.id ? workspaceChanges.changes : null"
       @open="refreshFacts($event)"
+      @restore-focus="restoreWorkspaceFocus"
     />
 
     <p
@@ -608,6 +632,7 @@ onBeforeUnmount(() => {
       :is-loading-knowledge-bases="isLoadingKnowledgeBases"
       :knowledge-base-load-error="knowledgeBaseLoadError"
       :selected-conversation="selectedConversation ?? null"
+      :workspace-panel-open="workspacePanelOpen"
       :messages="messages"
       :latest-run="latestRun"
       :stream-content="hasCurrentStream ? streamState?.content ?? '' : null"
@@ -617,6 +642,7 @@ onBeforeUnmount(() => {
       :has-pending-network-command="pendingNetworkCommand !== null"
       :has-active-run="hasActiveRun"
       :run-failure-message="runFailureMessage"
+      @open-workspace="workspacePanelOpen = true"
       @refresh="refreshFacts()"
       @rename="renameConversation"
       @delete="deleteSelectedConversation"
@@ -639,10 +665,22 @@ onBeforeUnmount(() => {
       />
     </section>
     <section
-      v-else
+      v-else-if="activeView === 'knowledge'"
       class="min-h-0 min-w-0 flex-1 overflow-y-auto bg-workspace lg:overflow-hidden"
     >
       <KnowledgePage @notice="showMemoryNotice" />
+    </section>
+    <section
+      v-else-if="activeView === 'skills'"
+      class="min-h-0 min-w-0 flex-1 overflow-y-auto bg-workspace lg:overflow-hidden"
+    >
+      <SkillsPage />
+    </section>
+    <section
+      v-else
+      class="min-h-0 min-w-0 flex-1 overflow-y-auto bg-workspace"
+    >
+      <ObservatoryRunsPage />
     </section>
   </main>
 </template>

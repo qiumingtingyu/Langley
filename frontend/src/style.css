@@ -36,11 +36,16 @@
   --radius-md: 0.375rem;
   --radius-lg: 0.5rem;
 
+  --langley-font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont,
+    "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei",
+    Arial, sans-serif;
+  --langley-font-mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono",
+    monospace;
+
   color: var(--foreground);
   background: var(--background);
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-    sans-serif;
+  font-family: var(--langley-font-sans);
+  font-weight: 400;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -71,6 +76,8 @@
   --color-danger-border: var(--danger-border);
   --color-danger-foreground: var(--danger-foreground);
   --color-success-foreground: var(--success-foreground);
+  --font-sans: var(--langley-font-sans);
+  --font-mono: var(--langley-font-mono);
   --radius-sm: 0.25rem;
   --radius-md: 0.375rem;
   --radius-lg: 0.5rem;
@@ -101,6 +108,11 @@ textarea {
 
 button {
   cursor: pointer;
+}
+
+/* Keep the shared Button weight explicit after the native control font reset. */
+button[data-slot="button"] {
+  font-weight: 500;
 }
 
 button:disabled {

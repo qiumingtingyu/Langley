@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowUp, Pencil, RefreshCw, RotateCcw, Trash2 } from "lucide-vue-next";
+import { ArrowUp, Folder, Pencil, RefreshCw, RotateCcw, Trash2 } from "lucide-vue-next";
 import {
   DialogContent,
   DialogDescription,
@@ -13,10 +13,12 @@ import { computed, ref, watch } from "vue";
 import EvidenceSheet from "@/components/EvidenceSheet.vue";
 import MessageContent from "@/components/MessageContent.vue";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type { Conversation, GroundingPolicy, KnowledgeBase, Message, MessageCitation, Run } from "@/types";
 
 const props = defineProps<{
   selectedConversation: Conversation | null;
+  workspacePanelOpen: boolean;
   messages: Message[];
   latestRun: Run | null;
   streamContent: string | null;
@@ -46,6 +48,7 @@ const hasUnavailableKnowledgeBaseName = computed(() =>
 );
 
 const emit = defineEmits<{
+  openWorkspace: [];
   refresh: [];
   rename: [title: string];
   delete: [];
@@ -61,6 +64,16 @@ const emit = defineEmits<{
 
 function conversationTitle(conversation: Conversation): string {
   return conversation.title ?? "未命名会话";
+}
+
+function send(): void {
+  if (props.busyAction !== null || props.hasActiveRun || !composerContent.value.trim()) return;
+  emit("send");
+}
+
+function stop(): void {
+  if (!props.hasActiveRun || props.busyAction !== null) return;
+  emit("stop");
 }
 
 function selectKnowledgeBase(event: Event): void {
@@ -108,6 +121,22 @@ watch(
         </h1>
       </div>
       <div class="flex shrink-0 items-center gap-0.5">
+        <Button
+          id="workspace-trigger"
+          variant="ghost"
+          size="small"
+          aria-label="打开工作区"
+          aria-haspopup="dialog"
+          :aria-expanded="workspacePanelOpen"
+          :class="cn(workspacePanelOpen && 'bg-subtle text-foreground')"
+          @click="emit('openWorkspace')"
+        >
+          <Folder
+            :size="15"
+            aria-hidden="true"
+          />
+          {{ selectedConversation?.workspace_id != null ? "工作区 · 已连接" : "工作区" }}
+        </Button>
         <Button
           v-if="selectedConversation"
           variant="ghost"
@@ -270,14 +299,6 @@ watch(
               aria-hidden="true"
             />
             {{ latestRun?.status === "PENDING" ? "正在生成…" : "正在处理…" }}
-            <Button
-              variant="outline"
-              size="small"
-              :disabled="busyAction !== null"
-              @click="emit('stop')"
-            >
-              停止
-            </Button>
           </div>
 
           <div
@@ -356,7 +377,7 @@ watch(
     <form
       v-if="selectedConversation"
       class="shrink-0 border-t border-border bg-workspace px-5 py-4 sm:px-8 sm:py-5 lg:px-12"
-      @submit.prevent="emit('send')"
+      @submit.prevent="send"
     >
       <div class="mx-auto w-full max-w-[52rem]">
         <label
@@ -370,8 +391,8 @@ watch(
             class="block min-h-24 w-full resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-6 text-foreground outline-none placeholder:text-muted-light"
             :disabled="busyAction !== null || hasActiveRun"
             placeholder="输入你的学习问题…"
-            @keydown.meta.enter.prevent="emit('send')"
-            @keydown.ctrl.enter.prevent="emit('send')"
+            @keydown.meta.enter.prevent="send"
+            @keydown.ctrl.enter.prevent="send"
           />
           <div class="flex flex-col gap-2 px-1 pt-2 sm:flex-row sm:items-center sm:justify-between">
             <div class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
@@ -443,6 +464,16 @@ watch(
             </div>
             <span class="font-mono text-[9px] tracking-[0.1em] text-muted-light">COMPOSER · CTRL/⌘ + ENTER</span>
             <Button
+              v-if="hasActiveRun"
+              type="button"
+              :aria-label="busyAction === '正在停止…' ? '正在停止' : '停止回答'"
+              :disabled="busyAction !== null"
+              @click="stop"
+            >
+              {{ busyAction === "正在停止…" ? "正在停止…" : "停止回答" }}
+            </Button>
+            <Button
+              v-else
               type="submit"
               size="icon"
               aria-label="发送问题"

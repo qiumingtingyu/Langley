@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import {
+  Activity,
+  BookMarked,
   BookOpenText,
   Brain,
+  Folder,
   LibraryBig,
   Menu,
   MessageSquareText,
@@ -20,14 +23,17 @@ import {
 } from "@/components/ui/sheet";
 import type { ActiveView, Conversation } from "@/types";
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   conversations: Conversation[];
   selectedConversationId: number | null;
   activeView: ActiveView;
   memoryUpdated: boolean;
   busy: boolean;
   loading: boolean;
-}>();
+  developerEnabled?: boolean;
+}>(), {
+  developerEnabled: false,
+});
 
 const emit = defineEmits<{
   create: [];
@@ -35,16 +41,25 @@ const emit = defineEmits<{
   openChat: [];
   openKnowledge: [];
   openMemory: [];
+  openSkills: [];
+  openObservatory: [];
 }>();
 
 function conversationTitle(conversation: Conversation): string {
   return conversation.title ?? "未命名会话";
 }
 
+const conversationGroups = computed(() => [
+  { title: "工作区会话", workspace: true, conversations: props.conversations.filter(conversation => conversation.workspace_id != null) },
+  { title: "最近会话", workspace: false, conversations: props.conversations.filter(conversation => conversation.workspace_id == null) },
+]);
+
 const mobileNavigationOpen = ref(false);
 const mobileTitle = computed(() => {
   if (props.activeView === "knowledge") return "知识库";
   if (props.activeView === "memory") return "长期记忆";
+  if (props.activeView === "skills") return "技能";
+  if (props.activeView === "observatory") return "运行观测台";
   const conversation = props.conversations.find((item) => item.id === props.selectedConversationId);
   return conversation === undefined ? "聊天" : conversationTitle(conversation);
 });
@@ -77,13 +92,23 @@ function openMemoryFromMobile(): void {
   emit("openMemory");
   closeMobileNavigation();
 }
+
+function openSkillsFromMobile(): void {
+  emit("openSkills");
+  closeMobileNavigation();
+}
+
+function openObservatoryFromMobile(): void {
+  emit("openObservatory");
+  closeMobileNavigation();
+}
 </script>
 
 <template>
   <div class="flex h-14 shrink-0 items-center justify-between border-b border-border bg-sidebar px-4 md:hidden">
     <div class="min-w-0">
-      <p class="font-mono text-[9px] font-medium tracking-[0.14em] text-muted-light">
-        LANGLEY
+      <p class="text-xs font-normal text-muted-light">
+        Langley
       </p>
       <p class="truncate text-sm font-semibold text-foreground">
         {{ mobileTitle }}
@@ -108,14 +133,14 @@ function openMemoryFromMobile(): void {
         class="w-[min(20rem,calc(100vw-2.5rem))] gap-0 border-strong-border bg-sidebar p-0 text-foreground"
       >
         <SheetHeader class="border-b border-border px-5 py-5 pr-14 text-left">
-          <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-            LANGLEY
+          <p class="text-xs font-normal text-muted-light">
+            Langley
           </p>
           <SheetTitle class="mt-1 text-base font-semibold text-foreground">
             导航
           </SheetTitle>
           <SheetDescription class="mt-1 text-sm text-muted-foreground">
-            访问聊天、知识库、长期记忆和最近会话。
+            访问聊天、知识库、长期记忆、技能和最近会话。
           </SheetDescription>
         </SheetHeader>
         <div class="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
@@ -131,12 +156,12 @@ function openMemoryFromMobile(): void {
             />
             新建会话
           </Button>
-          <p class="mb-2 mt-6 px-2 font-mono text-[10px] font-medium tracking-[0.15em] text-muted-light">
-            WORKSPACE
+          <p class="mb-2 mt-6 px-2 text-xs font-normal text-muted-light">
+            导航
           </p>
           <nav
             class="flex flex-col gap-0.5"
-            aria-label="工作区"
+            aria-label="导航"
           >
             <button
               type="button"
@@ -185,41 +210,85 @@ function openMemoryFromMobile(): void {
                 class="ml-auto size-1.5 rounded-full bg-primary"
               />
             </button>
-          </nav>
-          <div class="mb-2 mt-6 flex items-center justify-between gap-2 px-2">
-            <p class="font-mono text-[10px] font-medium tracking-[0.15em] text-muted-light">
-              RECENT
-            </p>
-            <span class="font-mono text-[10px] tabular-nums text-muted-light">{{ conversations.length }}</span>
-          </div>
-          <nav
-            class="flex flex-col gap-0.5"
-            aria-label="最近会话"
-          >
             <button
-              v-for="conversation in conversations"
-              :key="conversation.id"
               type="button"
-              class="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-              :class="activeView === 'chat' && conversation.id === selectedConversationId ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
-              :aria-current="activeView === 'chat' && conversation.id === selectedConversationId ? 'page' : undefined"
-              @click="selectFromMobile(conversation.id)"
+              class="flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              :class="activeView === 'skills' ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
+              :aria-current="activeView === 'skills' ? 'page' : undefined"
+              @click="openSkillsFromMobile"
             >
-              <MessageSquareText
-                :size="14"
-                :stroke-width="1.6"
+              <BookMarked
+                :size="15"
+                :stroke-width="1.7"
                 aria-hidden="true"
-                class="shrink-0 opacity-70"
               />
-              <span class="break-words">{{ conversationTitle(conversation) }}</span>
+              技能
             </button>
+          </nav>
+          <template v-if="developerEnabled">
+            <p class="mb-2 mt-6 px-2 text-xs font-normal text-muted-light">
+              开发者
+            </p>
+            <nav
+              aria-label="开发者"
+              class="flex flex-col gap-0.5"
+            >
+              <button
+                type="button"
+                class="flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                :class="activeView === 'observatory' ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
+                :aria-current="activeView === 'observatory' ? 'page' : undefined"
+                @click="openObservatoryFromMobile"
+              >
+                <Activity
+                  :size="15"
+                  :stroke-width="1.7"
+                  aria-hidden="true"
+                />
+                运行观测
+              </button>
+            </nav>
+          </template>
+          <div class="mt-6">
+            <nav
+              v-for="group in conversationGroups"
+              :key="group.title"
+              :aria-label="group.title"
+              class="mb-6 flex flex-col gap-0.5"
+            >
+              <div class="mb-2 flex items-center justify-between gap-2 px-2">
+                <h2 class="text-xs font-normal text-muted-light">
+                  {{ group.title }}
+                </h2>
+                <span class="font-mono text-[10px] tabular-nums text-muted-light">{{ group.conversations.length }}</span>
+              </div>
+              <button
+                v-for="conversation in group.conversations"
+                :key="conversation.id"
+                type="button"
+                class="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                :class="activeView === 'chat' && conversation.id === selectedConversationId ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
+                :aria-current="activeView === 'chat' && conversation.id === selectedConversationId ? 'page' : undefined"
+                @click="selectFromMobile(conversation.id)"
+              >
+                <component
+                  :is="group.workspace ? Folder : MessageSquareText"
+                  :size="14"
+                  :stroke-width="1.6"
+                  aria-hidden="true"
+                  class="shrink-0"
+                  :class="group.workspace ? 'text-muted-light' : 'opacity-70'"
+                />
+                <span class="break-words">{{ conversationTitle(conversation) }}</span>
+              </button>
+            </nav>
             <p
               v-if="conversations.length === 0 && !loading"
               class="px-2 py-3 text-sm leading-6 text-muted-foreground"
             >
               新建一个会话后即可开始。
             </p>
-          </nav>
+          </div>
         </div>
       </SheetContent>
     </Sheet>
@@ -238,8 +307,8 @@ function openMemoryFromMobile(): void {
         <p class="truncate text-sm font-semibold tracking-[-0.01em] text-foreground">
           Langley
         </p>
-        <p class="truncate font-mono text-[9px] tracking-[0.14em] text-muted-light">
-          PERSONAL KNOWLEDGE
+        <p class="truncate text-xs font-normal text-muted-light">
+          Personal knowledge
         </p>
       </div>
     </div>
@@ -257,12 +326,12 @@ function openMemoryFromMobile(): void {
       新建会话
     </Button>
 
-    <p class="mb-2 mt-7 px-2 font-mono text-[10px] font-medium tracking-[0.15em] text-muted-light">
-      WORKSPACE
+    <p class="mb-2 mt-7 px-2 text-xs font-normal text-muted-light">
+      导航
     </p>
     <nav
       class="space-y-0.5"
-      aria-label="工作区"
+      aria-label="导航"
     >
       <button
         type="button"
@@ -311,41 +380,92 @@ function openMemoryFromMobile(): void {
           class="ml-auto size-1.5 rounded-full bg-primary"
         />
       </button>
+      <button
+        type="button"
+        class="flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+        :class="activeView === 'skills' ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
+        :aria-current="activeView === 'skills' ? 'page' : undefined"
+        @click="emit('openSkills')"
+      >
+        <BookMarked
+          :size="15"
+          :stroke-width="1.7"
+          aria-hidden="true"
+        />
+        技能
+      </button>
     </nav>
 
-    <div class="mb-2 mt-7 flex items-center justify-between gap-2 px-2">
-      <p class="font-mono text-[10px] font-medium tracking-[0.15em] text-muted-light">
-        RECENT
+    <template v-if="developerEnabled">
+      <p class="mb-2 mt-7 px-2 text-xs font-normal text-muted-light">
+        开发者
       </p>
-      <span class="font-mono text-[10px] tabular-nums text-muted-light">{{ conversations.length }}</span>
-    </div>
-    <nav
-      class="min-h-0 flex-1 space-y-0.5 overflow-y-auto"
-      aria-label="会话列表"
-    >
-      <button
-        v-for="conversation in conversations"
-        :key="conversation.id"
-        type="button"
-        class="group flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-        :class="activeView === 'chat' && conversation.id === selectedConversationId ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
-        :aria-current="activeView === 'chat' && conversation.id === selectedConversationId ? 'page' : undefined"
-        @click="emit('select', conversation.id)"
+      <nav
+        aria-label="开发者"
+        class="space-y-0.5"
       >
-        <MessageSquareText
-          :size="14"
-          :stroke-width="1.6"
-          aria-hidden="true"
-          class="shrink-0 opacity-70"
-        />
-        <span class="truncate">{{ conversationTitle(conversation) }}</span>
-      </button>
+        <button
+          type="button"
+          class="flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          :class="activeView === 'observatory' ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
+          :aria-current="activeView === 'observatory' ? 'page' : undefined"
+          @click="emit('openObservatory')"
+        >
+          <Activity
+            :size="15"
+            :stroke-width="1.7"
+            aria-hidden="true"
+          />
+          运行观测
+        </button>
+      </nav>
+    </template>
+
+    <div class="mt-7 min-h-0 flex-1 overflow-y-auto">
+      <nav
+        v-for="group in conversationGroups"
+        :key="group.title"
+        :aria-label="group.title"
+        class="mb-6 flex flex-col gap-0.5"
+      >
+        <div class="mb-2 flex items-center justify-between gap-2 px-2">
+          <h2 class="text-xs font-normal text-muted-light">
+            {{ group.title }}
+          </h2>
+          <span class="font-mono text-[10px] tabular-nums text-muted-light">{{ group.conversations.length }}</span>
+        </div>
+        <button
+          v-for="conversation in group.conversations"
+          :key="conversation.id"
+          type="button"
+          class="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          :class="activeView === 'chat' && conversation.id === selectedConversationId ? 'bg-surface text-foreground shadow-[inset_2px_0_0_var(--primary)]' : 'text-muted-foreground hover:bg-subtle hover:text-foreground'"
+          :aria-current="activeView === 'chat' && conversation.id === selectedConversationId ? 'page' : undefined"
+          @click="emit('select', conversation.id)"
+        >
+          <component
+            :is="group.workspace ? Folder : MessageSquareText"
+            :size="14"
+            :stroke-width="1.6"
+            aria-hidden="true"
+            class="shrink-0"
+            :class="group.workspace ? 'text-muted-light' : 'opacity-70'"
+          />
+          <span class="truncate">{{ conversationTitle(conversation) }}</span>
+        </button>
+      </nav>
       <p
         v-if="conversations.length === 0 && !loading"
         class="px-2 py-3 text-sm leading-6 text-muted-foreground"
       >
         新建一个会话后即可开始。
       </p>
-    </nav>
+    </div>
   </aside>
 </template>
+
+<style scoped>
+button[aria-current="page"] {
+  font-weight: 500;
+}
+</style>

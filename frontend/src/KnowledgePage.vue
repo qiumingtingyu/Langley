@@ -18,7 +18,7 @@ type DocumentProcessingStatus = { document_version_id: number; latest_attempt: D
 
 const CHUNK_PAGE_SIZE = 10;
 const INDEX_POLL_INTERVAL_MS = 5000;
-const PROCESSING_POLL_INTERVAL_MS = 2500;
+const PROCESSING_POLL_INTERVAL_MS = 5000;
 
 const emit = defineEmits<{ notice: [message: string] }>();
 const knowledgeBases = ref<KnowledgeBase[]>([]);
@@ -31,6 +31,11 @@ const documentName = ref("");
 const loading = ref(false);
 const creating = ref(false);
 const uploading = ref(false);
+const uploadExpanded = ref<boolean | null>(null);
+const uploadError = ref("");
+const uploadNotice = ref("");
+const fileInput = ref<HTMLInputElement | null>(null);
+const uploadVisible = computed(() => (uploadExpanded.value ?? documents.value.length === 0) || uploading.value || uploadError.value !== "");
 const verifying = ref(false);
 const verifiedVersionId = ref<number | null>(null);
 const verifiedAt = ref<string | null>(null);
@@ -68,8 +73,15 @@ function currentIndexStatusText(status: string | undefined): string {
   return status ?? "正在读取";
 }
 
+function errorCode(payload: unknown): string | undefined {
+  if (typeof payload !== "object" || payload === null || !("detail" in payload)) return;
+  const detail = payload.detail;
+  if (typeof detail !== "object" || detail === null || !("code" in detail)) return;
+  return typeof detail.code === "string" ? detail.code : undefined;
+}
+
 function errorMessage(payload: unknown): string {
-  const code = typeof payload === "object" && payload !== null && "detail" in payload ? (payload.detail as { code?: string }).code : undefined;
+  const code = errorCode(payload);
   if (code === "KNOWLEDGE_BASE_NOT_FOUND" || code === "DOCUMENT_VERSION_NOT_FOUND") return "该知识库或文档已不存在，请刷新后重试。";
   if (code === "UPLOAD_TOO_LARGE") return "文件超过允许大小。Markdown 最大 5 MiB，PDF 最大 64 MiB。";
   if (code === "UNSUPPORTED_MEDIA_TYPE") return "当前仅支持 Markdown 和 PDF 文件。";
@@ -91,8 +103,15 @@ function errorMessage(payload: unknown): string {
 class KnowledgeRequestError extends Error { constructor(readonly code: string | undefined, message: string) { super(message); } }
 
 async function request(path: string, init?: Parameters<typeof window.fetch>[1]): Promise<Response> {
-  const response = await fetch(path, init);
-  if (!response.ok) { const payload = await response.json(); const code = typeof payload === "object" && payload !== null && "detail" in payload ? (payload.detail as { code?: string }).code : undefined; throw new KnowledgeRequestError(code, errorMessage(payload)); }
+  let response: Response;
+  try { response = await fetch(path, init); }
+  catch { throw new KnowledgeRequestError("NETWORK_ERROR", "网络连接中断，请检查连接后刷新。"); }
+  if (!response.ok) {
+    let payload: unknown;
+    try { payload = await response.json(); }
+    catch { throw new KnowledgeRequestError(undefined, `服务请求未完成（HTTP ${response.status}），请稍后重试。`); }
+    throw new KnowledgeRequestError(errorCode(payload), errorMessage(payload));
+  }
   return response;
 }
 
@@ -190,6 +209,7 @@ function validDraftMaxChunkChars(): number | null {
 }
 
 async function rebuildChunks(): Promise<void> {
+  if (selectedDocumentIsPdf.value || processingPending.value) return;
   const versionId = selectedDocument.value?.source.document_version_id;
   const knowledgeBaseId = selectedKnowledgeBaseId.value;
   const maxChunkChars = validDraftMaxChunkChars();
@@ -239,7 +259,32 @@ function sourceRegionText(region: SourceRegion): string {
 function sourceFormat(mediaType: string): string {
   if (mediaType === "text/markdown") return "Markdown";
   if (mediaType === "application/pdf") return "PDF";
-  return mediaType;
+  return "未知格式";
+}
+
+function readableSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "大小未知";
+  if (bytes < 1024) return `${bytes} B`;
+  const unit = bytes < 1024 * 1024 ? "KiB" : "MiB";
+  return `${Number((bytes / (unit === "KiB" ? 1024 : 1024 * 1024)).toFixed(2))} ${unit}`;
+}
+
+function localDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function fileSummary(source: DocumentSource): string {
+  return `${sourceFormat(source.media_type)} · ${readableSize(source.size_bytes)} · ${localDate(source.created_at)}`;
+}
+
+function validateFile(file: File): string {
+  // Match the API's suffix-based limit; MIME alone is not authoritative.
+  const pdf = file.name.toLowerCase().endsWith(".pdf");
+  const limit = (pdf ? 64 : 5) * 1024 * 1024;
+  if (file.size > limit) return `文件大小 ${readableSize(file.size)}（${file.size.toLocaleString("zh-CN")} bytes），超过 ${pdf ? "PDF 的 64" : "Markdown 的 5"} MiB 限制。`;
+  if (pdf && file.type !== "" && file.type !== "application/pdf") return "PDF 文件类型不匹配，请重新选择 PDF 文件。";
+  return "";
 }
 
 function isPdfPageRegion(region: SourceRegion): region is PdfPageRegion {
@@ -399,28 +444,47 @@ async function createKnowledgeBase(): Promise<void> {
 }
 
 function chooseFile(event: Event): void {
+  if (uploading.value) return;
   const input = event.target as HTMLInputElement;
   selectedFile.value = input.files?.[0] ?? null;
   documentName.value = selectedFile.value?.name.replace(/\.[^.]+$/, "") ?? "";
+  uploadError.value = selectedFile.value ? validateFile(selectedFile.value) : "";
+  uploadNotice.value = "";
 }
 
 async function upload(): Promise<void> {
+  if (uploading.value) return;
   const knowledgeBaseId = selectedKnowledgeBaseId.value;
   const file = selectedFile.value;
-  if (knowledgeBaseId === null || file === null) { emit("notice", "请选择一个 Markdown 或 PDF 文件。"); return; }
+  if (knowledgeBaseId === null || file === null) { uploadError.value = "请选择一个 Markdown 或 PDF 文件。"; return; }
+  uploadError.value = validateFile(file);
+  if (uploadError.value) return;
+  uploadNotice.value = "";
   uploading.value = true;
+  let accepted = false;
   try {
     const body = new FormData();
-    body.append("file", file);
+    body.append("file", file.name.toLowerCase().endsWith(".pdf") && !file.type ? new File([file], file.name, { type: "application/pdf" }) : file);
     if (documentName.value.trim()) body.append("document_name", documentName.value);
     const response = await request(`/api/knowledge-bases/${knowledgeBaseId}/documents`, { method: "POST", body });
+    accepted = true;
     const created = await response.json() as Document;
     selectedFile.value = null;
     documentName.value = "";
+    if (fileInput.value) fileInput.value.value = "";
+    uploadNotice.value = response.status === 202 ? "上传请求已接受，PDF 将在后台处理；可检索状态以知识库状态为准。" : "上传请求已接受，请查看文档处理与知识库检索状态。";
     await loadDocuments(knowledgeBaseId, created.id);
     await loadIndexStatus(knowledgeBaseId);
   } catch (error) {
-    emit("notice", error instanceof TypeError || error instanceof KnowledgeRequestError && error.code === "KNOWLEDGE_ADMISSION_FAILED" ? "上传结果不明确，请先刷新文档列表确认后再试。" : error instanceof Error ? error.message : "操作失败，请稍后重试。");
+    if (accepted) {
+      uploadError.value = "上传请求已接受，但暂时无法刷新资料，请先刷新文档列表确认。";
+    } else if (error instanceof KnowledgeRequestError && error.code !== "NETWORK_ERROR" && error.code !== "KNOWLEDGE_ADMISSION_FAILED") {
+      uploadError.value = error.message;
+    } else {
+      uploadError.value = "上传结果不明确，请先刷新文档列表确认后再试。";
+    }
+    uploadExpanded.value = true;
+    emit("notice", uploadError.value);
   } finally { uploading.value = false; }
 }
 
@@ -456,13 +520,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="min-h-0 w-full bg-workspace lg:grid lg:h-full lg:grid-cols-[15rem_minmax(0,1fr)]">
-    <aside class="flex min-h-0 flex-col border-b border-border bg-sidebar px-4 py-5 lg:overflow-y-auto lg:border-b-0 lg:border-r">
+  <section class="knowledge-workspace min-h-0 w-full bg-workspace">
+    <aside class="knowledge-rail flex min-h-0 flex-col border-b border-border bg-sidebar px-4 py-5 lg:border-b-0 lg:border-r">
       <div class="mb-5 px-1">
-        <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-          KNOWLEDGE
-        </p>
-        <h1 class="mt-1 text-sm font-semibold text-foreground">
+        <h1 class="text-xl font-semibold text-foreground">
           知识库
         </h1>
       </div>
@@ -497,8 +558,8 @@ onBeforeUnmount(() => {
       <button
         v-for="knowledgeBase in knowledgeBases"
         :key="knowledgeBase.id"
-        class="order-2 block w-full break-words border-l-2 px-3 py-2 text-left text-sm transition-colors"
-        :class="knowledgeBase.id === selectedKnowledgeBaseId ? 'border-primary bg-surface text-foreground' : 'border-transparent text-muted-foreground hover:bg-subtle hover:text-foreground'"
+        class="order-2 block w-full shrink-0 break-words border-l-2 px-3 py-2 text-left text-sm transition-colors focus-visible:outline focus-visible:outline-ring"
+        :class="knowledgeBase.id === selectedKnowledgeBaseId ? 'border-primary bg-surface font-medium! text-foreground' : 'border-transparent text-muted-foreground hover:bg-subtle hover:text-foreground'"
         @click="selectKnowledgeBase(knowledgeBase.id)"
       >
         {{ knowledgeBase.name }}
@@ -506,15 +567,12 @@ onBeforeUnmount(() => {
     </aside>
     <main
       v-if="selectedKnowledgeBaseId !== null"
-      class="min-w-0 bg-workspace lg:min-h-0 lg:overflow-y-auto"
+      class="knowledge-main min-w-0 bg-workspace"
     >
-      <header class="border-b border-border px-5 py-7 sm:px-8 lg:sticky lg:top-0 lg:z-10 lg:bg-workspace lg:px-10">
+      <header class="shrink-0 border-b border-border bg-workspace px-5 py-4 sm:px-6">
         <div class="flex flex-wrap items-start justify-between gap-4">
-          <div>
-            <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-              KNOWLEDGE BASE
-            </p>
-            <h2 class="mt-1 text-xl font-semibold tracking-[-0.02em] text-foreground">
+          <div class="min-w-0">
+            <h2 class="mt-1 break-words text-xl font-semibold tracking-[-0.02em] text-foreground">
               {{ knowledgeBases.find((item) => item.id === selectedKnowledgeBaseId)?.name }}
             </h2>
             <p class="mt-2 text-sm text-muted-foreground">
@@ -523,13 +581,31 @@ onBeforeUnmount(() => {
           </div>
           <Button
             type="button"
-            variant="outline"
-            :disabled="startingIndexBuild || indexStatus?.index_status === 'INDEXING'"
-            @click="startIndexBuild"
+            :aria-expanded="uploadVisible"
+            aria-controls="knowledge-upload"
+            :disabled="uploading"
+            @click="uploadExpanded = !uploadVisible"
           >
-            {{ startingIndexBuild ? "正在提交…" : "重建全部索引" }}
+            {{ uploadVisible ? "收起上传" : "添加资料" }}
           </Button>
         </div>
+        <details class="mt-2 text-xs text-muted-foreground">
+          <summary class="cursor-pointer">
+            维护操作
+          </summary>
+          <div class="mt-3 flex flex-wrap items-center gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              size="small"
+              :disabled="startingIndexBuild || indexStatus?.index_status === 'INDEXING'"
+              @click="startIndexBuild"
+            >
+              {{ startingIndexBuild ? "正在提交…" : "重建全部索引" }}
+            </Button>
+            <p>用于全库索引维护；资料是否可检索以当前状态为准。</p>
+          </div>
+        </details>
         <div
           v-if="indexStatus?.latest_job && (indexStatus.latest_job.status === 'PENDING' || indexStatus.latest_job.status === 'RUNNING' || indexStatus.latest_job.status === 'FAILED' || indexStatus.latest_job.status === 'INTERRUPTED')"
           class="mt-4 border-l-2 border-primary bg-subtle px-3 py-2 text-sm text-body"
@@ -542,9 +618,11 @@ onBeforeUnmount(() => {
           </p>
         </div>
       </header>
-      <div class="space-y-6 px-5 py-7 sm:px-8 lg:px-10">
+      <div class="knowledge-body flex min-h-0 flex-col gap-4 px-5 py-4 sm:px-6">
         <form
-          class="space-y-3 border-b border-border pb-6"
+          v-show="uploadVisible"
+          id="knowledge-upload"
+          class="upload-form flex flex-col gap-3 border-b border-border pb-4"
           @submit.prevent="upload"
         >
           <h3 class="text-sm font-semibold text-foreground">
@@ -553,9 +631,20 @@ onBeforeUnmount(() => {
           <p class="text-sm text-muted-foreground">
             支持 Markdown 和 PDF。<br>Markdown 最大 5 MiB · PDF 最大 64 MiB
           </p>
+          <p
+            v-if="uploadError"
+            id="upload-error"
+            role="alert"
+            class="break-words rounded-md border border-danger-border bg-danger-surface px-3 py-2 text-sm text-danger-foreground"
+          >
+            {{ uploadError }}
+          </p>
           <label class="inline-flex cursor-pointer items-center rounded-sm border border-strong-border bg-surface px-3 py-2 text-sm font-medium text-body hover:bg-subtle focus-within:outline focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-ring">选择文件<input
+            ref="fileInput"
             class="sr-only"
             type="file"
+            :aria-invalid="uploadError !== ''"
+            :aria-describedby="uploadError ? 'upload-error' : undefined"
             accept=".md,.pdf,text/markdown,application/pdf"
             :disabled="uploading"
             @change="chooseFile"
@@ -569,13 +658,30 @@ onBeforeUnmount(() => {
             maxlength="255"
             :disabled="uploading"
           ></label>
-          <Button
-            type="submit"
-            :disabled="uploading || selectedFile === null"
-          >
-            {{ uploading ? "正在上传…" : "上传资料" }}
-          </Button>
+          <div class="flex flex-wrap items-center gap-3">
+            <Button
+              type="submit"
+              :disabled="uploading || selectedFile === null || !!(selectedFile && validateFile(selectedFile))"
+            >
+              {{ uploading ? "正在上传…" : "上传资料" }}
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              :disabled="uploading || loading"
+              @click="load"
+            >
+              刷新文档列表
+            </Button>
+          </div>
         </form>
+        <p
+          v-if="uploadNotice"
+          role="status"
+          class="text-sm text-body"
+        >
+          {{ uploadNotice }}
+        </p>
         <p
           v-if="documents.length === 0 && !loading"
           class="border border-dashed border-strong-border px-5 py-10 text-center text-sm text-muted-foreground"
@@ -584,105 +690,60 @@ onBeforeUnmount(() => {
         </p>
         <div
           v-else
-          class="grid gap-6 lg:grid-cols-[minmax(12rem,0.75fr)_minmax(0,1.5fr)]"
+          class="document-workspace grid min-h-0 gap-5"
         >
-          <section class="min-w-0 space-y-1 border-b border-border pb-5 lg:border-b-0 lg:border-r lg:pb-0 lg:pr-5">
-            <h3 class="mb-3 font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-              DOCUMENTS
+          <section
+            class="document-list min-w-0 border-b border-border pb-4"
+            aria-label="文档列表"
+            tabindex="0"
+          >
+            <h3 class="mb-3 text-sm font-semibold text-foreground">
+              文档
             </h3>
             <button
               v-for="document in documents"
               :key="document.id"
-              class="block w-full border-l-2 px-3 py-2.5 text-left"
+              class="block w-full border-l-2 px-3 py-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               :class="document.id === selectedDocumentId ? 'border-primary bg-subtle text-foreground' : 'border-transparent text-body hover:bg-subtle'"
               @click="selectDocument(document.id); verifiedVersionId = null; verifiedAt = null"
             >
-              <span class="block break-words font-medium">{{ document.name }}</span><span class="mt-1 block break-all text-xs text-muted-foreground">{{ document.source.filename }}</span>
+              <span class="block break-words font-medium">{{ document.name }}</span><span class="mt-1 block break-all text-xs text-muted-foreground">{{ sourceFormat(document.source.media_type) }} · {{ readableSize(document.source.size_bytes) }}</span>
             </button>
           </section>
           <article
             v-if="selectedDocument"
-            class="min-w-0 text-sm"
+            class="document-detail min-w-0 text-sm"
+            aria-label="文档阅读区"
+            tabindex="0"
           >
-            <p class="font-mono text-[9px] font-medium tracking-[0.15em] text-muted-light">
-              SELECTED DOCUMENT
-            </p>
-            <h3 class="mt-1 break-words text-lg font-semibold text-foreground">
+            <h3 class="mt-1 break-words text-lg font-medium text-foreground">
               {{ selectedDocument.name }}
             </h3>
-            <dl class="mt-4 grid gap-x-6 gap-y-2 text-sm text-body sm:grid-cols-2">
-              <div>
-                <dt class="inline">
-                  上传时间：
-                </dt><dd class="inline">
-                  {{ selectedDocument.source.created_at }}
-                </dd>
-              </div><div>
-                <dt class="inline">
-                  文件：
-                </dt><dd class="inline">
-                  {{ selectedDocument.source.filename }}
-                </dd>
-              </div><div>
-                <dt class="inline">
-                  格式：
-                </dt><dd class="inline">
-                  {{ sourceFormat(selectedDocument.source.media_type) }}
-                </dd>
-              </div><div>
-                <dt class="inline">
-                  大小：
-                </dt><dd class="inline">
-                  {{ selectedDocument.source.size_bytes }} bytes
-                </dd>
-              </div>
-            </dl>
-            <details class="mt-5 border-t border-border pt-3 text-body">
-              <summary class="cursor-pointer text-sm font-medium text-foreground">
-                来源与完整性
-              </summary>
-              <div class="mt-3 space-y-3">
-                <p class="break-all font-mono text-xs text-muted-foreground">
-                  SHA-256 · {{ selectedDocument.source.sha256 }}
-                </p>
-                <Button
-                  :disabled="verifying"
-                  @click="verifySource"
-                >
-                  {{ verifying ? "正在验证…" : "验证原始文件" }}
-                </Button>
-                <p class="text-sm text-muted-foreground">
-                  原文件完整性：{{ verifiedVersionId === selectedDocument.source.document_version_id ? "刚刚验证通过" : "尚未验证" }}
-                </p>
-                <p
-                  v-if="verifiedAt && verifiedVersionId === selectedDocument.source.document_version_id"
-                  class="font-mono text-xs text-muted-foreground"
-                >
-                  {{ verifiedAt }}
-                </p>
-              </div>
-            </details>
+            <p class="mt-3 text-xs font-normal leading-5 text-muted-foreground">
+              {{ fileSummary(selectedDocument.source) }}
+            </p>
+            <p class="mt-1 break-all text-xs leading-5 text-muted-foreground">
+              {{ selectedDocument.source.filename }}
+            </p>
+
             <section
               v-if="!selectedDocumentIsPdf"
               class="mt-6 border-t border-border pt-5"
             >
-              <h4 class="font-semibold text-foreground">
+              <h4
+                v-if="successfulChunkMaxChars === null"
+                class="font-semibold text-foreground"
+              >
                 文档处理
               </h4>
               <p
-                v-if="successfulChunkMaxChars !== null"
-                class="mt-2 text-muted-foreground"
-              >
-                当前分块配置：{{ successfulChunkMaxChars }}
-              </p>
-              <p
-                v-else-if="chunkCount === 0 && !chunksLoading"
+                v-if="successfulChunkMaxChars === null && chunkCount === 0 && !chunksLoading"
                 class="mt-2 text-muted-foreground"
               >
                 尚未处理
               </p>
               <p
-                v-else-if="!chunksLoading"
+                v-else-if="successfulChunkMaxChars === null && !chunksLoading"
                 class="mt-2 text-warning-foreground"
               >
                 当前切片配置未知，请重新处理文档。
@@ -700,27 +761,42 @@ onBeforeUnmount(() => {
               >
                 {{ processingError }}
               </p>
-              <form
-                class="mt-3 flex flex-wrap items-end gap-3"
-                @submit.prevent="rebuildChunks"
+              <details
+                :key="selectedDocument.id"
+                :open="successfulChunkMaxChars === null"
+                class="mt-3"
               >
-                <label class="block text-sm">
-                  单个分块最大字符数
-                  <span class="ml-1 font-mono text-[10px] text-muted-light">max_chunk_chars</span>
-                  <input
-                    v-model="draftMaxChunkChars"
-                    class="mt-1 block w-40 rounded-sm border border-strong-border bg-surface p-2 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
-                    inputmode="numeric"
+                <summary class="cursor-pointer text-sm text-body">
+                  处理设置
+                </summary>
+                <p
+                  v-if="successfulChunkMaxChars !== null"
+                  class="mt-2 text-xs text-muted-foreground"
+                >
+                  当前分块配置：{{ successfulChunkMaxChars }}
+                </p>
+                <form
+                  class="mt-3 flex flex-wrap items-end gap-3"
+                  @submit.prevent="rebuildChunks"
+                >
+                  <label class="block text-sm">
+                    单个分块最大字符数
+                    <span class="ml-1 font-mono text-[10px] text-muted-light">max_chunk_chars</span>
+                    <input
+                      v-model="draftMaxChunkChars"
+                      class="mt-1 block w-40 rounded-sm border border-strong-border bg-surface p-2 text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-ring/20"
+                      inputmode="numeric"
+                      :disabled="processingPending || processingBlockedByIndex"
+                    >
+                  </label>
+                  <Button
+                    type="submit"
                     :disabled="processingPending || processingBlockedByIndex"
                   >
-                </label>
-                <Button
-                  type="submit"
-                  :disabled="processingPending || processingBlockedByIndex"
-                >
-                  {{ processingPending ? "处理中…" : successfulChunkMaxChars === null ? "处理文档" : "重新切片" }}
-                </Button>
-              </form>
+                    {{ processingPending ? "处理中…" : successfulChunkMaxChars === null ? "处理文档" : "重新切片" }}
+                  </Button>
+                </form>
+              </details>
             </section>
             <section
               v-else
@@ -729,8 +805,17 @@ onBeforeUnmount(() => {
               <h4 class="font-semibold text-foreground">
                 PDF 处理
               </h4>
-              <p class="mt-2 text-body" aria-live="polite">
-                {{ documentProcessingLoading ? "正在读取处理状态…" : processingStatusText(documentProcessingStatus) }}
+              <p
+                class="mt-2 text-body"
+                aria-live="polite"
+              >
+                {{ documentProcessingLoading && documentProcessingStatus === null ? "正在读取处理状态…" : processingStatusText(documentProcessingStatus) }}
+              </p>
+              <p
+                v-if="documentProcessingStatus?.latest_attempt?.status === 'PENDING' || documentProcessingStatus?.latest_attempt?.status === 'RUNNING'"
+                class="mt-2 text-sm leading-6 text-muted-foreground"
+              >
+                PDF 解析可能需要一些时间，可以离开此页面，处理会在后台继续。
               </p>
               <p
                 v-if="documentProcessingStatus?.latest_attempt?.status === 'FAILED' || documentProcessingStatus?.latest_attempt?.status === 'INTERRUPTED'"
@@ -801,28 +886,27 @@ onBeforeUnmount(() => {
                 <article
                   v-for="chunk in chunks"
                   :key="chunk.ordinal"
-                  class="border border-border bg-subtle p-3"
+                  class="border-t border-border py-5"
                 >
-                  <p class="font-medium text-foreground">
-                    #{{ chunk.ordinal }}
+                  <p
+                    v-if="chunk.heading_path.length > 0"
+                    class="mt-1 text-[13px] font-normal text-muted-foreground"
+                  >
+                    {{ chunk.heading_path.join(" › ") }}
                   </p>
-                <p
-                  v-if="chunk.heading_path.length > 0"
-                  class="mt-1 text-xs text-muted-foreground"
-                >
-                  当前位置：{{ chunk.heading_path.join(" › ") }}
-                </p>
-                <p
-                  v-if="selectedDocumentIsPdf && pdfPageLocation(chunk.source_regions)"
-                  class="mt-1 text-xs font-medium text-body"
-                >
-                  页码：{{ pdfPageLocation(chunk.source_regions) }}
-                </p>
-                  <p class="mt-2 break-words whitespace-pre-wrap text-body">
+                  <p
+                    v-if="selectedDocumentIsPdf && pdfPageLocation(chunk.source_regions)"
+                    class="mt-1 text-[13px] font-normal text-muted-foreground"
+                  >
+                    页码：{{ pdfPageLocation(chunk.source_regions) }}
+                  </p>
+                  <p class="mt-2 break-words whitespace-pre-wrap text-[15px] font-normal leading-[1.75] text-body">
                     {{ expandedChunkOrdinals.includes(chunk.ordinal) ? chunk.content : `${chunk.content.slice(0, 240)}${chunk.content.length > 240 ? "…" : ""}` }}
                   </p>
                   <button
-                    class="mt-2 text-sm text-primary-deep underline underline-offset-2"
+                    v-if="chunk.content.length > 240"
+                    :aria-expanded="expandedChunkOrdinals.includes(chunk.ordinal)"
+                    class="mt-2 text-sm text-primary-deep underline underline-offset-2 focus-visible:outline focus-visible:outline-ring"
                     type="button"
                     @click="toggleChunk(chunk.ordinal)"
                   >
@@ -830,7 +914,7 @@ onBeforeUnmount(() => {
                   </button>
                   <details class="mt-3 text-xs text-muted-foreground">
                     <summary class="cursor-pointer">
-                      位置详情
+                      位置详情 · 片段 {{ chunk.ordinal }}
                     </summary>
                     <p class="mt-1 break-all font-mono">
                       {{ chunk.source_regions.map(sourceRegionText).join("；") }}
@@ -865,6 +949,31 @@ onBeforeUnmount(() => {
                 </div>
               </div>
             </section>
+            <details class="mt-5 border-t border-border pt-3 text-body">
+              <summary class="cursor-pointer text-sm font-medium text-foreground">
+                来源与完整性
+              </summary>
+              <div class="mt-3 space-y-3">
+                <p class="break-all font-mono text-xs text-muted-foreground">
+                  SHA-256 · {{ selectedDocument.source.sha256 }}
+                </p>
+                <Button
+                  :disabled="verifying"
+                  @click="verifySource"
+                >
+                  {{ verifying ? "正在验证…" : "验证原始文件" }}
+                </Button>
+                <p class="text-sm text-muted-foreground">
+                  原文件完整性：{{ verifiedVersionId === selectedDocument.source.document_version_id ? "刚刚验证通过" : "尚未验证" }}
+                </p>
+                <p
+                  v-if="verifiedAt && verifiedVersionId === selectedDocument.source.document_version_id"
+                  class="font-mono text-xs text-muted-foreground"
+                >
+                  {{ verifiedAt }}
+                </p>
+              </div>
+            </details>
           </article>
         </div>
       </div>
@@ -877,3 +986,27 @@ onBeforeUnmount(() => {
     </main>
   </section>
 </template>
+
+
+<style scoped>
+/* App supplies a bounded desktop viewport; each content pane owns its scroll. */
+@media (min-width: 1024px) {
+  .knowledge-workspace { display: grid; height: 100%; overflow: hidden; grid-template-columns: 11rem minmax(0, 1fr); }
+  .knowledge-rail { overflow-y: auto; }
+  .knowledge-main { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }
+  .knowledge-body { flex: 1; overflow: hidden; }
+  .upload-form { flex-shrink: 0; max-height: 45vh; overflow-y: auto; }
+  .document-workspace { flex: 1; grid-template-rows: minmax(7rem, 0.35fr) minmax(0, 1fr); overflow: hidden; }
+  .document-list, .document-detail { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+  .document-detail { padding-right: 0.5rem; }
+}
+@media (min-width: 1280px) {
+  .document-workspace { grid-template-columns: 12rem minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+  .document-list { border-bottom: 0; border-right: 1px solid var(--border); padding: 0 0.75rem 0 0; }
+}
+@media (min-width: 1440px) {
+  .knowledge-workspace { grid-template-columns: 12rem minmax(0, 1fr); }
+  .document-workspace { grid-template-columns: 14rem minmax(0, 1fr); gap: 1.75rem; }
+}
+.knowledge-workspace summary:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+</style>
