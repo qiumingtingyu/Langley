@@ -142,7 +142,6 @@ async def inspect_knowledge(
             if counts[doc.id] != 1:
                 entries.append(
                     {
-                        "document_id": doc.id,
                         "label": doc.name,
                         "available": False,
                         "reason": "ambiguous_version",
@@ -153,7 +152,6 @@ async def inspect_knowledge(
             available = media in {"text/markdown", "application/pdf"}
             entries.append(
                 {
-                    "document_id": doc.id,
                     "label": doc.name,
                     "format": {
                         "text/markdown": "markdown",

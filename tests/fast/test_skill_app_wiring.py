@@ -42,6 +42,7 @@ def app_settings(tmp_path):
 
 def app_flow(app):
     flow = app.state.execution_manager._workflow_factory()
+    assert flow._skill_registry is app.state.skill_registry
     # Only replace DB conversation construction, never registry or tool wiring.
     flow._context_builder = StaticContext()
     return flow

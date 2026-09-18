@@ -36,7 +36,9 @@ from langley.api.conversations import router as conversations_router
 from langley.api.health import router as health_router
 from langley.api.knowledge import router as knowledge_router
 from langley.api.memories import router as memories_router
+from langley.api.observatory import router as observatory_router
 from langley.api.runs import router as runs_router
+from langley.api.skills import router as skills_router
 from langley.api.workspaces import router as workspaces_router
 from langley.infrastructure.database import (
     create_database_engine,
@@ -77,6 +79,8 @@ from langley.memory.processing import (
     process_memory_through,
 )
 from langley.observability import configure_logging
+from langley.observatory.service import ObservatoryRuntime
+from langley.observatory.store import ObservatoryStore
 from langley.settings import Settings
 from langley.skill_store import SkillStore
 from langley.skills import SkillRegistry
@@ -241,6 +245,7 @@ def _workflow_factory_for(
     tracer: Tracer | None,
     session_factory,
     knowledge_index_runtime: KnowledgeIndexBuildRuntime,
+    skill_registry: SkillRegistry,
     conversation_compactor_provider: LLMProvider | None = None,
     workspace_storage: WorkspaceStorage | None = None,
 ):
@@ -293,9 +298,6 @@ def _workflow_factory_for(
         WorkspaceTool(name, workspace_storage) for name in sorted(WORKSPACE_TOOL_NAMES)
     )
     tool_executor = ToolExecutor(tools=tools)
-    skill_registry = SkillRegistry(
-        settings.builtin_skill_root, SkillStore(settings).user_root
-    )
     resolved_tracer = tracer or LangSmithTracer(
         enabled=settings.tracing_enabled,
         project=settings.langsmith_project,
@@ -412,10 +414,21 @@ def create_app(
         )
 
     app.state.settings = resolved_settings
+    app.state.skill_registry = SkillRegistry(
+        resolved_settings.builtin_skill_root,
+        SkillStore(resolved_settings).user_root,
+    )
     app.state.workspace_storage = WorkspaceStorage(resolved_settings)
     app.state.local_file_storage = LocalFileStorage(
         resolved_settings.knowledge_storage_root
     )
+    if resolved_settings.environment == "development":
+        app.state.observatory_runtime = ObservatoryRuntime(
+            store_factory=lambda: ObservatoryStore(
+                resolved_settings.observatory_database_path,
+                resolved_settings.local_run_diagnostics_root,
+            )
+        )
     if resolved_settings.database_url is not None:
         database_engine = create_database_engine(resolved_settings.database_url)
         app.state.database_engine = database_engine
@@ -500,6 +513,7 @@ def create_app(
                 tracer,
                 app.state.session_factory,
                 app.state.knowledge_index_runtime,
+                app.state.skill_registry,
                 configured_compactor_provider,
                 workspace_storage=app.state.workspace_storage,
             ),
@@ -562,4 +576,7 @@ def create_app(
     app.include_router(runs_router)
     app.include_router(memories_router)
     app.include_router(knowledge_router)
+    app.include_router(skills_router)
+    if resolved_settings.environment == "development":
+        app.include_router(observatory_router)
     return app

@@ -13,6 +13,7 @@ from langley.knowledge.index_build import KnowledgeIndexBuildRuntime
 from langley.knowledge.pdf_processing import DocumentProcessingDispatcher
 from langley.memory.events import MemoryEventSubscribers
 from langley.memory.policy import MemoryPolicy, MemoryPolicyStatus
+from langley.skills import SkillRegistry
 from langley.workspace_storage import WorkspaceStorage
 
 
@@ -48,6 +49,12 @@ def get_execution_manager(request: Request) -> AnswerExecutionManager:
 
 def get_settings(request: Request):
     return request.app.state.settings
+
+
+def get_skill_registry(request: Request) -> SkillRegistry:
+    """Return the application-scoped registry shared with Agent execution."""
+
+    return request.app.state.skill_registry
 
 
 def get_workspace_storage(request: Request) -> WorkspaceStorage:

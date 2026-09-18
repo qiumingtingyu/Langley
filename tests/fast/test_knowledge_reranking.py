@@ -26,6 +26,7 @@ from langley.knowledge.retrieval_service import (
     KnowledgeSearchError,
 )
 from langley.settings import Settings
+from langley.skills import SkillRegistry
 
 
 def _context() -> ActiveRetrievalContext:
@@ -382,6 +383,7 @@ def test_workflow_factory_reuses_one_unloaded_reranker_per_application(
         None,
         None,
         None,
+        SkillRegistry(tmp_path / "builtin", tmp_path / "user"),
     )
 
     first = factory()

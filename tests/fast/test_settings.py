@@ -39,6 +39,7 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
         "LANGLEY_OVERALL_WORKFLOW_DEADLINE_SECONDS",
         "LANGLEY_TRACING_ENABLED",
         "LANGLEY_TRACE_CONTENT_ENABLED",
+        "LANGLEY_OBSERVATORY_DATABASE_PATH",
         "LANGLEY_LANGSMITH_PROJECT",
         "LANGLEY_WEB_SEARCH_ENABLED",
         "LANGLEY_TAVILY_API_KEY",
@@ -85,6 +86,7 @@ def test_settings_use_safe_defaults_without_dotenv(monkeypatch) -> None:
     assert settings.overall_workflow_deadline_seconds == 180.0
     assert settings.tracing_enabled is False
     assert settings.trace_content_enabled is False
+    assert settings.observatory_database_path == Path(".runtime/observatory.sqlite")
     assert settings.langsmith_project is None
     assert settings.web_search_enabled is False
     assert settings.tavily_api_key is None
@@ -120,6 +122,9 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     monkeypatch.setenv("LANGLEY_OVERALL_WORKFLOW_DEADLINE_SECONDS", "12.5")
     monkeypatch.setenv("LANGLEY_TRACING_ENABLED", "true")
     monkeypatch.setenv("LANGLEY_TRACE_CONTENT_ENABLED", "true")
+    monkeypatch.setenv(
+        "LANGLEY_OBSERVATORY_DATABASE_PATH", "temporary/observatory.sqlite"
+    )
     monkeypatch.setenv("LANGLEY_LANGSMITH_PROJECT", "langley-test")
     monkeypatch.setenv("LANGLEY_WEB_SEARCH_ENABLED", "true")
     monkeypatch.setenv("TAVILY_API_KEY", "test-tavily-key")
@@ -156,6 +161,7 @@ def test_settings_read_langley_prefixed_environment_variables(monkeypatch) -> No
     assert settings.overall_workflow_deadline_seconds == 12.5
     assert settings.tracing_enabled is True
     assert settings.trace_content_enabled is True
+    assert settings.observatory_database_path == Path("temporary/observatory.sqlite")
     assert settings.langsmith_project == "langley-test"
     assert settings.web_search_enabled is True
     assert settings.tavily_api_key is not None

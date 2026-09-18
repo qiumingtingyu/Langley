@@ -49,6 +49,21 @@ async def get_owned_run(
     return OwnedRunResult(run=run, assistant_message=assistant_message)
 
 
+async def list_owned_runs(session: AsyncSession, *, user_id: int) -> tuple[Run, ...]:
+    """List authoritative non-deleted Runs owned by one user."""
+
+    runs = await session.scalars(
+        select(Run)
+        .join(Conversation, Run.conversation_id == Conversation.id)
+        .where(
+            Conversation.user_id == user_id,
+            Conversation.deleted_at.is_(None),
+        )
+        .order_by(Run.id.desc())
+    )
+    return tuple(runs.all())
+
+
 async def cancel_owned_run(session: AsyncSession, *, user_id: int, run_id: int) -> Run:
     """Commit an owned active Run's cancellation before any local Task stop."""
 

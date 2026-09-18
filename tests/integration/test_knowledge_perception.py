@@ -152,11 +152,12 @@ def test_owned_catalog_pass_through_and_temporary_version_policy(
             catalog = await inspect_knowledge(
                 factory, storage, user_id=1, knowledge_base_id=7, document_id=None
             )
-            assert {d["document_id"] for d in catalog["documents"]} == {
+            assert {d["locator"]["document_id"] for d in catalog["documents"]} == {
                 versions[0].document_id,
                 pdf_id,
             }
             for entry in catalog["documents"]:
+                assert "document_id" not in entry
                 result = await read_knowledge(
                     factory,
                     storage,
@@ -204,12 +205,9 @@ def test_owned_catalog_pass_through_and_temporary_version_policy(
             catalog = await inspect_knowledge(
                 factory, storage, user_id=1, knowledge_base_id=7, document_id=None
             )
-            ambiguous = next(
-                d
-                for d in catalog["documents"]
-                if d["document_id"] == versions[0].document_id
-            )
+            ambiguous = next(d for d in catalog["documents"] if d["label"] == "notes-7")
             assert not ambiguous["available"] and "locator" not in ambiguous
+            assert "document_id" not in ambiguous
         finally:
             await engine.dispose()
 

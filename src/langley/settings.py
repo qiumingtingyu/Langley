@@ -88,6 +88,7 @@ class Settings(BaseSettings):
     local_run_diagnostics_enabled: bool | None = None
     local_run_diagnostics_include_content: bool | None = None
     local_run_diagnostics_root: Path = Path(".runtime/traces")
+    observatory_database_path: Path = Path(".runtime/observatory.sqlite")
     langsmith_project: str | None = None
     web_search_enabled: bool = False
     tavily_api_key: SecretStr | None = Field(
