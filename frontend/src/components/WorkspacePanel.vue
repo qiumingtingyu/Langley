@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowLeft, ChevronRight, FileText, Folder, RefreshCw } from "lucide-vue-next";
+import { ArrowLeft, ChevronRight, Download, FileText, Folder, RefreshCw } from "lucide-vue-next";
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -37,6 +37,10 @@ const directory = ref("");
 const entries = ref<Entry[]>([]);
 const preview = ref<{ path: string; content: string; end_line: number; total_lines: number } | null>(null);
 const folderInput = ref<HTMLInputElement | null>(null);
+const downloading = ref<string | null>(null);
+const downloadError = ref("");
+let downloadController: AbortController | null = null;
+let downloadRevision = 0;
 let scopeRevision = 0;
 let fileRevision = 0;
 let workspaceListRevision = 0;
@@ -139,6 +143,55 @@ async function files(path = "", isPreview = false, offset = 1) {
     if (current === fileRevision && scope === scopeRevision) loadingFiles.value = false;
   }
 }
+function stopDownload() {
+  downloadRevision++;
+  downloadController?.abort();
+  downloadController = null;
+  downloading.value = null;
+  downloadError.value = "";
+}
+async function downloadFile(entry: Entry) {
+  if (entry.type !== "file" || downloading.value !== null || props.workspaceId === null) return;
+  const id = props.workspaceId;
+  const scope = scopeRevision;
+  const current = ++downloadRevision;
+  const path = [directory.value, entry.name].filter(Boolean).join("/");
+  const controller = new AbortController();
+  downloadController = controller;
+  downloading.value = path;
+  downloadError.value = "";
+  try {
+    const response = await fetch(`/api/workspaces/${id}/files/download?${new URLSearchParams({ path })}`, { signal: controller.signal });
+    if (current !== downloadRevision || scope !== scopeRevision || id !== props.workspaceId) return;
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      throw new WorkspaceRequestError(payload?.detail?.code);
+    }
+    const blob = await response.blob();
+    if (current !== downloadRevision || scope !== scopeRevision || id !== props.workspaceId) return;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    try {
+      link.href = url;
+      link.download = entry.name;
+      document.body.appendChild(link);
+      link.click();
+    } finally {
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+  } catch (failure) {
+    if (current !== downloadRevision || scope !== scopeRevision) return;
+    downloadError.value = failure instanceof WorkspaceRequestError && failure.code === "FILE_TOO_LARGE"
+      ? "文件超过 25 MiB 下载上限，请选择较小文件。"
+      : "文件下载失败，文件可能已变更或暂时不可用。请重试或刷新文件列表。";
+  } finally {
+    if (current === downloadRevision) {
+      downloading.value = null;
+      downloadController = null;
+    }
+  }
+}
 function parentDirectory() {
   if (directory.value) void files(directory.value.split("/").slice(0, -1).join("/"));
 }
@@ -151,6 +204,7 @@ function restoreFocus(event: Event) {
   emit("restoreFocus");
 }
 watch(() => [props.conversationId, props.workspaceId], () => {
+  stopDownload();
   scopeRevision++;
   fileRevision++;
   entries.value = [];
@@ -165,6 +219,7 @@ watch(() => props.changes, () => {
   if (props.open && props.workspaceId !== null) void files(directory.value);
 });
 watch(() => props.open, (open) => {
+  if (!open) stopDownload();
   if (open) {
     void loadWorkspaces();
     if (props.workspaceId !== null) void files(directory.value);
@@ -174,7 +229,7 @@ onMounted(() => {
   void loadWorkspaces();
   if (props.open && props.workspaceId !== null) void files();
 });
-onBeforeUnmount(() => { scopeRevision++; fileRevision++; workspaceListRevision++; });
+onBeforeUnmount(() => { stopDownload(); scopeRevision++; fileRevision++; workspaceListRevision++; });
 </script>
 
 <template>
@@ -321,10 +376,11 @@ onBeforeUnmount(() => { scopeRevision++; fileRevision++; workspaceListRevision++
             <li
               v-for="entry in entries"
               :key="entry.name"
+              class="flex items-center gap-1"
             >
               <button
                 type="button"
-                class="file-entry flex w-full items-center gap-2.5 rounded-sm px-2 py-2 text-left text-foreground hover:bg-subtle focus-visible:outline focus-visible:outline-ring disabled:text-muted-light"
+                class="file-entry flex min-w-0 flex-1 items-center gap-2.5 rounded-sm px-2 py-2 text-left text-foreground hover:bg-subtle focus-visible:outline focus-visible:outline-ring disabled:text-muted-light"
                 :class="{ 'bg-subtle': (preview?.path ?? unsupportedPreviewPath) === [directory, entry.name].filter(Boolean).join('/') }"
                 :disabled="entry.type === 'symlink'"
                 :aria-current="(preview?.path ?? unsupportedPreviewPath) === [directory, entry.name].filter(Boolean).join('/') ? 'true' : undefined"
@@ -348,8 +404,29 @@ onBeforeUnmount(() => { scopeRevision++; fileRevision++; workspaceListRevision++
                   aria-hidden="true"
                 />
               </button>
+              <Button
+                v-if="entry.type === 'file'"
+                variant="ghost"
+                size="small"
+                :aria-label="`下载 ${entry.name}`"
+                :disabled="downloading !== null"
+                @click="downloadFile(entry)"
+              >
+                <Download
+                  :size="14"
+                  aria-hidden="true"
+                />
+                {{ downloading === [directory, entry.name].filter(Boolean).join('/') ? "下载中…" : "下载" }}
+              </Button>
             </li>
           </ul>
+          <p
+            v-if="downloadError"
+            role="alert"
+            class="mt-3 text-[13px] leading-6 text-warning-foreground"
+          >
+            {{ downloadError }}
+          </p>
           <p
             v-if="!loadingFiles && entries.length === 0"
             class="py-3 text-sm text-muted-foreground"

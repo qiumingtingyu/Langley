@@ -1,7 +1,7 @@
 """Application configuration."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogFormat = Literal["console", "json"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-LLMProviderName = Literal["qwen"]
+LLMProviderName = Literal["qwen", "deepseek"]
 KnowledgeEmbeddingRepresentation = Literal["source_context_v1"]
 
 _DEFAULT_QWEN_MODEL = "qwen3.7-plus-2026-05-26"
@@ -70,6 +70,8 @@ class Settings(BaseSettings):
     llm_provider: LLMProviderName = "qwen"
     qwen_api_key: SecretStr | None = None
     qwen_base_url: str | None = None
+    deepseek_api_key: SecretStr | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
     llm_model: str = _DEFAULT_QWEN_MODEL
     working_context_budget_estimate: int = Field(default=16_000, ge=1)
     conversation_compaction_trigger_estimate: int = Field(default=12_000, ge=1)
@@ -97,6 +99,16 @@ class Settings(BaseSettings):
             "TAVILY_API_KEY", "LANGLEY_TAVILY_API_KEY", "tavily_api_key"
         ),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def provider_model_defaults(cls, values: Any) -> Any:
+        """Keep Qwen defaults; avoid sending Qwen model names to DeepSeek."""
+        if isinstance(values, dict) and values.get("llm_provider") == "deepseek":
+            values = dict(values)
+            values.setdefault("llm_model", "deepseek-flash")
+            values.setdefault("conversation_compactor_model", values["llm_model"])
+        return values
 
     @field_validator("local_timezone")
     @classmethod

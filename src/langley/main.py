@@ -45,6 +45,7 @@ from langley.infrastructure.database import (
     create_session_factory,
     dispose_database_engine,
 )
+from langley.infrastructure.deepseek_provider import DeepSeekProvider
 from langley.infrastructure.local_file_storage import LocalFileStorage
 from langley.infrastructure.qwen_provider import QwenProvider
 from langley.knowledge.document_indexing import (
@@ -90,7 +91,7 @@ logger = structlog.get_logger(__name__)
 
 
 class _UnavailableProvider:
-    """Fail safely when the deployment has not configured Qwen credentials."""
+    """Fail safely when the selected provider has no credentials."""
 
     def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamEvent]:
         del request
@@ -102,17 +103,31 @@ class _UnavailableProvider:
         yield
 
 
-def _provider_for(settings: Settings, override: LLMProvider | None) -> LLMProvider:
-    """Create the configured real Provider once at the application composition root."""
-
-    if override is not None:
-        return override
+def _configured_provider(settings: Settings, model: str) -> LLMProvider:
+    """Select one explicit vendor without introducing a provider registry."""
+    if settings.llm_provider == "deepseek":
+        if settings.deepseek_api_key is None:
+            return _UnavailableProvider()
+        return DeepSeekProvider(
+            api_key=settings.deepseek_api_key,
+            base_url=settings.deepseek_base_url,
+            model=model,
+        )
     if settings.qwen_api_key is None or settings.qwen_base_url is None:
         return _UnavailableProvider()
     return QwenProvider(
         api_key=settings.qwen_api_key,
         base_url=settings.qwen_base_url,
-        model=settings.llm_model,
+        model=model,
+    )
+
+
+def _provider_for(settings: Settings, override: LLMProvider | None) -> LLMProvider:
+    """Construct the selected answer provider at the composition root."""
+    return (
+        override
+        if override is not None
+        else _configured_provider(settings, settings.llm_model)
     )
 
 
@@ -123,14 +138,10 @@ def _memory_provider_for(
 
     if settings.memory_policy_model is None:
         return None
-    if override is not None:
-        return override
-    if settings.qwen_api_key is None or settings.qwen_base_url is None:
-        return _UnavailableProvider()
-    return QwenProvider(
-        api_key=settings.qwen_api_key,
-        base_url=settings.qwen_base_url,
-        model=settings.memory_policy_model,
+    return (
+        override
+        if override is not None
+        else _configured_provider(settings, settings.memory_policy_model)
     )
 
 
@@ -151,14 +162,10 @@ def _conversation_compactor_provider_for(
 ) -> LLMProvider:
     """Construct the configured internal conversation compactor provider."""
 
-    if override is not None:
-        return override
-    if settings.qwen_api_key is None or settings.qwen_base_url is None:
-        return _UnavailableProvider()
-    return QwenProvider(
-        api_key=settings.qwen_api_key,
-        base_url=settings.qwen_base_url,
-        model=settings.conversation_compactor_model,
+    return (
+        override
+        if override is not None
+        else _configured_provider(settings, settings.conversation_compactor_model)
     )
 
 

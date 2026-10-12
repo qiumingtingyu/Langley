@@ -9,8 +9,11 @@ import re
 import stat
 import tempfile
 from pathlib import Path, PureWindowsPath
+from typing import BinaryIO
 
 from langley.settings import Settings
+
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 
 
 class WorkspaceFileError(ValueError):
@@ -85,6 +88,74 @@ class WorkspaceStorage:
                 entries.append({"name": child.name, "type": kind})
         entries.sort(key=lambda e: (e["type"] != "directory", e["name"]))
         return {"path": path, "entries": entries}
+
+    def download_snapshot(self, key: str, path: str) -> tuple[BinaryIO, int, str]:
+        """Call under execution_lock; return a bounded private binary snapshot."""
+        snapshot = None
+        try:
+            target = self.resolve(key, path)
+            before = target.stat(follow_symlinks=False)
+
+            def supported(info):
+                return (
+                    stat.S_ISREG(info.st_mode)
+                    and info.st_nlink == 1
+                    and not getattr(info, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                )
+
+            def version(info):
+                return (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_size,
+                    info.st_mtime_ns,
+                    info.st_nlink,
+                )
+
+            if not supported(before):
+                raise WorkspaceFileError("DOWNLOAD_FILE_UNSUPPORTED")
+            if before.st_size > MAX_DOWNLOAD_BYTES:
+                raise WorkspaceFileError("FILE_TOO_LARGE")
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            with os.fdopen(os.open(target, flags), "rb") as source:
+                opened = os.fstat(source.fileno())
+                if not supported(opened) or version(opened) != version(before):
+                    raise WorkspaceFileError("FILE_CHANGED")
+                snapshot = tempfile.TemporaryFile(mode="w+b")
+                size = 0
+                while chunk := source.read(min(65536, MAX_DOWNLOAD_BYTES - size + 1)):
+                    size += len(chunk)
+                    if size > MAX_DOWNLOAD_BYTES:
+                        raise WorkspaceFileError("FILE_TOO_LARGE")
+                    snapshot.write(chunk)
+                # Detect external writes/replacements and link changes during copying.
+                current = self.resolve(key, path).stat(follow_symlinks=False)
+                finished = os.fstat(source.fileno())
+                # Windows path stat and fstat can report different creation times.
+                # Compare ctime within each API; check identity/mtime across APIs.
+                if (
+                    not supported(current)
+                    or version(current) != version(before)
+                    or current.st_ctime_ns != before.st_ctime_ns
+                    or version(finished) != version(opened)
+                    or finished.st_ctime_ns != opened.st_ctime_ns
+                    or size != before.st_size
+                ):
+                    raise WorkspaceFileError("FILE_CHANGED")
+            snapshot.seek(0)
+            return snapshot, size, target.name
+        except BaseException as error:
+            if snapshot is not None:
+                snapshot.close()
+            if isinstance(error, FileNotFoundError):
+                raise WorkspaceFileError("FILE_NOT_FOUND") from error
+            if isinstance(error, PermissionError):
+                raise WorkspaceFileError("FILE_ACCESS_DENIED") from error
+            if isinstance(error, OSError):
+                raise WorkspaceFileError("DOWNLOAD_FILE_UNSUPPORTED") from error
+            raise
 
     def _text(self, target: Path, bound: int) -> str:
         try:

@@ -42,7 +42,95 @@ function mockFiles(handler?: (url: URL) => Response | Promise<Response>) {
 afterEach(() => {
   mounted.splice(0).forEach(wrapper => wrapper.unmount());
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
   document.body.innerHTML = "";
+});
+
+describe("Workspace downloads", () => {
+  const entries = [
+    { name: "季度报告.docx", type: "file" }, { name: "notes.txt", type: "file" },
+    { name: "folder", type: "directory" }, { name: "link", type: "symlink" },
+  ];
+  function urls() {
+    const create = vi.fn(() => "blob:download");
+    const revoke = vi.fn();
+    vi.stubGlobal("URL", Object.assign(class extends URL {}, { createObjectURL: create, revokeObjectURL: revoke }));
+    const clicked: string[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function () { clicked.push(this.download); });
+    return { create, revoke, clicked };
+  }
+  function fetchDownloads(download: (url: URL) => Response | Promise<Response>) {
+    return mockFiles(url => url.pathname.endsWith("/download") ? download(url) : response({ entries }));
+  }
+  it.each(["季度报告.docx", "notes.txt"])("downloads %s separately from preview and revokes its URL", async name => {
+    const { create, revoke, clicked } = urls();
+    const blob = new Blob(["binary\u0000bytes"]);
+    const calls = fetchDownloads(url => {
+      expect(url.searchParams.get("path")).toBe(name);
+      return { ok: true, blob: async () => blob } as Response;
+    });
+    setup(); await flushPromises();
+    await panel().get(`button[aria-label="下载 ${name}"]`).trigger("click");
+    await flushPromises();
+    expect(create).toHaveBeenCalledWith(blob);
+    expect(clicked).toEqual([name]);
+    expect(revoke).toHaveBeenCalledWith("blob:download");
+    expect(panel().find("pre").exists()).toBe(false);
+    expect(calls.mock.calls.filter(c => String(c[0]).includes("/download?"))).toHaveLength(1);
+  });
+  it("has no directory or symlink download action", async () => {
+    fetchDownloads(() => { throw new Error("not called"); });
+    setup(); await flushPromises();
+    expect(panel().find('button[aria-label="下载 folder"]').exists()).toBe(false);
+    expect(panel().find('button[aria-label="下载 link"]').exists()).toBe(false);
+    expect(panel().findAll("button").find(b => b.text().includes("符号链接"))?.attributes("disabled")).toBeDefined();
+  });
+  it("keeps the file list and shows a friendly failed-download message", async () => {
+    fetchDownloads(() => ({ ok: false, json: async () => ({ detail: { code: "FILE_TOO_LARGE" } }) }) as Response);
+    setup(); await flushPromises();
+    await panel().get('button[aria-label="下载 季度报告.docx"]').trigger("click"); await flushPromises();
+    expect(panel().get('[role="alert"]').text()).toContain("25 MiB");
+    expect(panel().findAll(".file-entry")).toHaveLength(4);
+    expect(panel().get('button[aria-label="下载 季度报告.docx"]').attributes("disabled")).toBeUndefined();
+  });
+  it("blocks duplicate clicks while the request is pending", async () => {
+    urls(); const pending = deferred<Response>();
+    const calls = fetchDownloads(() => pending.promise);
+    setup(); await flushPromises();
+    const button = panel().get('button[aria-label="下载 notes.txt"]');
+    await button.trigger("click"); await button.trigger("click");
+    expect(calls.mock.calls.filter(c => String(c[0]).includes("/download?"))).toHaveLength(1);
+    pending.resolve({ ok: true, blob: async () => new Blob(["ok"]) } as Response);
+    await flushPromises();
+  });
+  it("aborts and discards a delayed Blob when the Workspace changes", async () => {
+    const { create } = urls(); const pending = deferred<Blob>();
+    let signal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn(async (path: string, init?: RequestInit) => {
+      if (path === "/api/workspaces") return response(workspaceList);
+      if (path.includes("/download?")) {
+        signal = init?.signal as AbortSignal;
+        return { ok: true, blob: () => pending.promise } as Response;
+      }
+      return response({ entries });
+    }));
+    const wrapper = setup(); await flushPromises();
+    await panel().get('button[aria-label="下载 notes.txt"]').trigger("click"); await flushPromises();
+    await wrapper.setProps({ workspaceId: 2, conversationId: 20 }); await flushPromises();
+    expect(signal?.aborted).toBe(true);
+    pending.resolve(new Blob(["old"])); await flushPromises();
+    expect(create).not.toHaveBeenCalled();
+    expect(panel().find('[role="alert"]').exists()).toBe(false);
+    expect(panel().get('button[aria-label="下载 notes.txt"]').attributes("disabled")).toBeUndefined();
+  });
+  it("ignores an old error response after switching Workspace", async () => {
+    const pending = deferred<Response>(); fetchDownloads(() => pending.promise);
+    const wrapper = setup(); await flushPromises();
+    await panel().get('button[aria-label="下载 notes.txt"]').trigger("click");
+    await wrapper.setProps({ workspaceId: 2, conversationId: 20 }); await flushPromises();
+    pending.resolve({ ok: false, json: async () => ({ detail: { code: "FILE_NOT_FOUND" } }) } as Response);
+    await flushPromises(); expect(panel().find('[role="alert"]').exists()).toBe(false);
+  });
 });
 
 describe("Workspace panel", () => {

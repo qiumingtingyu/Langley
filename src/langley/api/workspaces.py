@@ -1,14 +1,18 @@
 """Managed-copy creation and small owned Workspace read APIs."""
 
+import asyncio
 import os
 import shutil
+from urllib.parse import quote
 from uuid import uuid4
 
+from anyio import CancelScope
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.datastructures import UploadFile
+from starlette.responses import StreamingResponse
 
 from langley.api.dependencies import (
     get_current_user_id,
@@ -27,6 +31,53 @@ from langley.workspace_storage import (
 )
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
+
+
+async def _download_snapshot(storage: WorkspaceStorage, key: str, path: str):
+    """Keep the caller's lock until copying stops, even after cancellation."""
+    worker = asyncio.create_task(
+        asyncio.to_thread(storage.download_snapshot, key, path)
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # A thread cannot be cancelled safely. Drain it before releasing the lock,
+        # and retain ownership of any snapshot that cannot reach a response.
+        with CancelScope(shield=True):
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue  # Repeated Task.cancel() must not abandon the copy.
+                except BaseException:
+                    break  # The storage function already closed a failed snapshot.
+            if not worker.cancelled() and worker.exception() is None:
+                worker.result()[0].close()
+        raise
+
+
+class _DownloadResponse(StreamingResponse):
+    """Own the anonymous snapshot through send failures and client cancellation."""
+
+    def __init__(self, snapshot, size: int, filename: str):
+        self.snapshot = snapshot
+        super().__init__(
+            iter(lambda: snapshot.read(65536), b""),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Length": str(size),
+                "Content-Disposition": 'attachment; filename="download"; '
+                "filename*=UTF-8''" + quote(filename, safe=""),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.snapshot.close()
 
 
 class CreateWorkspaceRequest(BaseModel):
@@ -224,3 +275,34 @@ async def workspace_files(
             )
     except WorkspaceFileError as error:
         raise HTTPException(422, detail={"code": error.code}) from error
+
+
+@router.get("/{workspace_id}/files/download")
+async def download_workspace_file(
+    workspace_id: int,
+    path: str = Query(min_length=1),
+    user_id: int = Depends(get_current_user_id),
+    factory=Depends(get_session_factory),
+    storage: WorkspaceStorage = Depends(get_workspace_storage),
+):
+    async with factory() as session:
+        workspace = await session.get(Workspace, workspace_id)
+        if workspace is None or workspace.user_id != user_id:
+            raise HTTPException(404, detail={"code": "WORKSPACE_NOT_FOUND"})
+        key = workspace.storage_key
+    try:
+        async with storage.execution_lock(key):
+            snapshot, size, filename = await _download_snapshot(storage, key, path)
+        try:
+            return _DownloadResponse(snapshot, size, filename)
+        except BaseException:
+            snapshot.close()
+            raise
+    except WorkspaceFileError as error:
+        status = {
+            "FILE_NOT_FOUND": 404,
+            "FILE_TOO_LARGE": 413,
+            "FILE_ACCESS_DENIED": 403,
+            "FILE_CHANGED": 409,
+        }.get(error.code, 422)
+        raise HTTPException(status, detail={"code": error.code}) from error

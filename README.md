@@ -127,30 +127,50 @@ docker compose ps
 
 ### 2. 配置环境变量
 
-在启动后端的 shell 中按本机配置设置以下变量，连接信息和凭据留在本地：
+本地开发使用公共配置与 Provider 配置，`Settings` 仍默认不自动读取 `.env`。
+首次配置时复制安全模板，已有本地文件不要覆盖：
 
-| 变量 | 用途 |
-| --- | --- |
-| `LANGLEY_DATABASE_URL` | 自己配置的 MySQL 应用数据库连接 |
-| `LANGLEY_LOCAL_USER_ID` | 本地用户 ID |
-| `LANGLEY_QWEN_API_KEY` | 自己的模型服务凭据 |
-| `LANGLEY_QWEN_BASE_URL` | 服务商提供的兼容 endpoint |
+```powershell
+foreach ($name in 'common', 'qwen', 'deepseek') {
+    if (!(Test-Path ".env.$name.local")) {
+        Copy-Item "config/env/$name.env.example" ".env.$name.local"
+    }
+}
+```
 
-更多配置见 [`.env.example`](.env.example)。
+在本地文件中填写数据库连接、API Key 和 Base URL。三个 `.env.*.local` 文件已被
+Git 忽略，模板中不填写真实凭据。公共文件不定义 Provider、模型名或 Memory Policy
+写入预算；每家 Provider 的回答、压缩、Memory 模型和预算在自己的文件中管理。
+DeepSeek Memory Policy 默认未配置，启用时需明确选择独立预算，不能沿用 Qwen
+预算作为已验证结论。现有 Windows User / Machine 变量无需删除或重命名。
+
+`scripts/local_env.py` 只在子进程中隔离继承的应用、模型、Eval、Uvicorn 与远端 SDK
+配置，再显式调用 `uv run --env-file .env.common.local --env-file .env.<provider>.local`。
+保留代理、TLS、HF 缓存和设备环境；不改变父终端或 Windows 持久变量。
+直接使用 `uv --env-file` 时，继承的同名环境变量优先于文件，可能保留旧 Qwen 模型；
+因此本地切换推荐使用该脚本。支持的配置文件使用字面量赋值，不支持变量引用；
+值中包含 `$` 时使用单引号包裹，以保持字面量含义。
+重复字段、跨 Provider 字段、开发文件中的测试数据库变量会在启动前拒绝。
+
+更多字段见 [`.env.example`](.env.example)。
 
 ### 3. 初始化后端
 
 ```powershell
 uv sync --locked --group retrieval
-uv run alembic upgrade head
-uv run python -m langley.bootstrap
+uv run --no-env-file python scripts/local_env.py dev --provider qwen --check
+uv run --no-env-file python scripts/local_env.py dev --provider qwen -- alembic upgrade head
+uv run --no-env-file python scripts/local_env.py dev --provider qwen -- python -m langley.bootstrap
 docker build -t langley-sandbox:v0 sandbox
 ```
 
 ### 4. 启动服务
 
 ```powershell
-uv run uvicorn langley.main:create_app --factory --reload
+# 使用 Qwen；切换后重新启动，不做运行时热切换。
+uv run --no-env-file python scripts/local_env.py dev --provider qwen
+# 或使用 DeepSeek：
+uv run --no-env-file python scripts/local_env.py dev --provider deepseek
 ```
 
 另开一个 PowerShell 窗口：
@@ -162,6 +182,44 @@ npm run dev -- --host 127.0.0.1
 ```
 
 打开 Vite 输出的地址即可使用 Langley。
+
+### 5. 脱敏检查与独立测试环境
+
+```powershell
+uv run --no-env-file python scripts/local_env.py dev --provider deepseek --check
+uv run --no-env-file python scripts/local_env.py test --check
+uv run --no-env-file python scripts/local_env.py test -- pytest
+```
+
+检查只创建 `Settings()`，展示变量名、来源类别及安全错误分类，不打印真实值、
+Key 前后缀、哈希、数据库 URL 或完整异常，不请求数据库、模型或 Trace 服务。
+PASS 仅表示配置可解析且满足本地启动条件，不代表服务连接或 Key 鉴权成功。
+启动前也执行同样的检查；失败退出码为 2，子命令退出码会透传。
+
+测试模式不加载任何开发文件，并排除继承的模型凭据和应用配置。真实 MySQL
+集成测试单独复制 `config/env/test.env.example` 到 `.env.test.local` 并填写专用连接：
+
+```powershell
+uv run --no-env-file python scripts/local_env.py test --integration --check
+uv run --no-env-file python scripts/local_env.py test --integration -- pytest tests/integration
+```
+
+只有 `--integration` 会加载该测试文件；预检查要求 MySQL 且数据库名精确为
+`langley_test`。执行集成测试可能重置测试库，必须按当前 Task 授权范围运行。
+脚本不更改 Workflow、Memory 生命周期、数据库结构或前端。
+
+真实 Docker 测试另有独立 opt-in；终端中继承的 `RUN_SANDBOX_IT` 会被隔离，
+普通测试默认跳过 Docker。以下命令仅在明确授权真实 Docker 验证后执行：
+
+```powershell
+# 默认只选择独立 Docker 测试，不加载开发文件或测试数据库文件。
+uv run --no-env-file python scripts/local_env.py test --sandbox
+# 同时需要 MySQL 的 Docker 集成测试需另加 --integration，并明确选择测试路径。
+uv run --no-env-file python scripts/local_env.py test --integration --sandbox -- pytest tests/integration/test_workspaces_api.py
+```
+
+`--sandbox` 仅向本次测试子进程设置 `RUN_SANDBOX_IT=true`，不改变父终端或持久变量。
+增加 `--check` 只执行配置预检查，不创建 Docker 容器或连接数据库。
 
 ## 当前边界
 
