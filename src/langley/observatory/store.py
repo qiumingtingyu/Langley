@@ -108,6 +108,8 @@ class TraceRoundRecord:
     provider_model: str | None
     estimated_context_tokens: int | None
     context_estimate_kind: str | None
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +161,11 @@ class ObservatoryStore:
                 connection.execute(
                     "ALTER TABLE trace_rounds ADD COLUMN context_estimate_kind TEXT"
                 )
+            for column in ("cache_hit_tokens", "cache_miss_tokens"):
+                if column not in round_columns:
+                    connection.execute(
+                        f"ALTER TABLE trace_rounds ADD COLUMN {column} INTEGER"
+                    )
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     def refresh(self) -> RefreshResult:
@@ -563,8 +570,8 @@ class ObservatoryStore:
                 source_path, run_id, round, event_id, input_tokens,
                 output_tokens, total_tokens, duration_ms, ttft_ms,
                 finish_reason, provider_model, estimated_context_tokens,
-                context_estimate_kind
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                context_estimate_kind, cache_hit_tokens, cache_miss_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source_path, run_id, round) DO UPDATE SET
                 event_id = excluded.event_id,
                 input_tokens = excluded.input_tokens,
@@ -575,7 +582,9 @@ class ObservatoryStore:
                 finish_reason = excluded.finish_reason,
                 provider_model = excluded.provider_model,
                 estimated_context_tokens = excluded.estimated_context_tokens,
-                context_estimate_kind = excluded.context_estimate_kind
+                context_estimate_kind = excluded.context_estimate_kind,
+                cache_hit_tokens = excluded.cache_hit_tokens,
+                cache_miss_tokens = excluded.cache_miss_tokens
             """,
             (
                 source_path,
@@ -595,6 +604,8 @@ class ObservatoryStore:
                 else None,
                 estimated_context_tokens,
                 context_estimate_kind,
+                _cache_int(event.get("cache_hit_tokens")),
+                _cache_int(event.get("cache_miss_tokens")),
             ),
         )
         connection.execute(
@@ -817,6 +828,11 @@ def _strict_int(value: object) -> int | None:
     return None
 
 
+def _cache_int(value: object) -> int | None:
+    count = _strict_int(value)
+    return count if count is not None and count >= 0 else None
+
+
 def _number(value: object) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
@@ -911,6 +927,8 @@ def _round_record(row: sqlite3.Row) -> TraceRoundRecord:
         provider_model=row["provider_model"],
         estimated_context_tokens=row["estimated_context_tokens"],
         context_estimate_kind=row["context_estimate_kind"],
+        cache_hit_tokens=row["cache_hit_tokens"],
+        cache_miss_tokens=row["cache_miss_tokens"],
     )
 
 
@@ -1003,6 +1021,8 @@ CREATE TABLE IF NOT EXISTS trace_rounds (
     provider_model TEXT,
     estimated_context_tokens INTEGER,
     context_estimate_kind TEXT,
+    cache_hit_tokens INTEGER,
+    cache_miss_tokens INTEGER,
     PRIMARY KEY(source_path, run_id, round)
 );
 

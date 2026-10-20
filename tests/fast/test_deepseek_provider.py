@@ -118,6 +118,7 @@ def test_stream_and_tool_result_followup():
                         "prompt_tokens": 20,
                         "completion_tokens": 3,
                         "prompt_cache_hit_tokens": 5,
+                        "prompt_cache_miss_tokens": 15,
                     },
                 },
             ),
@@ -160,6 +161,8 @@ def test_stream_and_tool_result_followup():
     assert final.finish_reason is LLMFinishReason.STOP
     assert final.usage.input_tokens == 20
     assert final.usage.output_tokens == 3
+    assert final.usage.cache_hit_tokens == 5
+    assert final.usage.cache_miss_tokens == 15
     assert len(received) == 2
     for request in received:
         assert str(request.url) == "https://deepseek.example.test/chat/completions"
@@ -491,3 +494,46 @@ def test_existing_workflow_executes_tool_then_uses_deepseek_followup():
     asyncio.run(exercise())
     assert len(received) == 2
     assert all(p["thinking"] == {"type": "disabled"} for p in received)
+
+
+@pytest.mark.parametrize(
+    "cache,expected",
+    [
+        ({}, (None, None)),
+        ({"prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 20}, (0, 20)),
+        ({"prompt_cache_hit_tokens": 8}, (8, None)),
+        ({"prompt_cache_hit_tokens": 15, "prompt_cache_miss_tokens": 15}, (15, 15)),
+        (
+            {"prompt_cache_hit_tokens": True, "prompt_cache_miss_tokens": -1},
+            (None, None),
+        ),
+        (
+            {"prompt_cache_hit_tokens": "5", "prompt_cache_miss_tokens": 1.5},
+            (None, None),
+        ),
+    ],
+)
+def test_tail_cache_usage_is_optional_and_does_not_change_input(cache, expected):
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=_sse(
+                {"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]},
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 3,
+                        **cache,
+                    },
+                },
+            ),
+        )
+
+    async def exercise():
+        return [e async for e in _provider(handler).stream(_request())]
+
+    final = asyncio.run(exercise())[-1]
+    assert final.usage.input_tokens == 20
+    assert final.usage.output_tokens == 3
+    assert (final.usage.cache_hit_tokens, final.usage.cache_miss_tokens) == expected

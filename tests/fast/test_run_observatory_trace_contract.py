@@ -340,3 +340,33 @@ def test_local_writer_failure_remains_fail_open(tmp_path):
     )
     trace.failure("TEST")
     assert broken_root.read_text(encoding="utf-8") == "occupied"
+
+
+def test_cache_usage_metadata_flows_to_round_projection_and_api(tmp_path):
+    from langley.api.observatory import _round_response
+    from langley.observatory.store import ObservatoryStore
+
+    trace = LocalJsonTracer(tmp_path / "traces", include_content=False).start(
+        901, "deepseek", "configured", False
+    )
+    trace.begin_llm(_rich_request(), 1).finish(
+        LLMResponseCompleted(
+            assistant_content="private-answer",
+            tool_calls=(),
+            finish_reason=LLMFinishReason.STOP,
+            usage=LLMUsage(20, 3, cache_hit_tokens=5, cache_miss_tokens=15),
+        )
+    )
+    event = _events(tmp_path / "traces")[-1]
+    assert event["cache_hit_tokens"] == 5
+    assert event["cache_miss_tokens"] == 15
+    assert event["input_tokens"] == 20 and event["total_tokens"] == 23
+    assert "private-answer" not in json.dumps(event)
+    store = ObservatoryStore(tmp_path / "index.sqlite", tmp_path / "traces")
+    store.refresh()
+    record = store.get_round(901, 1)
+    assert record is not None
+    response = _round_response(record).model_dump()
+    assert response["cache_hit_tokens"] == 5
+    assert response["cache_miss_tokens"] == 15
+    assert response["provider_input_tokens"] == 20

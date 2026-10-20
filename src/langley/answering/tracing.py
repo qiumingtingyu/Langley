@@ -87,6 +87,7 @@ class ExecutionTrace(Protocol):
         duration_ms: float | None,
         success: bool,
         outcome: str,
+        run_context: dict[str, JSONValue] | None = None,
     ) -> None: ...
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None: ...
@@ -162,6 +163,7 @@ class ContextCompactionTraceParent(Protocol):
         duration_ms: float | None,
         success: bool,
         outcome: str,
+        run_context: dict[str, JSONValue] | None = None,
     ) -> None: ...
 
 
@@ -308,6 +310,7 @@ class _NoopTrace:
         duration_ms: float | None,
         success: bool,
         outcome: str,
+        run_context: dict[str, JSONValue] | None = None,
     ) -> None:
         del (
             estimated_before,
@@ -321,6 +324,7 @@ class _NoopTrace:
             duration_ms,
             success,
             outcome,
+            run_context,
         )
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
@@ -442,6 +446,7 @@ class _LangSmithTrace:
         duration_ms: float | None,
         success: bool,
         outcome: str,
+        run_context: dict[str, JSONValue] | None = None,
     ) -> None:
         finished_at = datetime.now(UTC)
         started_at = finished_at - timedelta(milliseconds=max(duration_ms or 0.0, 0.0))
@@ -463,6 +468,7 @@ class _LangSmithTrace:
                 "duration_ms": duration_ms,
                 "success": success,
                 "outcome": outcome,
+                **(run_context or {}),
             },
             self._root_id,
             True,

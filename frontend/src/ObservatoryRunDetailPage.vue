@@ -20,6 +20,14 @@ const props = defineProps<{ runId: number }>();
 defineEmits<{ back: [] }>();
 
 const detail = ref<ObservatoryRun | null>(null);
+const usageCards = computed(() => {
+  const usage = detail.value?.diagnostics.usage;
+  return usage ? [
+    { key: "generation", label: "Generation Usage · 生成调用", value: usage.generation },
+    { key: "run-compaction", label: "Run Compaction Usage · RUN 摘要", value: usage.run_compaction },
+    { key: "all-run", label: "All-Run Usage · 生成 + RUN 摘要", value: usage.all_run },
+  ] : [];
+});
 const detailError = ref(false);
 const detailLoading = ref(true);
 const timeline = ref<ObservatoryTimelineEvent[]>([]);
@@ -59,6 +67,22 @@ const roundNumbers = computed(() =>
 const selectedRoundDetail = computed(() =>
   selectedRound.value === null ? null : (roundDetails.value[selectedRound.value] ?? null),
 );
+const cacheHitRate = computed(() => {
+  const round = selectedRoundDetail.value;
+  const input = round?.provider_input_tokens;
+  const hit = round?.cache_hit_tokens;
+  const miss = round?.cache_miss_tokens;
+  if (input == null || hit == null || miss == null
+    || ![input, hit, miss].every(value => Number.isSafeInteger(value) && value >= 0)
+    || input === 0 || hit + miss !== input) return "N/A";
+  return `${(100 * hit / input).toFixed(1)}%`;
+});
+
+function formatCacheTokens(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value.toLocaleString("en-US") : "N/A";
+}
+
 const selectedRoundIndex = computed(() =>
   selectedRound.value === null ? -1 : roundNumbers.value.indexOf(selectedRound.value),
 );
@@ -365,9 +389,20 @@ onMounted(reload);
         <article><span>Provider / 配置模型</span><strong class="mono">{{ detail.diagnostics.provider ?? "未知" }}</strong><small>{{ detail.diagnostics.configured_model ?? "模型未知" }}</small></article>
         <article><span>捕获模式</span><strong class="mono">{{ detail.diagnostics.capture_mode ?? "未知" }}</strong><small>本地诊断捕获策略</small></article>
         <article><span>Rounds / Tools</span><strong class="mono">{{ detail.diagnostics.round_count ?? "—" }} / {{ detail.diagnostics.tool_count ?? "—" }}</strong><small>已索引诊断事件</small></article>
-        <article><span>Provider 输入</span><strong class="mono">{{ formatInteger(detail.diagnostics.provider_input_tokens) }}</strong><small>严格 Run 聚合</small></article>
-        <article><span>Provider 输出</span><strong class="mono">{{ formatInteger(detail.diagnostics.provider_output_tokens) }}</strong><small>严格 Run 聚合</small></article>
-        <article><span>Provider 总计</span><strong class="mono">{{ formatInteger(detail.diagnostics.provider_total_tokens) }}</strong><small>任一 Round 缺失即为未知</small></article>
+        <article
+          v-for="card in usageCards"
+          :key="card.key"
+          :data-usage="card.key"
+        >
+          <span>{{ card.label }}</span>
+          <strong class="mono">{{ formatInteger(card.value.known_input_tokens) }} / {{ formatInteger(card.value.known_output_tokens) }} / {{ formatInteger(card.value.known_total_tokens) }}</strong>
+          <small>输入 / 输出 / 合计 · {{ card.value.complete ? "完整" : "不完整 · 已知部分" }} · {{ card.value.call_count }} 次调用</small>
+        </article>
+        <template v-if="usageCards.length === 0">
+          <article><span>Generation 输入</span><strong class="mono">{{ formatInteger(detail.diagnostics.provider_input_tokens) }}</strong><small>仅生成调用 · 旧接口</small></article>
+          <article><span>Generation 输出</span><strong class="mono">{{ formatInteger(detail.diagnostics.provider_output_tokens) }}</strong><small>仅生成调用 · 旧接口</small></article>
+          <article><span>Generation 合计</span><strong class="mono">{{ formatInteger(detail.diagnostics.provider_total_tokens) }}</strong><small>All-Run 完整性未知 · 未提供分账</small></article>
+        </template>
       </div>
     </section>
 
@@ -627,6 +662,15 @@ onMounted(reload);
           </article>
           <article data-measure="provider">
             <span>Provider 总计</span><strong class="mono">{{ formatInteger(selectedRoundDetail.provider_total_tokens) }}</strong>
+          </article>
+          <article data-measure="cache-hit">
+            <span>Cache Hit Tokens</span><strong class="mono">{{ formatCacheTokens(selectedRoundDetail.cache_hit_tokens) }}</strong>
+          </article>
+          <article data-measure="cache-miss">
+            <span>Cache Miss Tokens</span><strong class="mono">{{ formatCacheTokens(selectedRoundDetail.cache_miss_tokens) }}</strong>
+          </article>
+          <article data-measure="cache-rate">
+            <span>Cache Hit Rate</span><strong class="mono">{{ cacheHitRate }}</strong><small>Hit / Provider 输入 · Hit + Miss 须与输入一致</small>
           </article>
           <article data-measure="semantic">
             <span>语义上下文估算</span><strong class="mono">{{ formatInteger(selectedRoundDetail.estimated_semantic_context_tokens) }}</strong><small>{{ selectedRoundDetail.estimate_kind ?? "估算器未知" }} · 非 Provider 精确 Token</small>

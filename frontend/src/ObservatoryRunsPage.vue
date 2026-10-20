@@ -277,7 +277,7 @@ onMounted(() => void loadDashboard());
             <small>诊断记录完整性</small>
           </article>
           <article class="token-observation">
-            <span>LLM 输入 Token</span>
+            <span>Generation 输入 Token</span>
             <strong class="mono">{{ formatInteger(metrics?.llm.input_tokens.observed_total ?? null) }} 已观测</strong>
             <small v-if="metrics">
               {{ metrics.llm.input_tokens.observed_round_count }} / {{ metrics.llm.input_tokens.total_round_count }} Rounds
@@ -303,8 +303,8 @@ onMounted(() => void loadDashboard());
           aria-label="Run 诊断趋势"
         >
           <ObservatoryTrendChart
-            title="Provider 输入 Token / Run"
-            description="Provider 上报输入用量的严格 Run 聚合。"
+            title="Generation 输入 Token / Run"
+            description="仅正常生成调用；RUN 摘要及全 Run Usage 见详情。"
             entity-label="Run"
             test-id="trend-provider-input-tokens-by-run"
             :points="providerInputPoints"
@@ -439,7 +439,7 @@ onMounted(() => void loadDashboard());
                   <th>Model</th>
                   <th>Rounds</th>
                   <th>Tools</th>
-                  <th>输入 Token</th>
+                  <th>Generation 输入 Token</th>
                   <th>观测时长</th>
                   <th>首次观测</th>
                 </tr>

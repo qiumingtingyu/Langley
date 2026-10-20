@@ -1,4 +1,19 @@
+export interface ObservatoryUsageTotals {
+  call_count: number;
+  known_input_tokens: number;
+  known_output_tokens: number;
+  known_total_tokens: number;
+  complete: boolean;
+}
+
+export interface ObservatoryRunUsage {
+  generation: ObservatoryUsageTotals;
+  run_compaction: ObservatoryUsageTotals;
+  all_run: ObservatoryUsageTotals;
+}
+
 export interface ObservatoryDiagnostics {
+  usage?: ObservatoryRunUsage | null;
   available: boolean;
   observed_outcome: "SUCCEEDED" | "FAILED" | null;
   trace_complete: boolean | null;
@@ -81,6 +96,8 @@ export interface ObservatoryTimelineResponse {
 }
 
 export interface ObservatoryRoundDetail {
+  cache_hit_tokens?: number | null;
+  cache_miss_tokens?: number | null;
   run_id: number;
   round: number;
   provider_input_tokens: number | null;

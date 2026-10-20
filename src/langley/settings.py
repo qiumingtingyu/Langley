@@ -73,11 +73,20 @@ class Settings(BaseSettings):
     deepseek_api_key: SecretStr | None = None
     deepseek_base_url: str = "https://api.deepseek.com"
     llm_model: str = _DEFAULT_QWEN_MODEL
+    llm_connect_max_retries: int = Field(default=0, ge=0, le=2)
     working_context_budget_estimate: int = Field(default=16_000, ge=1)
     conversation_compaction_trigger_estimate: int = Field(default=12_000, ge=1)
     recent_raw_target_estimate: int = Field(default=6_000, ge=1)
     compact_state_target_estimate: int = Field(default=2_000, ge=1)
     conversation_compactor_model: str = _DEFAULT_QWEN_MODEL
+    run_compaction_enabled: bool = False
+    progress_guard_enabled: bool = False
+    run_context_input_budget_estimate: int = Field(default=48_000, ge=1)
+    run_compaction_trigger_estimate: int = Field(default=32_000, ge=1)
+    run_recent_target_estimate: int = Field(default=12_000, ge=1)
+    run_summary_target_estimate: int = Field(default=2_000, ge=1)
+    run_compaction_max_calls_per_run: int = Field(default=2, ge=1)
+    run_compaction_timeout_seconds: float = Field(default=15.0, gt=0)
     memory_estimated_token_budget: int = Field(default=8_192, ge=1)
     memory_policy_estimated_token_budget: int | None = Field(default=None, ge=1)
     memory_policy_model: str | None = None
@@ -148,4 +157,18 @@ class Settings(BaseSettings):
         """Fail at startup instead of exposing a misconfigured capability."""
         if self.web_search_enabled and self.tavily_api_key is None:
             raise ValueError("TAVILY_API_KEY is required when Web search is enabled")
+        return self
+
+    @model_validator(mode="after")
+    def run_compaction_budgets(self) -> "Settings":
+        from langley.answering.run_context import RunContextConfig
+
+        RunContextConfig(
+            input_budget=self.run_context_input_budget_estimate,
+            trigger=self.run_compaction_trigger_estimate,
+            recent_target=self.run_recent_target_estimate,
+            summary_target=self.run_summary_target_estimate,
+            max_calls=self.run_compaction_max_calls_per_run,
+            timeout_seconds=self.run_compaction_timeout_seconds,
+        )
         return self

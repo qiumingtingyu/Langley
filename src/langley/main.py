@@ -19,6 +19,7 @@ from langley.answering.conversation_context_builder import ConversationContextBu
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 from langley.answering.knowledge_tools import InspectKnowledgeTool, ReadKnowledgeTool
 from langley.answering.local_tracing import CompositeTracer, LocalJsonTracer
+from langley.answering.run_context import RunContextCompactor, RunContextConfig
 from langley.answering.tools import (
     AgentTool,
     CurrentTimeTool,
@@ -112,6 +113,7 @@ def _configured_provider(settings: Settings, model: str) -> LLMProvider:
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,
             model=model,
+            connect_max_retries=settings.llm_connect_max_retries,
         )
     if settings.qwen_api_key is None or settings.qwen_base_url is None:
         return _UnavailableProvider()
@@ -119,6 +121,7 @@ def _configured_provider(settings: Settings, model: str) -> LLMProvider:
         api_key=settings.qwen_api_key,
         base_url=settings.qwen_base_url,
         model=model,
+        connect_max_retries=settings.llm_connect_max_retries,
     )
 
 
@@ -318,6 +321,23 @@ def _workflow_factory_for(
             ),
         )
 
+    run_compactor = (
+        RunContextCompactor(
+            _configured_provider(settings, settings.llm_model),
+            settings.llm_model,
+            RunContextConfig(
+                input_budget=settings.run_context_input_budget_estimate,
+                trigger=settings.run_compaction_trigger_estimate,
+                recent_target=settings.run_recent_target_estimate,
+                summary_target=settings.run_summary_target_estimate,
+                max_calls=settings.run_compaction_max_calls_per_run,
+                timeout_seconds=settings.run_compaction_timeout_seconds,
+            ),
+        )
+        if settings.run_compaction_enabled
+        else None
+    )
+
     def factory() -> LearningAssistantWorkflow:
         return LearningAssistantWorkflow(
             context_builder=context_builder,
@@ -333,6 +353,8 @@ def _workflow_factory_for(
             retrieval_service=retrieval_service,
             workspace_storage=workspace_storage,
             skill_registry=skill_registry,
+            run_compactor=run_compactor,
+            progress_guard_enabled=settings.progress_guard_enabled,
         )
 
     return factory

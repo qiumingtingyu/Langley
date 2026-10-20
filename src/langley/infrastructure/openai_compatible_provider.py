@@ -4,12 +4,14 @@ The adapter normalizes only one provider round.  It neither runs an Agent loop
 nor validates or executes Tool calls.
 """
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+import structlog
 from pydantic import SecretStr
 
 from langley.answering.contracts import (
@@ -27,6 +29,104 @@ from langley.answering.contracts import (
 from langley.answering.errors import RunErrorCode, WorkflowFailure
 
 HTTPClientFactory = Callable[[], httpx.AsyncClient]
+logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class _ConnectEvidence:
+    """Bounded evidence for httpcore 1.0.x pre-POST failures, not absent sends.
+
+    CONNECT reuses the target request's trace callback. Only exact known
+    prefixes ending in a paired, causally matching failure prove pre-send.
+    New/missing/reordered transport events therefore fail closed.
+    """
+
+    target: httpx.URL
+    events: list[str] = field(default_factory=list)
+    target_started: bool = False
+    invalid: bool = False
+    failure: BaseException | None = None
+
+    def observe(self, name: str, info: dict[str, Any]) -> None:
+        if not isinstance(name, str) or not isinstance(info, dict):
+            self.invalid = True
+            return
+        if len(self.events) >= 16:
+            self.invalid = True
+        else:
+            self.events.append(name)
+        if name.endswith(
+            (
+                "send_request_headers.started",
+                "send_request_body.started",
+                "receive_response_headers.started",
+            )
+        ):
+            request = info.get("request")
+            method = getattr(request, "method", None)
+            if method == b"POST":
+                self.target_started = True
+            elif method == b"CONNECT" and name.startswith("http11."):
+                authority = (
+                    self.target.raw_host + b":" + str(self.target.port or 443).encode()
+                )
+                self.invalid |= (
+                    getattr(getattr(request, "url", None), "target", None) != authority
+                )
+            else:
+                self.invalid = True
+        if name.endswith("connect_tcp.started"):
+            self.invalid |= (
+                not isinstance(info.get("host"), str)
+                or type(info.get("port")) is not int
+            )
+        if name.endswith("start_tls.started"):
+            self.invalid |= info.get("server_hostname") != self.target.host
+        if name == "http11.receive_response_headers.complete":
+            value = info.get("return_value")
+            self.invalid |= not (
+                isinstance(value, tuple)
+                and len(value) == 4
+                and type(value[1]) is int
+                and 200 <= value[1] < 300
+            )
+        if name.endswith(".failed"):
+            error = info.get("exception")
+            self.failure = error if isinstance(error, BaseException) else None
+
+    def classify(self, error: BaseException) -> str:
+        if self.target_started:
+            return "SENT_OR_RESPONSE_STARTED"
+        if self.invalid or self.target.scheme != "https":
+            return "UNKNOWN"
+        tcp = ("connection.connect_tcp.started", "connection.connect_tcp.complete")
+        tunnel = (
+            "http11.send_request_headers.started",
+            "http11.send_request_headers.complete",
+            "http11.send_request_body.started",
+            "http11.send_request_body.complete",
+            "http11.receive_response_headers.started",
+            "http11.receive_response_headers.complete",
+        )
+        prefixes = [
+            (tcp[0], "connection.connect_tcp.failed"),
+            tcp + ("connection.start_tls.started", "connection.start_tls.failed"),
+            tcp + tunnel + ("proxy.start_tls.started", "proxy.start_tls.failed"),
+        ]
+        # CONNECT itself may fail, but only a complete prefix before target POST.
+        for offset in (0, 2, 4):
+            stage = tunnel[offset].removesuffix(".started")
+            prefixes.append(
+                tcp + tunnel[:offset] + (stage + ".started", stage + ".failed")
+            )
+        cause: BaseException | None = error
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            if cause is self.failure and tuple(self.events) in prefixes:
+                return "PROVEN_PRE_SEND"
+            seen.add(id(cause))
+            cause = cause.__cause__
+        return "UNKNOWN"
 
 
 @dataclass
@@ -48,7 +148,11 @@ class OpenAICompatibleProvider:
         base_url: str,
         model: str,
         client_factory: HTTPClientFactory | None = None,
+        connect_max_retries: int = 0,
     ) -> None:
+        if type(connect_max_retries) is not int or not 0 <= connect_max_retries <= 2:
+            raise ValueError("connect_max_retries must be an integer from 0 to 2")
+        self._connect_max_retries = connect_max_retries
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -66,106 +170,238 @@ class OpenAICompatibleProvider:
             "Authorization": f"Bearer {self._api_key.get_secret_value()}",
             "Content-Type": "application/json",
         }
-        content_parts: list[str] = []
-        tool_parts: dict[int, _ToolCallParts] = {}
-        finish_reason = LLMFinishReason.UNKNOWN
-        usage: LLMUsage | None = None
-        provider_model: str | None = None
-        saw_done = False
+        for attempt in range(1, self._connect_max_retries + 2):
+            content_parts: list[str] = []
+            tool_parts: dict[int, _ToolCallParts] = {}
+            finish_reason = LLMFinishReason.UNKNOWN
+            usage: LLMUsage | None = None
+            provider_model: str | None = None
+            saw_done = False
 
-        try:
-            async with self._client_factory() as client:
-                async with client.stream(
-                    "POST",
-                    f"{self._base_url}/chat/completions",
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data = line.removeprefix("data:").strip()
-                        if data == "[DONE]":
-                            saw_done = True
-                            break
-                        event = self._parse_event(data)
-                        event_model = event.get("model")
-                        if event_model is not None:
-                            if (
-                                not isinstance(event_model, str)
-                                or not event_model.strip()
-                            ):
-                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-                            if (
-                                provider_model is not None
-                                and provider_model != event_model
-                            ):
-                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-                            provider_model = event_model
-                        event_usage = event.get("usage")
-                        if event_usage is not None:
-                            usage = self._normalize_usage(event_usage)
-                        choices = event.get("choices")
-                        if choices is None:
-                            continue
-                        if not isinstance(choices, list):
-                            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-                        if not choices:
-                            continue
-                        if len(choices) != 1:
-                            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-                        choice = choices[0]
-                        if not isinstance(choice, dict):
-                            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-                        delta = choice.get("delta")
-                        if delta is not None:
-                            if not isinstance(delta, dict):
-                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-                            self._validate_delta(delta)
-                            content = delta.get("content")
-                            if content is not None:
-                                if not isinstance(content, str):
+            response_received = False
+            evidence = _ConnectEvidence(httpx.URL(f"{self._base_url}/chat/completions"))
+            request_hooks_finished = False
+            opening_stream = False
+
+            async def response_received_hook(response: httpx.Response) -> None:
+                nonlocal response_received
+                response_received = True
+
+            async def request_ready_hook(request: httpx.Request) -> None:
+                nonlocal request_hooks_finished
+                request_hooks_finished = True
+
+            async def transport_trace(name: str, info: dict[str, Any]) -> None:
+                evidence.observe(name, info)
+
+            try:
+                async with self._client_factory() as client:
+                    client.event_hooks["response"].insert(0, response_received_hook)
+                    client.event_hooks["request"].append(request_ready_hook)
+                    opening_stream = True
+                    async with client.stream(
+                        "POST",
+                        f"{self._base_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                        extensions={"trace": transport_trace},
+                    ) as response:
+                        response_received = True
+                        opening_stream = False
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data = line.removeprefix("data:").strip()
+                            if data == "[DONE]":
+                                saw_done = True
+                                break
+                            event = self._parse_event(data)
+                            event_model = event.get("model")
+                            if event_model is not None:
+                                if (
+                                    not isinstance(event_model, str)
+                                    or not event_model.strip()
+                                ):
                                     raise WorkflowFailure(
                                         RunErrorCode.LLM_RESPONSE_INVALID
                                     )
-                                content_parts.append(content)
-                                yield AssistantContentDelta(content=content)
-                            self._append_tool_call_fragments(
-                                tool_parts, delta.get("tool_calls")
-                            )
-                        raw_finish_reason = choice.get("finish_reason")
-                        if raw_finish_reason is not None:
-                            finish_reason = self._normalize_finish_reason(
-                                raw_finish_reason
-                            )
-        except WorkflowFailure:
-            raise
-        except httpx.HTTPStatusError as error:
-            error_code = (
-                RunErrorCode.ANSWER_CONTEXT_TOO_LARGE
-                if self._is_context_capacity_rejection(error.response)
-                else RunErrorCode.LLM_PROVIDER_FAILED
-            )
-            raise WorkflowFailure(error_code) from error
-        except httpx.HTTPError as error:
-            raise WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED) from error
+                                if (
+                                    provider_model is not None
+                                    and provider_model != event_model
+                                ):
+                                    raise WorkflowFailure(
+                                        RunErrorCode.LLM_RESPONSE_INVALID
+                                    )
+                                provider_model = event_model
+                            event_usage = event.get("usage")
+                            if event_usage is not None:
+                                usage = self._normalize_usage(event_usage)
+                            choices = event.get("choices")
+                            if choices is None:
+                                continue
+                            if not isinstance(choices, list):
+                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                            if not choices:
+                                continue
+                            if len(choices) != 1:
+                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                            choice = choices[0]
+                            if not isinstance(choice, dict):
+                                raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                            delta = choice.get("delta")
+                            if delta is not None:
+                                if not isinstance(delta, dict):
+                                    raise WorkflowFailure(
+                                        RunErrorCode.LLM_RESPONSE_INVALID
+                                    )
+                                self._validate_delta(delta)
+                                content = delta.get("content")
+                                if content is not None:
+                                    if not isinstance(content, str):
+                                        raise WorkflowFailure(
+                                            RunErrorCode.LLM_RESPONSE_INVALID
+                                        )
+                                    content_parts.append(content)
+                                    yield AssistantContentDelta(content=content)
+                                self._append_tool_call_fragments(
+                                    tool_parts, delta.get("tool_calls")
+                                )
+                            raw_finish_reason = choice.get("finish_reason")
+                            if raw_finish_reason is not None:
+                                finish_reason = self._normalize_finish_reason(
+                                    raw_finish_reason
+                                )
+                if not saw_done:
+                    raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
 
-        if not saw_done:
-            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                tool_calls = tuple(
+                    self._complete_tool_call(parts)
+                    for _, parts in sorted(tool_parts.items(), key=lambda item: item[0])
+                )
+                if len({tool_call.call_id for tool_call in tool_calls}) != len(
+                    tool_calls
+                ):
+                    raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
+                if attempt > 1:
+                    self._record_attempt(attempt, "RECOVERED", usage=usage)
+                yield LLMResponseCompleted(
+                    assistant_content="".join(content_parts),
+                    tool_calls=tool_calls,
+                    finish_reason=finish_reason,
+                    usage=usage if attempt == 1 else None,
+                    provider_model=provider_model,
+                )
+                return
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                safety = (
+                    "SENT_OR_RESPONSE_STARTED"
+                    if response_received
+                    else evidence.classify(error)
+                    if opening_stream and request_hooks_finished
+                    else "UNKNOWN"
+                )
+                retry = (
+                    safety == "PROVEN_PRE_SEND" and attempt <= self._connect_max_retries
+                )
+                self._record_attempt(
+                    attempt,
+                    "RETRYING" if retry else "FAILED",
+                    error_type=type(error).__name__,
+                    will_retry=retry,
+                    retry_safety=safety,
+                    retry_reason=(
+                        "SAFE_CONNECT_RETRY"
+                        if retry
+                        else "RETRY_BUDGET_EXHAUSTED"
+                        if safety == "PROVEN_PRE_SEND"
+                        else "TARGET_STARTED"
+                        if safety == "SENT_OR_RESPONSE_STARTED"
+                        else "INSUFFICIENT_TRANSPORT_EVIDENCE"
+                    ),
+                )
+                if not retry:
+                    raise WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED) from error
+                try:
+                    await asyncio.sleep(2 ** (attempt - 1))
+                except asyncio.CancelledError:
+                    self._record_attempt(attempt, "CANCELLED")
+                    raise
+            except asyncio.CancelledError:
+                self._record_attempt(
+                    attempt, "CANCELLED", retry_reason="CANCELLED_OR_DEADLINE"
+                )
+                raise
+            except WorkflowFailure as error:
+                self._record_attempt(
+                    attempt,
+                    "FAILED",
+                    error_type=error.error_code.value,
+                    retry_reason="RESPONSE_VALIDATION_FAILED",
+                )
+                raise
+            except httpx.HTTPStatusError as error:
+                self._record_attempt(
+                    attempt,
+                    "FAILED",
+                    error_type=type(error).__name__,
+                    retry_safety="SENT_OR_RESPONSE_STARTED",
+                    retry_reason="HTTP_STATUS_ERROR",
+                )
+                error_code = (
+                    RunErrorCode.ANSWER_CONTEXT_TOO_LARGE
+                    if self._is_context_capacity_rejection(error.response)
+                    else RunErrorCode.LLM_PROVIDER_FAILED
+                )
+                raise WorkflowFailure(error_code) from error
+            except httpx.HTTPError as error:
+                self._record_attempt(
+                    attempt,
+                    "FAILED",
+                    error_type=type(error).__name__,
+                    retry_reason="NON_RETRYABLE_HTTP_ERROR",
+                )
+                raise WorkflowFailure(RunErrorCode.LLM_PROVIDER_FAILED) from error
 
-        tool_calls = tuple(
-            self._complete_tool_call(parts)
-            for _, parts in sorted(tool_parts.items(), key=lambda item: item[0])
-        )
-        if len({tool_call.call_id for tool_call in tool_calls}) != len(tool_calls):
-            raise WorkflowFailure(RunErrorCode.LLM_RESPONSE_INVALID)
-        yield LLMResponseCompleted(
-            assistant_content="".join(content_parts),
-            tool_calls=tool_calls,
-            finish_reason=finish_reason,
-            usage=usage,
-            provider_model=provider_model,
+    def _record_attempt(
+        self,
+        attempt: int,
+        outcome: str,
+        *,
+        error_type: str | None = None,
+        will_retry: bool = False,
+        usage: LLMUsage | None = None,
+        retry_safety: str | None = None,
+        retry_reason: str | None = None,
+    ) -> None:
+        # Never log exception strings, headers, payloads or response contents.
+        # Failed connection attempts have UNKNOWN Usage, never zero. After a
+        # retry the logical completion therefore has usage=None; known final
+        # attempt tokens remain here, separate from a complete request total.
+        logger.info(
+            "llm.provider_attempt",
+            provider=type(self).__name__,
+            model=self._model,
+            attempt=attempt,
+            outcome=outcome,
+            error_type=error_type,
+            will_retry=will_retry,
+            retry_safety=retry_safety,
+            retry_reason=retry_reason,
+            usage_unknown=(
+                usage is None
+                or usage.input_tokens is None
+                or usage.output_tokens is None
+            ),
+            logical_usage_complete=False,
+            successful_attempt_input_tokens=usage.input_tokens if usage else None,
+            successful_attempt_output_tokens=usage.output_tokens if usage else None,
+            successful_attempt_cache_hit_tokens=usage.cache_hit_tokens
+            if usage
+            else None,
+            successful_attempt_cache_miss_tokens=usage.cache_miss_tokens
+            if usage
+            else None,
         )
 
     def _request_payload(self, request: LLMRequest) -> dict[str, Any]:
@@ -317,7 +553,17 @@ class OpenAICompatibleProvider:
             output_tokens is not None and not isinstance(output_tokens, int)
         ):
             return None
-        return LLMUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+
+        def cache_count(key: str) -> int | None:
+            value = raw_usage.get(key)
+            return value if type(value) is int and value >= 0 else None
+
+        return LLMUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_hit_tokens=cache_count("prompt_cache_hit_tokens"),
+            cache_miss_tokens=cache_count("prompt_cache_miss_tokens"),
+        )
 
     @staticmethod
     def _normalize_finish_reason(raw_finish_reason: object) -> LLMFinishReason:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from langley.api.dependencies import get_current_user_id, get_session
@@ -22,6 +22,7 @@ from langley.observatory.store import (
     TraceRoundRecord,
     TraceRunSummary,
 )
+from langley.observatory.usage import RunUsage, usage_for_run
 from langley.runs import RunNotFoundError, get_owned_run, list_owned_runs
 
 router = APIRouter(prefix="/api/dev/observatory", tags=["developer-observatory"])
@@ -42,6 +43,24 @@ _SAFE_EVENT_FIELDS: dict[str, tuple[str, ...]] = {
     ),
     "response.rejected": ("invalid_response_subtype", "finish_reason"),
     "context.compact": (
+        "raw_char_count",
+        "raw_byte_count",
+        "projected_char_count",
+        "projected_byte_count",
+        "attempted_through_index",
+        "scope",
+        "parent_generation_round",
+        "revision",
+        "through_index",
+        "attempt_count",
+        "raw_transcript_estimate",
+        "projected_item_count",
+        "raw_item_count",
+        "summary_input_estimate",
+        "summary_output_estimate",
+        "published_summary_estimate",
+        "cache_hit_tokens",
+        "cache_miss_tokens",
         "estimated_before",
         "estimated_after",
         "newly_compacted_turn_count",
@@ -75,9 +94,16 @@ class DiagnosticsSummaryResponse(BaseModel):
     capture_mode: str | None = None
     round_count: int | None = None
     tool_count: int | None = None
-    provider_input_tokens: int | None = None
-    provider_output_tokens: int | None = None
-    provider_total_tokens: int | None = None
+    provider_input_tokens: int | None = Field(
+        default=None, description="Generation-only input tokens (legacy field)"
+    )
+    provider_output_tokens: int | None = Field(
+        default=None, description="Generation-only output tokens (legacy field)"
+    )
+    provider_total_tokens: int | None = Field(
+        default=None, description="Generation-only total tokens (legacy field)"
+    )
+    usage: RunUsage | None = None
     observed_duration_ms: float | None = None
 
 
@@ -111,6 +137,8 @@ class TimelineResponse(BaseModel):
 
 
 class RoundResponse(BaseModel):
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
     run_id: int
     round: int
     provider_input_tokens: int | None
@@ -180,13 +208,19 @@ async def list_observatory_runs(
 ) -> RunListResponse:
     business_runs = await _owned_business_runs(session, current_user_id)
     business_by_id = {run.run_id: run for run in business_runs}
-    summaries = await _runtime_read(runtime, lambda store: store.list_runs())
-    return RunListResponse(
-        runs=[
-            _run_response(business_by_id[summary.run_id], summary)
-            for summary in summaries
-            if summary.run_id in business_by_id
-        ]
+    return await _runtime_read(
+        runtime,
+        lambda store: RunListResponse(
+            runs=[
+                _run_response(
+                    business_by_id[summary.run_id],
+                    summary,
+                    usage_for_run(store, summary),
+                )
+                for summary in store.list_runs()
+                if summary.run_id in business_by_id
+            ]
+        ),
     )
 
 
@@ -198,8 +232,14 @@ async def get_observatory_run(
     runtime: ObservatoryRuntime = Depends(get_observatory_runtime),
 ) -> RunObservatoryResponse:
     business_run = await _owned_business_run(session, current_user_id, run_id)
-    summary = await _runtime_read(runtime, lambda store: store.get_run(run_id))
-    return _run_response(business_run, summary)
+
+    def read(store: ObservatoryStore) -> RunObservatoryResponse:
+        summary = store.get_run(run_id)
+        return _run_response(
+            business_run, summary, usage_for_run(store, summary) if summary else None
+        )
+
+    return await _runtime_read(runtime, read)
 
 
 @router.get("/runs/{run_id}/timeline", response_model=TimelineResponse)
@@ -373,7 +413,9 @@ async def _owned_business_runs(
 
 
 def _run_response(
-    business_run: _BusinessRun, summary: TraceRunSummary | None
+    business_run: _BusinessRun,
+    summary: TraceRunSummary | None,
+    usage: RunUsage | None = None,
 ) -> RunObservatoryResponse:
     if summary is None:
         diagnostics = DiagnosticsSummaryResponse(
@@ -393,6 +435,7 @@ def _run_response(
             capture_mode=summary.capture_mode,
             round_count=summary.round_count,
             tool_count=summary.tool_count,
+            usage=usage,
             provider_input_tokens=summary.provider_input_tokens,
             provider_output_tokens=summary.provider_output_tokens,
             provider_total_tokens=summary.provider_total_tokens,
@@ -481,6 +524,8 @@ def _round_response(round_record: TraceRoundRecord) -> RoundResponse:
         run_id=round_record.run_id,
         round=round_record.round,
         provider_input_tokens=round_record.input_tokens,
+        cache_hit_tokens=round_record.cache_hit_tokens,
+        cache_miss_tokens=round_record.cache_miss_tokens,
         provider_output_tokens=round_record.output_tokens,
         provider_total_tokens=round_record.total_tokens,
         duration_ms=round_record.duration_ms,

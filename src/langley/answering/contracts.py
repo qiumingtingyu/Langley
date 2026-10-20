@@ -127,6 +127,8 @@ class LLMUsage:
 
     input_tokens: int | None
     output_tokens: int | None
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
 
 
 @dataclass(frozen=True)

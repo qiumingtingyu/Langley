@@ -115,7 +115,7 @@ describe("ObservatoryRunsPage", () => {
     expect(wrapper.text()).toContain("未捕获");
     expect(wrapper.text()).toContain("未知");
     expect(wrapper.text()).toContain("观测时长");
-    expect(wrapper.text()).toContain("Provider 输入 Token / Run");
+    expect(wrapper.text()).toContain("Generation 输入 Token / Run");
     expect(wrapper.text()).toContain("观测时长 / Run");
     const durationTrend = wrapper.get('[data-testid="trend-observed-duration-by-run"]');
     expect(durationTrend.text()).not.toContain("Run latency");

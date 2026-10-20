@@ -800,3 +800,56 @@ def test_schema_is_local_explicit_and_contains_required_tables(tmp_path):
     assert "request" not in event_columns
     assert "result_content" not in event_columns
     assert "context_estimate_kind" in round_columns
+
+
+def test_cache_columns_upgrade_old_sqlite_without_resetting_old_trace(tmp_path):
+    from langley.api.observatory import _round_response
+
+    store = _store(tmp_path)
+    _write(
+        store.traces_root / "run-41.jsonl",
+        [
+            _event(
+                41, 1, "llm", round=1, input_tokens=20, output_tokens=3, total_tokens=23
+            ),
+        ],
+    )
+    store.refresh()
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("ALTER TABLE trace_rounds DROP COLUMN cache_hit_tokens")
+        connection.execute("ALTER TABLE trace_rounds DROP COLUMN cache_miss_tokens")
+        indexed_before = connection.execute(
+            "SELECT indexed_bytes FROM trace_sources"
+        ).fetchone()[0]
+    store = _store(tmp_path)
+    old = store.get_round(41, 1)
+    assert old is not None
+    assert old.cache_hit_tokens is None and old.cache_miss_tokens is None
+    assert _round_response(old).model_dump()["cache_hit_tokens"] is None
+    assert store.refresh().events_indexed == 0
+    with sqlite3.connect(store.database_path) as connection:
+        assert (
+            connection.execute("SELECT indexed_bytes FROM trace_sources").fetchone()[0]
+            == indexed_before
+        )
+    _write(
+        store.traces_root / "run-42.jsonl",
+        [
+            _event(
+                42,
+                1,
+                "llm",
+                round=1,
+                input_tokens=20,
+                output_tokens=3,
+                total_tokens=23,
+                cache_hit_tokens=5,
+                cache_miss_tokens=15,
+            ),
+        ],
+    )
+    store.refresh()
+    new = store.get_round(42, 1)
+    assert new is not None
+    assert (new.cache_hit_tokens, new.cache_miss_tokens) == (5, 15)
+    assert store.get_run(42).provider_total_tokens == 23

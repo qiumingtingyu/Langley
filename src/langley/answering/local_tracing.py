@@ -207,7 +207,8 @@ class _LocalExecutionTrace(_NoopTrace):
         self.event("citation.validate", **fields)
 
     def context_compact(self, **fields: Any) -> None:
-        self.event("context.compact", **fields)
+        run_context = fields.pop("run_context", None)
+        self.event("context.compact", **fields, **(run_context or {}))
 
     def success(self, answer: str, stop_reason: str = "FINAL_ANSWER") -> None:
         content = {"assistant_content": answer} if self.tracer.include_content else {}
@@ -274,6 +275,12 @@ class _LocalLLMTrace(_NoopLLMTrace):
             finish_reason=response.finish_reason.value,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            cache_hit_tokens=response.usage.cache_hit_tokens
+            if response.usage
+            else None,
+            cache_miss_tokens=response.usage.cache_miss_tokens
+            if response.usage
+            else None,
             total_tokens=input_tokens + output_tokens
             if input_tokens is not None and output_tokens is not None
             else None,

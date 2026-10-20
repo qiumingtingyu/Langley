@@ -129,6 +129,54 @@ async function settle(): Promise<void> {
 }
 
 describe("ObservatoryRunDetailPage", () => {
+
+  it.each([true, false])("shows generation, RUN compaction and all-run usage completeness %s", async (complete) => {
+    const usage = {
+      generation: { call_count: 1, known_input_tokens: 42, known_output_tokens: 8, known_total_tokens: 50, complete: true },
+      run_compaction: { call_count: 1, known_input_tokens: complete ? 100 : 0, known_output_tokens: complete ? 20 : 0, known_total_tokens: complete ? 120 : 0, complete },
+      all_run: { call_count: 2, known_input_tokens: complete ? 142 : 42, known_output_tokens: complete ? 28 : 8, known_total_tokens: complete ? 170 : 50, complete },
+    };
+    vi.stubGlobal("fetch", vi.fn((path: string) => path === "/api/dev/observatory/runs/42"
+      ? Promise.resolve(response({ ...run, diagnostics: { ...run.diagnostics, usage } })) : defaultFetch(path)));
+    const wrapper = mount(ObservatoryRunDetailPage, { props: { runId: 42 } });
+    await settle();
+    expect(wrapper.get('[data-usage="generation"]').text()).toContain("Generation Usage");
+    expect(wrapper.get('[data-usage="run-compaction"]').text()).toContain("Run Compaction Usage");
+    expect(wrapper.get('[data-usage="all-run"] strong').text()).toBe(complete ? "142 / 28 / 170" : "42 / 8 / 50");
+    expect(wrapper.get('[data-usage="all-run"] small').text()).toContain(complete ? "· 完整 ·" : "不完整 · 已知部分");
+    expect(wrapper.text()).not.toContain("严格 Run 聚合");
+    wrapper.unmount();
+  });
+
+  it("labels legacy API numbers as generation-only with unknown all-run coverage", async () => {
+    vi.stubGlobal("fetch", vi.fn(defaultFetch));
+    const wrapper = mount(ObservatoryRunDetailPage, { props: { runId: 42 } });
+    await settle();
+    expect(wrapper.text()).toContain("Generation 合计");
+    expect(wrapper.text()).toContain("All-Run 完整性未知");
+    expect(wrapper.find('[data-usage="all-run"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it.each([
+    [{ cache_hit_tokens: 90, cache_miss_tokens: 30 }, "90", "30", "75.0%"],
+    [{ cache_hit_tokens: 0, cache_miss_tokens: 120 }, "0", "120", "0.0%"],
+    [{}, "N/A", "N/A", "N/A"],
+    [{ cache_hit_tokens: 90 }, "90", "N/A", "N/A"],
+    [{ cache_hit_tokens: 90, cache_miss_tokens: 90 }, "90", "90", "N/A"],
+    [{ cache_hit_tokens: -1, cache_miss_tokens: 121 }, "N/A", "121", "N/A"],
+    [{ cache_hit_tokens: 0, cache_miss_tokens: 0, provider_input_tokens: 0 }, "0", "0", "N/A"],
+  ])("shows bounded cache metrics for %j", async (cache, hit, miss, rate) => {
+    vi.stubGlobal("fetch", vi.fn((path: string) => path.endsWith("/rounds/2")
+      ? Promise.resolve(response({ ...rounds[2], ...cache })) : defaultFetch(path)));
+    const wrapper = mount(ObservatoryRunDetailPage, { props: { runId: 42 } });
+    await settle();
+    expect(wrapper.get('[data-measure="cache-hit"] strong').text()).toBe(hit);
+    expect(wrapper.get('[data-measure="cache-miss"] strong').text()).toBe(miss);
+    expect(wrapper.get('[data-measure="cache-rate"] strong').text()).toBe(rate);
+    wrapper.unmount();
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
