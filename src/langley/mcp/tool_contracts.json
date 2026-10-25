@@ -1,0 +1,2214 @@
+{
+  "search_knowledge": {
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "kb_scope": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "top_k": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5,
+          "default": 5
+        }
+      },
+      "required": [
+        "query",
+        "kb_scope"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "document"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "heading"
+                    },
+                    "heading_path": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 16,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "heading_path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "pages"
+                    },
+                    "page_start": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    },
+                    "page_end": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "page_start",
+                    "page_end"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "document_locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "document"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "region": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "text_span"
+                },
+                "start_byte": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5242880
+                },
+                "end_byte": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5242880
+                }
+              },
+              "required": [
+                "kind",
+                "start_byte",
+                "end_byte"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "pdf_page"
+                },
+                "page_start": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "page_end": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                }
+              },
+              "required": [
+                "kind",
+                "page_start",
+                "page_end"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "NOT_ALLOWED",
+                "INVALID_ARGUMENTS",
+                "RESOURCE_UNAVAILABLE",
+                "RESOURCE_CHANGED",
+                "RESOURCE_VERSION_AMBIGUOUS",
+                "RESOURCE_TOO_LARGE",
+                "INDEX_NOT_READY",
+                "SEARCH_UNAVAILABLE",
+                "READ_UNAVAILABLE",
+                "LOCATION_NOT_FOUND",
+                "READ_SCOPE_TOO_LARGE",
+                "RESPONSE_TOO_LARGE",
+                "RATE_LIMITED",
+                "SERVER_BUSY",
+                "TOOL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "retry_after_ms"
+          ],
+          "additionalProperties": false
+        },
+        "citation": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "locator": {
+              "$ref": "#/$defs/locator"
+            },
+            "source_regions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/region"
+              }
+            },
+            "evidence_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "coverage": {
+              "enum": [
+                "exact_source_span",
+                "published_regions"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "locator",
+            "source_regions",
+            "evidence_sha256",
+            "coverage"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "items": {
+                  "type": "array",
+                  "maxItems": 5,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 255
+                      },
+                      "snippet": {
+                        "type": "string",
+                        "minLength": 0,
+                        "maxLength": 512
+                      },
+                      "snippet_truncated": {
+                        "type": "boolean"
+                      },
+                      "locator": {
+                        "$ref": "#/$defs/document_locator"
+                      },
+                      "source_regions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 128,
+                        "items": {
+                          "$ref": "#/$defs/region"
+                        }
+                      },
+                      "coverage": {
+                        "const": "search_hit_regions"
+                      }
+                    },
+                    "required": [
+                      "title",
+                      "snippet",
+                      "snippet_truncated",
+                      "locator",
+                      "source_regions",
+                      "coverage"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "returned_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5
+                },
+                "truncated": {
+                  "type": "boolean"
+                },
+                "has_more": {
+                  "type": "null"
+                }
+              },
+              "required": [
+                "items",
+                "returned_count",
+                "truncated",
+                "has_more"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ok",
+            "request_id",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "error": {
+              "$ref": "#/$defs/error"
+            }
+          },
+          "required": [
+            "ok",
+            "request_id",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "document"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "heading"
+                    },
+                    "heading_path": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 16,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "heading_path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "pages"
+                    },
+                    "page_start": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    },
+                    "page_end": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "page_start",
+                    "page_end"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "document_locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "document"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "region": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "text_span"
+                },
+                "start_byte": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5242880
+                },
+                "end_byte": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5242880
+                }
+              },
+              "required": [
+                "kind",
+                "start_byte",
+                "end_byte"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "pdf_page"
+                },
+                "page_start": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "page_end": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                }
+              },
+              "required": [
+                "kind",
+                "page_start",
+                "page_end"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "NOT_ALLOWED",
+                "INVALID_ARGUMENTS",
+                "RESOURCE_UNAVAILABLE",
+                "RESOURCE_CHANGED",
+                "RESOURCE_VERSION_AMBIGUOUS",
+                "RESOURCE_TOO_LARGE",
+                "INDEX_NOT_READY",
+                "SEARCH_UNAVAILABLE",
+                "READ_UNAVAILABLE",
+                "LOCATION_NOT_FOUND",
+                "READ_SCOPE_TOO_LARGE",
+                "RESPONSE_TOO_LARGE",
+                "RATE_LIMITED",
+                "SERVER_BUSY",
+                "TOOL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "retry_after_ms"
+          ],
+          "additionalProperties": false
+        },
+        "citation": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "locator": {
+              "$ref": "#/$defs/locator"
+            },
+            "source_regions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/region"
+              }
+            },
+            "evidence_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "coverage": {
+              "enum": [
+                "exact_source_span",
+                "published_regions"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "locator",
+            "source_regions",
+            "evidence_sha256",
+            "coverage"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "read_knowledge": {
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "locator": {
+          "$ref": "#/$defs/locator"
+        },
+        "max_bytes": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 16384,
+          "default": 16384
+        }
+      },
+      "required": [
+        "locator"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "document"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "heading"
+                    },
+                    "heading_path": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 16,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "heading_path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "pages"
+                    },
+                    "page_start": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    },
+                    "page_end": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "page_start",
+                    "page_end"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "document_locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "document"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "region": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "text_span"
+                },
+                "start_byte": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5242880
+                },
+                "end_byte": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5242880
+                }
+              },
+              "required": [
+                "kind",
+                "start_byte",
+                "end_byte"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "pdf_page"
+                },
+                "page_start": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "page_end": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                }
+              },
+              "required": [
+                "kind",
+                "page_start",
+                "page_end"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "NOT_ALLOWED",
+                "INVALID_ARGUMENTS",
+                "RESOURCE_UNAVAILABLE",
+                "RESOURCE_CHANGED",
+                "RESOURCE_VERSION_AMBIGUOUS",
+                "RESOURCE_TOO_LARGE",
+                "INDEX_NOT_READY",
+                "SEARCH_UNAVAILABLE",
+                "READ_UNAVAILABLE",
+                "LOCATION_NOT_FOUND",
+                "READ_SCOPE_TOO_LARGE",
+                "RESPONSE_TOO_LARGE",
+                "RATE_LIMITED",
+                "SERVER_BUSY",
+                "TOOL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "retry_after_ms"
+          ],
+          "additionalProperties": false
+        },
+        "citation": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "locator": {
+              "$ref": "#/$defs/locator"
+            },
+            "source_regions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/region"
+              }
+            },
+            "evidence_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "coverage": {
+              "enum": [
+                "exact_source_span",
+                "published_regions"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "locator",
+            "source_regions",
+            "evidence_sha256",
+            "coverage"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "content": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 16384
+                },
+                "content_kind": {
+                  "enum": [
+                    "markdown_source",
+                    "pdf_extracted_text"
+                  ]
+                },
+                "locator": {
+                  "$ref": "#/$defs/locator"
+                },
+                "citation": {
+                  "$ref": "#/$defs/citation"
+                },
+                "actual_source_regions": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 128,
+                  "items": {
+                    "$ref": "#/$defs/region"
+                  }
+                },
+                "byte_count": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 16384
+                },
+                "truncated": {
+                  "const": false
+                }
+              },
+              "required": [
+                "content",
+                "content_kind",
+                "locator",
+                "citation",
+                "actual_source_regions",
+                "byte_count",
+                "truncated"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ok",
+            "request_id",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "error": {
+              "$ref": "#/$defs/error"
+            }
+          },
+          "required": [
+            "ok",
+            "request_id",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "document"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "heading"
+                    },
+                    "heading_path": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 16,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "heading_path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "pages"
+                    },
+                    "page_start": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    },
+                    "page_end": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "page_start",
+                    "page_end"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "document_locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "document"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "region": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "text_span"
+                },
+                "start_byte": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5242880
+                },
+                "end_byte": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5242880
+                }
+              },
+              "required": [
+                "kind",
+                "start_byte",
+                "end_byte"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "pdf_page"
+                },
+                "page_start": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "page_end": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                }
+              },
+              "required": [
+                "kind",
+                "page_start",
+                "page_end"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "NOT_ALLOWED",
+                "INVALID_ARGUMENTS",
+                "RESOURCE_UNAVAILABLE",
+                "RESOURCE_CHANGED",
+                "RESOURCE_VERSION_AMBIGUOUS",
+                "RESOURCE_TOO_LARGE",
+                "INDEX_NOT_READY",
+                "SEARCH_UNAVAILABLE",
+                "READ_UNAVAILABLE",
+                "LOCATION_NOT_FOUND",
+                "READ_SCOPE_TOO_LARGE",
+                "RESPONSE_TOO_LARGE",
+                "RATE_LIMITED",
+                "SERVER_BUSY",
+                "TOOL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "retry_after_ms"
+          ],
+          "additionalProperties": false
+        },
+        "citation": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "locator": {
+              "$ref": "#/$defs/locator"
+            },
+            "source_regions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/region"
+              }
+            },
+            "evidence_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "coverage": {
+              "enum": [
+                "exact_source_span",
+                "published_regions"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "locator",
+            "source_regions",
+            "evidence_sha256",
+            "coverage"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  "inspect_knowledge": {
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "locator": {
+          "$ref": "#/$defs/document_locator"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999,
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 20
+        }
+      },
+      "required": [
+        "locator"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "document"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "heading"
+                    },
+                    "heading_path": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 16,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "heading_path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "pages"
+                    },
+                    "page_start": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    },
+                    "page_end": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "page_start",
+                    "page_end"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "document_locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "document"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "region": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "text_span"
+                },
+                "start_byte": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5242880
+                },
+                "end_byte": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5242880
+                }
+              },
+              "required": [
+                "kind",
+                "start_byte",
+                "end_byte"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "pdf_page"
+                },
+                "page_start": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "page_end": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                }
+              },
+              "required": [
+                "kind",
+                "page_start",
+                "page_end"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "NOT_ALLOWED",
+                "INVALID_ARGUMENTS",
+                "RESOURCE_UNAVAILABLE",
+                "RESOURCE_CHANGED",
+                "RESOURCE_VERSION_AMBIGUOUS",
+                "RESOURCE_TOO_LARGE",
+                "INDEX_NOT_READY",
+                "SEARCH_UNAVAILABLE",
+                "READ_UNAVAILABLE",
+                "LOCATION_NOT_FOUND",
+                "READ_SCOPE_TOO_LARGE",
+                "RESPONSE_TOO_LARGE",
+                "RATE_LIMITED",
+                "SERVER_BUSY",
+                "TOOL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "retry_after_ms"
+          ],
+          "additionalProperties": false
+        },
+        "citation": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "locator": {
+              "$ref": "#/$defs/locator"
+            },
+            "source_regions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/region"
+              }
+            },
+            "evidence_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "coverage": {
+              "enum": [
+                "exact_source_span",
+                "published_regions"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "locator",
+            "source_regions",
+            "evidence_sha256",
+            "coverage"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 255
+                },
+                "locator": {
+                  "$ref": "#/$defs/document_locator"
+                },
+                "format": {
+                  "enum": [
+                    "markdown",
+                    "pdf"
+                  ]
+                },
+                "entries": {
+                  "type": "array",
+                  "maxItems": 50,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "type": "string",
+                        "minLength": 0,
+                        "maxLength": 1024
+                      },
+                      "readable": {
+                        "type": "boolean"
+                      },
+                      "locator": {
+                        "anyOf": [
+                          {
+                            "$ref": "#/$defs/locator"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "reason": {
+                        "anyOf": [
+                          {
+                            "enum": [
+                              "EMPTY_OR_AMBIGUOUS_HEADING",
+                              "LOCATION_TOO_COMPLEX"
+                            ]
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "label",
+                      "readable",
+                      "locator",
+                      "reason"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "offset": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 999
+                },
+                "next_offset": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 999
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "truncated": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "title",
+                "locator",
+                "format",
+                "entries",
+                "offset",
+                "next_offset",
+                "truncated"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "ok",
+            "request_id",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "request_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "error": {
+              "$ref": "#/$defs/error"
+            }
+          },
+          "required": [
+            "ok",
+            "request_id",
+            "error"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "document"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "heading"
+                    },
+                    "heading_path": {
+                      "type": "array",
+                      "minItems": 1,
+                      "maxItems": 16,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "heading_path"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "const": "pages"
+                    },
+                    "page_start": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    },
+                    "page_end": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 1000000
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "page_start",
+                    "page_end"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "document_locator": {
+          "type": "object",
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "kb_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "document_version_id": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "chunk_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "location": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "document"
+                }
+              },
+              "required": [
+                "kind"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "v",
+            "kb_id",
+            "document_id",
+            "document_version_id",
+            "chunk_revision",
+            "location"
+          ],
+          "additionalProperties": false
+        },
+        "region": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "text_span"
+                },
+                "start_byte": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 5242880
+                },
+                "end_byte": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 5242880
+                }
+              },
+              "required": [
+                "kind",
+                "start_byte",
+                "end_byte"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "const": "pdf_page"
+                },
+                "page_start": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "page_end": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                }
+              },
+              "required": [
+                "kind",
+                "page_start",
+                "page_end"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "error": {
+          "type": "object",
+          "properties": {
+            "code": {
+              "enum": [
+                "NOT_ALLOWED",
+                "INVALID_ARGUMENTS",
+                "RESOURCE_UNAVAILABLE",
+                "RESOURCE_CHANGED",
+                "RESOURCE_VERSION_AMBIGUOUS",
+                "RESOURCE_TOO_LARGE",
+                "INDEX_NOT_READY",
+                "SEARCH_UNAVAILABLE",
+                "READ_UNAVAILABLE",
+                "LOCATION_NOT_FOUND",
+                "READ_SCOPE_TOO_LARGE",
+                "RESPONSE_TOO_LARGE",
+                "RATE_LIMITED",
+                "SERVER_BUSY",
+                "TOOL_TIMEOUT",
+                "INTERNAL_ERROR"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 160
+            },
+            "retryable": {
+              "type": "boolean"
+            },
+            "retry_after_ms": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 60000
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "retry_after_ms"
+          ],
+          "additionalProperties": false
+        },
+        "citation": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            },
+            "locator": {
+              "$ref": "#/$defs/locator"
+            },
+            "source_regions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 128,
+              "items": {
+                "$ref": "#/$defs/region"
+              }
+            },
+            "evidence_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "coverage": {
+              "enum": [
+                "exact_source_span",
+                "published_regions"
+              ]
+            }
+          },
+          "required": [
+            "title",
+            "locator",
+            "source_regions",
+            "evidence_sha256",
+            "coverage"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+}
