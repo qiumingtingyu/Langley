@@ -4,13 +4,13 @@ services:
     environment:
       MYSQL_DATABASE: langley
       MYSQL_ROOT_HOST: "%"
-      MYSQL_ROOT_PASSWORD: langley-local-root-password
+      MYSQL_ROOT_PASSWORD: ${LANGLEY_MYSQL_ROOT_PASSWORD:?set protected local variable}
     ports:
       - "127.0.0.1:3306:3306"
     volumes:
       - langley_mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD"]
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$${MYSQL_ROOT_PASSWORD}\" mysql --protocol=TCP -h 127.0.0.1 -uroot --batch --skip-column-names --execute=\"SELECT 1\" >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20

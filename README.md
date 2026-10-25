@@ -120,9 +120,18 @@ LangSmith 内容导出独立配置。本地 diagnostics 通过已有 tracing sea
 
 ### 1. 启动 MySQL 与 Qdrant
 
+先在仓库根目录创建仅本地使用的 `.env.mysql.local`，设置
+`LANGLEY_MYSQL_ROOT_PASSWORD` 为独立随机密码，并限制文件访问权限。该文件已被
+Git 忽略；不要将真实密码放入 Compose、命令参数或提交文件。启动前确认当前进程
+没有同名旧变量或其他 `COMPOSE_*` 覆盖项，Compose 的进程环境优先于 env-file。
+开发与测试连接配置使用相同的新密码，分别连接 `langley` 和 `langley_test`。
+
+已有数据卷的账户不会随初始化环境变量改变；既有部署须先完成受控账户轮换，
+确认新连接成功后再同卷重建容器。不要删除数据卷或重新初始化数据库。
+
 ```powershell
-docker compose up -d mysql qdrant
-docker compose ps
+docker compose -p langley --env-file .env.mysql.local up -d mysql qdrant
+docker compose -p langley --env-file .env.mysql.local ps
 ```
 
 ### 2. 配置环境变量
